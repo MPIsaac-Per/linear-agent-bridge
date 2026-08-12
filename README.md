@@ -6,7 +6,7 @@ your machine, in a working directory you choose, with everything that
 directory carries: CLAUDE.md instructions, MCP servers, skills. Replies
 land in the issue's agent-session thread.
 
-This is a minimal reference implementation (~600 lines, no framework,
+This is a minimal reference implementation (under 1,000 lines, no framework,
 tested). It is not a coding agent; for assign-an-issue-get-a-PR flows,
 see [Cyrus](https://github.com/ceedaragents/cyrus). This bridge is for
 talking to an agent that knows your context: a knowledge base, an ops
