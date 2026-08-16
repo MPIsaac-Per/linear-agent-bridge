@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { startServer, type ServerDeps } from "../src/server.js";
 import type { Config } from "../src/config.js";
 import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
+import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
 import { SerialQueue } from "../src/queue.js";
 import type {
@@ -27,6 +28,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     runtime: "claude",
     kbPath: "/tmp/kb-unused",
     sessionStorePath: "unused-see-store-field",
+    oauthTokenStorePath: "unused-see-oauth-field",
     ...overrides,
   };
 }
@@ -104,6 +106,7 @@ interface Harness {
   calls: LinearCall[];
   store: JsonSessionStore;
   tokenFetch: ReturnType<typeof vi.fn>;
+  oauthTokenStorePath: string;
 }
 
 async function startTestServer(
@@ -115,6 +118,7 @@ async function startTestServer(
 
   const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "server-test-"));
   const store = new JsonSessionStore(path.join(tmpDir, "sessions.json"));
+  const oauthTokenStorePath = path.join(tmpDir, "oauth-tokens.json");
 
   const tokenFetch = vi.fn(
     options.tokenFetchImpl ?? (async () => jsonResponse({ access_token: "unused" })),
@@ -126,10 +130,18 @@ async function startTestServer(
   });
 
   const queue = new SerialQueue();
+  const oauth = new LinearOAuthTokenManager({
+    clientId: "client-id-test",
+    clientSecret: "client-secret-test",
+    initialAccessToken: "test-linear-token",
+    storePath: oauthTokenStorePath,
+    fetchFn: tokenFetch as unknown as FetchFn,
+  });
   const deps: ServerDeps = {
     config: buildConfig({ port: 0 }),
     runtime,
     linear,
+    oauth,
     store,
     queue,
     tokenFetch: tokenFetch as unknown as FetchFn,
@@ -151,6 +163,7 @@ async function startTestServer(
     calls,
     store,
     tokenFetch,
+    oauthTokenStorePath,
   };
 }
 
@@ -346,7 +359,7 @@ describe("startServer", () => {
     expect(await health.text()).toBe("ok");
   });
 
-  it("oauth callback: exchanges the code with the mocked token endpoint and prints the token", async () => {
+  it("oauth callback: exchanges the code and persists the rotating token pair", async () => {
     const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
       yield { kind: "done" };
     });
@@ -387,10 +400,18 @@ describe("startServer", () => {
       expect(params.get("grant_type")).toBe("authorization_code");
       expect(params.get("redirect_uri")).toBe("http://localhost:3979/oauth/callback");
 
-      expect(logSpy).toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(
+        "[linear-atlas-agent] OAuth token pair installed",
+      );
       const logged = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
-      expect(logged).toContain("tok-secret-123");
-      expect(logged).toContain("LINEAR_ACCESS_TOKEN");
+      expect(logged).not.toContain("tok-secret-123");
+      expect(logged).not.toContain("rt-1");
+      expect(
+        JSON.parse(await fsPromises.readFile(harness.oauthTokenStorePath, "utf8")),
+      ).toMatchObject({
+        accessToken: "tok-secret-123",
+        refreshToken: "rt-1",
+      });
     } finally {
       logSpy.mockRestore();
     }

@@ -1,6 +1,10 @@
 import { createHmac } from "node:crypto";
+import { promises as fsPromises } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { LinearAgentClient } from "../src/linear/client.js";
+import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { verifyWebhook } from "../src/linear/webhook-verify.js";
 import type { AgentActivityContent } from "../src/types.js";
 
@@ -22,6 +26,64 @@ function jsonResponse(
 }
 
 describe("LinearAgentClient.createActivity", () => {
+  it("refreshes an expired OAuth token, persists the rotated pair, and retries once", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { errors: [{ message: "Authentication required" }] },
+          { ok: false, status: 401, statusText: "Unauthorized" },
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          access_token: "fresh-access",
+          refresh_token: "fresh-refresh",
+          expires_in: 86399,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ data: { agentActivityCreate: { success: true } } }),
+      );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "expired-access",
+      storePath: tokenStorePath,
+      fetchFn,
+    });
+    await oauth.install({
+      access_token: "expired-access",
+      refresh_token: "initial-refresh",
+      expires_in: 0,
+    });
+    const client = new LinearAgentClient(oauth, fetchFn);
+
+    try {
+      await client.createActivity("session-refresh", { type: "thought", body: "hello" });
+
+      expect(fetchFn).toHaveBeenCalledTimes(3);
+      expect(fetchFn.mock.calls[0]?.[0]).toBe(GRAPHQL_URL);
+      expect(fetchFn.mock.calls[1]?.[0]).toBe("https://api.linear.app/oauth/token");
+      const refreshParams = new URLSearchParams(
+        fetchFn.mock.calls[1]?.[1]?.body as string,
+      );
+      expect(refreshParams.get("grant_type")).toBe("refresh_token");
+      expect(refreshParams.get("refresh_token")).toBe("initial-refresh");
+      expect(fetchFn.mock.calls[2]?.[1]?.headers).toMatchObject({
+        Authorization: "Bearer fresh-access",
+      });
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "fresh-access",
+        refreshToken: "fresh-refresh",
+      });
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("POSTs the agentActivityCreate mutation with a thought activity", async () => {
     const fetchFn = vi
       .fn()

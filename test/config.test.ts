@@ -21,22 +21,25 @@ describe("loadConfig", () => {
       runtime: "claude",
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
+      oauthTokenStorePath: "./data/oauth-tokens.json",
     });
   });
 
-  it("honors overrides for PORT, RUNTIME, KB_PATH, SESSION_STORE_PATH", () => {
+  it("honors path, port, and runtime overrides", () => {
     const config = loadConfig({
       ...validEnv,
       PORT: "8080",
       RUNTIME: "codex",
       KB_PATH: "/tmp/kb",
       SESSION_STORE_PATH: "/tmp/sessions.json",
+      OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
     });
 
     expect(config.port).toBe(8080);
     expect(config.runtime).toBe("codex");
     expect(config.kbPath).toBe("/tmp/kb");
     expect(config.sessionStorePath).toBe("/tmp/sessions.json");
+    expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
   });
 
   it.each([

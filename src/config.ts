@@ -7,11 +7,13 @@ export interface Config {
   runtime: "claude" | "codex";
   kbPath: string;
   sessionStorePath: string;
+  oauthTokenStorePath: string;
 }
 
 const DEFAULT_PORT = "3979";
 const DEFAULT_RUNTIME = "claude";
 const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
+const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
 
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
@@ -56,5 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // service's own working directory; point it at your knowledge base.
     kbPath: env.KB_PATH ?? process.cwd(),
     sessionStorePath: env.SESSION_STORE_PATH ?? DEFAULT_SESSION_STORE_PATH,
+    oauthTokenStorePath:
+      env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
   };
 }

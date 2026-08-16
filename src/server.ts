@@ -8,6 +8,10 @@ import type {
 import type { Config } from "./config.js";
 import { verifyWebhook } from "./linear/webhook-verify.js";
 import type { LinearAgentClient, FetchFn } from "./linear/client.js";
+import type {
+  LinearOAuthTokenManager,
+  LinearOAuthTokenResponse,
+} from "./linear/oauth.js";
 import type { JsonSessionStore } from "./sessions/store.js";
 import type { SerialQueue } from "./queue.js";
 
@@ -27,6 +31,7 @@ export interface ServerDeps {
   config: Config;
   runtime: AgentRuntime;
   linear: LinearAgentClient;
+  oauth: LinearOAuthTokenManager;
   store: JsonSessionStore;
   queue: SerialQueue;
   /**
@@ -58,8 +63,8 @@ export interface ServerDeps {
  *      Linear, persist the runtime session id on session-started, emit an
  *      `error` activity on failure so the session never hangs silently.
  *
- * GET /oauth/callback — one-time OAuth install flow: exchange code for an
- * actor=app access token, print it for .env. (setup convenience)
+ * GET /oauth/callback — OAuth install flow: exchange code for a rotating
+ * actor=app token pair and persist it for automatic refresh.
  * GET /healthz — liveness for launchd.
  */
 export function startServer(deps: ServerDeps): { close(): Promise<void> } {
@@ -344,18 +349,13 @@ async function handleOAuthCallback(
       );
     }
 
-    const json = (await response.json()) as { access_token?: string };
-    if (typeof json.access_token !== "string") {
-      throw new Error("Linear OAuth token response missing access_token");
-    }
-
-    console.log(
-      `\nLinear access token acquired. Put this in .env as LINEAR_ACCESS_TOKEN:\n\nLINEAR_ACCESS_TOKEN=${json.access_token}\n`,
-    );
+    const json = (await response.json()) as LinearOAuthTokenResponse;
+    await deps.oauth.install(json);
+    console.log("[linear-atlas-agent] OAuth token pair installed");
 
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(
-      "<html><body><p>Authorization complete. Check the server console for the access token.</p></body></html>",
+      "<html><body><p>Authorization complete. The agent will refresh its Linear access automatically.</p></body></html>",
     );
   } catch (err) {
     console.error("[linear-atlas-agent] OAuth token exchange failed:", err);

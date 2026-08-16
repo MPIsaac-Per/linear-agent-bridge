@@ -11,6 +11,8 @@ Linear webhook (AgentSessionEvent) -> src/server.ts -> SerialQueue ->
 AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities back via
 src/linear/client.ts (agentActivityCreate). Session mapping persists in
 JsonSessionStore so `prompted` events resume the same runtime session.
+LinearOAuthTokenManager persists Linear's rotating OAuth token pair and
+refreshes it after an authenticated request returns 401.
 
 ## Hard constraints
 
@@ -27,6 +29,9 @@ JsonSessionStore so `prompted` events resume the same runtime session.
   apply inside runtime sessions automatically.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Ack first, work after.
+- Linear OAuth access tokens expire after 24 hours. Persist both replacement
+  tokens atomically after every authorization and refresh. Never log either
+  token.
 - Linear payload facts (verified against live payloads 2026-08-12): the
   prompted user text is `agentActivity.content.body`; AgentSessionEvent
   fields sit at the payload top level; the HMAC covers the raw body and
