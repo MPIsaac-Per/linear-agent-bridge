@@ -3,10 +3,11 @@
 All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-The project has not published a tagged release, so merged changes remain under
-Unreleased.
+Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-08-16
 
 ### Added
 
@@ -31,3 +32,6 @@ Unreleased.
 - Read stop metadata from `agentActivity.content.signal` and register
   cancellation before asynchronous follow-up setup, preventing work from being
   queued after a stop response. ([#3](https://github.com/MPIsaac-Per/linear-claude-bridge/pull/3))
+
+[Unreleased]: https://github.com/MPIsaac-Per/linear-claude-bridge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/MPIsaac-Per/linear-claude-bridge/releases/tag/v0.1.0
