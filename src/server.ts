@@ -29,6 +29,13 @@ const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 /** Emitted immediately on `created` to satisfy Linear's 10s liveness rule. */
 const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
+/** Acknowledge follow-up turns before they enter the host-wide serial queue. */
+const PROMPTED_THOUGHT_BODY = "Working on it…";
+const STOPPED_RESPONSE_BODY = "Stopped.";
+
+interface InternalServerDeps extends ServerDeps {
+  activeRuns: Map<string, Set<AbortController>>;
+}
 
 export interface ServerDeps {
   config: Config;
@@ -99,8 +106,12 @@ class OAuthStateStore {
  */
 export function startServer(deps: ServerDeps): { close(): Promise<void> } {
   const oauthStates = new OAuthStateStore();
+  const internalDeps: InternalServerDeps = {
+    ...deps,
+    activeRuns: new Map<string, Set<AbortController>>(),
+  };
   const server = createServer((req, res) => {
-    handleRequest(req, res, deps, oauthStates).catch((err: unknown) => {
+    handleRequest(req, res, internalDeps, oauthStates).catch((err: unknown) => {
       console.error("[linear-atlas-agent] request handler failed:", err);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
@@ -119,6 +130,11 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
 
   return {
     close(): Promise<void> {
+      for (const controllers of internalDeps.activeRuns.values()) {
+        for (const controller of controllers) {
+          controller.abort(new Error("Server shutting down"));
+        }
+      }
       return new Promise((resolve, reject) => {
         server.close((err) => {
           if (err) {
@@ -138,7 +154,7 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: ServerDeps,
+  deps: InternalServerDeps,
   oauthStates: OAuthStateStore,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
@@ -190,7 +206,7 @@ async function emitOAuthAuthorizationUrlIfNeeded(
 async function handleWebhook(
   req: IncomingMessage,
   res: ServerResponse,
-  deps: ServerDeps,
+  deps: InternalServerDeps,
 ): Promise<void> {
   const rawBody = await readRawBody(req);
 
@@ -260,7 +276,10 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
   return obj as unknown as LinearAgentSessionEvent;
 }
 
-async function processWebhookPayload(rawBody: Buffer, deps: ServerDeps): Promise<void> {
+async function processWebhookPayload(
+  rawBody: Buffer,
+  deps: InternalServerDeps,
+): Promise<void> {
   let payload: unknown;
   try {
     payload = JSON.parse(rawBody.toString("utf8"));
@@ -287,34 +306,99 @@ async function processWebhookPayload(rawBody: Buffer, deps: ServerDeps): Promise
 
   if (event.action === "created") {
     // 10s liveness rule: emit a thought before doing anything else.
-    await deps.linear.createActivity(sessionId, {
-      type: "thought",
-      body: CREATED_THOUGHT_BODY,
-    });
+    await deps.linear.createActivity(
+      sessionId,
+      {
+        type: "thought",
+        body: CREATED_THOUGHT_BODY,
+      },
+      { ephemeral: true },
+    );
 
     const prompt = event.promptContext ?? event.agentSession.issue?.title ?? "";
-    void deps.queue.enqueue(() =>
-      runSessionTask(deps, { linearSessionId: sessionId, prompt }, issueIdentifier),
-    );
+    enqueueSessionRun(deps, { linearSessionId: sessionId, prompt }, issueIdentifier);
     return;
   }
 
   // action === "prompted" — the user text lives in the content union
   // (verified against live payloads 2026-08-12); bare body is a fallback.
-  const record = await deps.store.get(sessionId);
   const prompt = event.agentActivity?.content?.body ?? event.agentActivity?.body ?? "";
+  const isStop =
+    event.agentActivity?.signal === "stop" || /^stop[.!]?$/i.test(prompt.trim());
+  if (isStop) {
+    abortSessionRuns(deps, sessionId);
+    await deps.linear.createActivity(sessionId, {
+      type: "response",
+      body: STOPPED_RESPONSE_BODY,
+    });
+    return;
+  }
+
+  const record = await deps.store.get(sessionId);
   if (prompt === "") {
     console.log(
       `[linear-atlas-agent] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
     );
   }
-  void deps.queue.enqueue(() =>
-    runSessionTask(
-      deps,
-      { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
-      issueIdentifier ?? record?.issueIdentifier,
-    ),
+  await deps.linear.createActivity(
+    sessionId,
+    {
+      type: "thought",
+      body: PROMPTED_THOUGHT_BODY,
+    },
+    { ephemeral: true },
   );
+  enqueueSessionRun(
+    deps,
+    { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
+    issueIdentifier ?? record?.issueIdentifier,
+  );
+}
+
+function enqueueSessionRun(
+  deps: InternalServerDeps,
+  request: Omit<SessionRequest, "abortController">,
+  issueIdentifier: string | undefined,
+): void {
+  const controller = new AbortController();
+  let controllers = deps.activeRuns.get(request.linearSessionId);
+  if (controllers === undefined) {
+    controllers = new Set<AbortController>();
+    deps.activeRuns.set(request.linearSessionId, controllers);
+  }
+  controllers.add(controller);
+
+  void deps.queue.enqueue(async () => {
+    try {
+      if (!controller.signal.aborted) {
+        await runSessionTask(
+          deps,
+          { ...request, abortController: controller },
+          issueIdentifier,
+        );
+      }
+    } finally {
+      unregisterRun(deps, request.linearSessionId, controller);
+    }
+  });
+}
+
+function abortSessionRuns(deps: InternalServerDeps, sessionId: string): void {
+  for (const controller of deps.activeRuns.get(sessionId) ?? []) {
+    controller.abort(new Error("Stopped by user"));
+  }
+}
+
+function unregisterRun(
+  deps: InternalServerDeps,
+  sessionId: string,
+  controller: AbortController,
+): void {
+  const controllers = deps.activeRuns.get(sessionId);
+  controllers?.delete(controller);
+  if (controllers?.size === 0) {
+    deps.activeRuns.delete(sessionId);
+  }
 }
 
 /**
@@ -324,15 +408,28 @@ async function processWebhookPayload(rawBody: Buffer, deps: ServerDeps): Promise
  * logged, but never rejects/crashes the caller (the queue, the process).
  */
 async function runSessionTask(
-  deps: ServerDeps,
+  deps: InternalServerDeps,
   request: SessionRequest,
   issueIdentifier: string | undefined,
 ): Promise<void> {
+  const controller = request.abortController;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller?.abort(new Error("Session deadline exceeded"));
+  }, deps.config.runTimeoutMs);
+
   try {
     for await (const event of deps.runtime.runSession(request)) {
+      if (controller?.signal.aborted === true) {
+        break;
+      }
       await handleRuntimeEvent(deps, request, issueIdentifier, event);
     }
   } catch (err) {
+    if (controller?.signal.aborted === true) {
+      return;
+    }
     console.error(
       `[linear-atlas-agent] session run failed for ${request.linearSessionId}:`,
       err,
@@ -346,11 +443,26 @@ async function runSessionTask(
         activityErr,
       );
     }
+  } finally {
+    clearTimeout(timeout);
+    if (timedOut) {
+      try {
+        await deps.linear.createActivity(request.linearSessionId, {
+          type: "error",
+          body: `This request timed out after ${formatDuration(deps.config.runTimeoutMs)}.`,
+        });
+      } catch (activityErr) {
+        console.error(
+          `[linear-atlas-agent] failed to emit timeout activity for ${request.linearSessionId}:`,
+          activityErr,
+        );
+      }
+    }
   }
 }
 
 async function handleRuntimeEvent(
-  deps: ServerDeps,
+  deps: InternalServerDeps,
   request: SessionRequest,
   issueIdentifier: string | undefined,
   event: RuntimeEvent,
@@ -367,8 +479,27 @@ async function handleRuntimeEvent(
   }
 
   if (event.kind === "activity") {
-    await deps.linear.createActivity(request.linearSessionId, event.activity);
+    const ephemeral =
+      event.activity.type === "thought" ||
+      (event.activity.type === "action" && event.activity.result === undefined);
+    await deps.linear.createActivity(
+      request.linearSessionId,
+      event.activity,
+      ephemeral ? { ephemeral: true } : {},
+    );
   }
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds % 60_000 === 0) {
+    const minutes = milliseconds / 60_000;
+    return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+  if (milliseconds % 1000 === 0) {
+    const seconds = milliseconds / 1000;
+    return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+  }
+  return `${milliseconds} ms`;
 }
 
 async function handleOAuthCallback(

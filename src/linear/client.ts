@@ -49,9 +49,15 @@ export class LinearAgentClient {
   async createActivity(
     agentSessionId: string,
     content: AgentActivityContent,
+    options: { ephemeral?: boolean } = {},
   ): Promise<void> {
     const accessToken = await this.getAccessToken();
-    let response = await this.postActivity(accessToken, agentSessionId, content);
+    let response = await this.postActivity(
+      accessToken,
+      agentSessionId,
+      content,
+      options,
+    );
 
     if (response.status === 401 && typeof this.tokenSource !== "string") {
       const refreshedAccessToken =
@@ -60,6 +66,7 @@ export class LinearAgentClient {
         refreshedAccessToken,
         agentSessionId,
         content,
+        options,
       );
     }
 
@@ -97,6 +104,7 @@ export class LinearAgentClient {
     accessToken: string,
     agentSessionId: string,
     content: AgentActivityContent,
+    options: { ephemeral?: boolean },
   ): Promise<Response> {
     return this.fetchFn(LINEAR_GRAPHQL_URL, {
       method: "POST",
@@ -106,7 +114,15 @@ export class LinearAgentClient {
       },
       body: JSON.stringify({
         query: AGENT_ACTIVITY_CREATE_MUTATION,
-        variables: { input: { agentSessionId, content } },
+        variables: {
+          input: {
+            agentSessionId,
+            content,
+            ...(options.ephemeral !== undefined
+              ? { ephemeral: options.ephemeral }
+              : {}),
+          },
+        },
       }),
     });
   }

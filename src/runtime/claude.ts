@@ -8,6 +8,13 @@ import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 /** Max length of a compact, one-line tool-input summary before truncation. */
 const MAX_ACTION_PARAMETER_LENGTH = 200;
+/** Keep completed tool cards useful without dumping large or sensitive outputs into Linear. */
+const MAX_ACTION_RESULT_LENGTH = 500;
+
+interface PendingToolUse {
+  action: string;
+  parameter: string;
+}
 
 /**
  * Injectable shape of the SDK's `query()` function. The real one is
@@ -40,6 +47,41 @@ function summarizeToolInput(input: unknown): string {
     return json;
   }
   return `${json.slice(0, MAX_ACTION_PARAMETER_LENGTH - 3)}...`;
+}
+
+/** Compact a tool_result content block into a bounded result for Linear. */
+function summarizeToolResult(content: unknown, isError: boolean): string {
+  if (!isError) {
+    return "Completed.";
+  }
+
+  let text: string;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    const parts = content.flatMap((block: unknown) => {
+      if (block !== null && typeof block === "object") {
+        const record = block as Record<string, unknown>;
+        if (record.type === "text" && typeof record.text === "string") {
+          return [record.text];
+        }
+        if (record.type === "image") {
+          return ["Image returned."];
+        }
+      }
+      return [];
+    });
+    text = parts.join("\n");
+  } else {
+    text = JSON.stringify(content) ?? "";
+  }
+
+  const compact = text.replace(/\s+/g, " ").trim();
+  const prefixed = compact !== "" ? `Failed: ${compact}` : "Tool failed.";
+  if (prefixed.length <= MAX_ACTION_RESULT_LENGTH) {
+    return prefixed;
+  }
+  return `${prefixed.slice(0, MAX_ACTION_RESULT_LENGTH - 3)}...`;
 }
 
 /**
@@ -82,6 +124,9 @@ export class ClaudeRuntime implements AgentRuntime {
       stderr: (data: string) => {
         console.error(`[claude-cli] ${data.trimEnd()}`);
       },
+      ...(request.abortController !== undefined
+        ? { abortController: request.abortController }
+        : {}),
       ...(request.resumeSessionId !== undefined
         ? { resume: request.resumeSessionId }
         : {}),
@@ -91,9 +136,13 @@ export class ClaudeRuntime implements AgentRuntime {
     // body; forwarding both renders duplicated text in Linear. Hold each
     // thought back one step and drop it if the result repeats it.
     let pendingThought: RuntimeEvent | undefined;
+    const pendingToolUses = new Map<string, PendingToolUse>();
     try {
       for await (const message of this.queryFn({ prompt: request.prompt, options })) {
-        for (const ev of this.mapMessage(message)) {
+        if (request.abortController?.signal.aborted === true) {
+          break;
+        }
+        for (const ev of this.mapMessage(message, pendingToolUses)) {
           const isDuplicateResponse =
             ev.kind === "activity" &&
             ev.activity.type === "response" &&
@@ -113,11 +162,19 @@ export class ClaudeRuntime implements AgentRuntime {
           }
         }
       }
+      if (request.abortController?.signal.aborted === true) {
+        yield { kind: "done" };
+        return;
+      }
       if (pendingThought !== undefined) {
         yield pendingThought;
       }
       yield { kind: "done" };
     } catch (err) {
+      if (request.abortController?.signal.aborted === true) {
+        yield { kind: "done" };
+        return;
+      }
       if (pendingThought !== undefined) {
         yield pendingThought;
       }
@@ -127,7 +184,10 @@ export class ClaudeRuntime implements AgentRuntime {
     }
   }
 
-  private *mapMessage(message: SDKMessage): Generator<RuntimeEvent> {
+  private *mapMessage(
+    message: SDKMessage,
+    pendingToolUses: Map<string, PendingToolUse>,
+  ): Generator<RuntimeEvent> {
     if (message.type === "system") {
       if (message.subtype === "init") {
         yield { kind: "session-started", runtimeSessionId: message.session_id };
@@ -147,8 +207,35 @@ export class ClaudeRuntime implements AgentRuntime {
             action: block.name,
             parameter: summarizeToolInput(block.input),
           };
+          pendingToolUses.set(block.id, {
+            action: activity.action,
+            parameter: activity.parameter,
+          });
           yield { kind: "activity", activity };
         }
+      }
+      return;
+    }
+
+    if (message.type === "user" && Array.isArray(message.message.content)) {
+      for (const block of message.message.content) {
+        if (block.type !== "tool_result") {
+          continue;
+        }
+        const toolUse = pendingToolUses.get(block.tool_use_id);
+        if (toolUse === undefined) {
+          continue;
+        }
+        pendingToolUses.delete(block.tool_use_id);
+        yield {
+          kind: "activity",
+          activity: {
+            type: "action",
+            action: toolUse.action,
+            parameter: toolUse.parameter,
+            result: summarizeToolResult(block.content, block.is_error === true),
+          },
+        };
       }
       return;
     }

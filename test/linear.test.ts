@@ -124,7 +124,7 @@ describe("LinearAgentClient.createActivity", () => {
     const client = new LinearAgentClient("test-token", fetchFn);
     const content: AgentActivityContent = { type: "thought", body: "thinking..." };
 
-    await client.createActivity("session-1", content);
+    await client.createActivity("session-1", content, { ephemeral: true });
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
@@ -137,12 +137,18 @@ describe("LinearAgentClient.createActivity", () => {
 
     const parsedBody = JSON.parse(init.body as string) as {
       query: string;
-      variables: { input: { agentSessionId: string; content: AgentActivityContent } };
+      variables: {
+        input: {
+          agentSessionId: string;
+          content: AgentActivityContent;
+          ephemeral?: boolean;
+        };
+      };
     };
     expect(parsedBody.query).toContain("agentActivityCreate");
     expect(parsedBody.query).toContain("AgentActivityCreateInput");
     expect(parsedBody.variables).toEqual({
-      input: { agentSessionId: "session-1", content },
+      input: { agentSessionId: "session-1", content, ephemeral: true },
     });
   });
 

@@ -29,12 +29,24 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     kbPath: "/tmp/kb-unused",
     sessionStorePath: "unused-see-store-field",
     oauthTokenStorePath: "unused-see-oauth-field",
+    runTimeoutMs: 300000,
     ...overrides,
   };
 }
 
 function sign(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body).digest("hex");
+}
+
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function jsonResponse(
@@ -55,17 +67,27 @@ function jsonResponse(
 interface LinearCall {
   agentSessionId: string;
   content: AgentActivityContent;
+  ephemeral?: boolean;
 }
 
 /** Fakes the Linear GraphQL endpoint: records every agentActivityCreate call. */
 function fakeLinearFetch(calls: LinearCall[]): FetchFn {
   return (async (_url: RequestInfo | URL, init?: RequestInit) => {
     const parsed = JSON.parse(init?.body as string) as {
-      variables: { input: { agentSessionId: string; content: AgentActivityContent } };
+      variables: {
+        input: {
+          agentSessionId: string;
+          content: AgentActivityContent;
+          ephemeral?: boolean;
+        };
+      };
     };
     calls.push({
       agentSessionId: parsed.variables.input.agentSessionId,
       content: parsed.variables.input.content,
+      ...(parsed.variables.input.ephemeral !== undefined
+        ? { ephemeral: parsed.variables.input.ephemeral }
+        : {}),
     });
     return jsonResponse({ data: { agentActivityCreate: { success: true } } });
   }) as FetchFn;
@@ -112,7 +134,7 @@ interface Harness {
 
 async function startTestServer(
   runtime: AgentRuntime,
-  options: { tokenFetchImpl?: FetchFn } = {},
+  options: { tokenFetchImpl?: FetchFn; configOverrides?: Partial<Config> } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
   const linear = new LinearAgentClient("test-linear-token", fakeLinearFetch(calls));
@@ -143,7 +165,7 @@ async function startTestServer(
     fetchFn: tokenFetch as unknown as FetchFn,
   });
   const deps: ServerDeps = {
-    config: buildConfig({ port: 0 }),
+    config: buildConfig({ port: 0, ...options.configOverrides }),
     runtime,
     linear,
     oauth,
@@ -219,10 +241,12 @@ describe("startServer", () => {
     expect(harness.calls[0]).toEqual({
       agentSessionId: "agent-session-1",
       content: { type: "thought", body: "Reading the issue and gathering context…" },
+      ephemeral: true,
     });
     expect(harness.calls[1]).toEqual({
       agentSessionId: "agent-session-1",
       content: { type: "thought", body: "Looking at the issue" },
+      ephemeral: true,
     });
     expect(harness.calls[2]).toEqual({
       agentSessionId: "agent-session-1",
@@ -232,6 +256,7 @@ describe("startServer", () => {
     expect(runtime.lastRequest).toEqual({
       linearSessionId: "agent-session-1",
       prompt: "<issue>Fix the bug</issue>",
+      abortController: expect.any(AbortController),
     });
 
     const record = await harness.store.get("agent-session-1");
@@ -287,7 +312,140 @@ describe("startServer", () => {
       linearSessionId: "agent-session-2",
       prompt: "please continue",
       resumeSessionId: "prior-runtime-session",
+      abortController: expect.any(AbortController),
     });
+  });
+
+  it("a stop signal aborts the active turn and closes the Linear session", async () => {
+    const release = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "session-started", runtimeSessionId: "runtime-stop" };
+      await Promise.race([
+        release.promise,
+        new Promise<void>((resolve) => {
+          request.abortController?.signal.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        }),
+      ]);
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+
+    try {
+      const createdPayload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: {
+          id: "agent-session-stop",
+          issue: { id: "issue-stop", identifier: "MPI-STOP", title: "Long request" },
+        },
+        promptContext: "do a long task",
+        webhookTimestamp: Date.now(),
+      };
+      const createdBody = JSON.stringify(createdPayload);
+      await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+        },
+        body: createdBody,
+      });
+      await waitFor(() => runtime.requests.length === 1);
+
+      const stopPayload = {
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-stop" },
+        agentActivity: {
+          content: { type: "prompt", body: "stop" },
+          signal: "stop",
+        },
+        webhookTimestamp: Date.now(),
+      };
+      const stopBody = JSON.stringify(stopPayload);
+      const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+        },
+        body: stopBody,
+      });
+      expect(response.status).toBe(200);
+
+      await waitFor(() =>
+        harness.calls.some(
+          (call) => call.content.type === "response" && call.content.body === "Stopped.",
+        ),
+      );
+      expect(runtime.requests).toHaveLength(1);
+      expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+    } finally {
+      release.resolve();
+    }
+  });
+
+  it("aborts a turn at the configured deadline and reports the timeout", async () => {
+    const release = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "session-started", runtimeSessionId: "runtime-timeout" };
+      await Promise.race([
+        release.promise,
+        new Promise<void>((resolve) => {
+          request.abortController?.signal.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        }),
+      ]);
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runTimeoutMs: 25 },
+    });
+    const harness = activeHarness;
+
+    try {
+      const payload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: {
+          id: "agent-session-timeout",
+          issue: { id: "issue-timeout", identifier: "MPI-TIME", title: "Bounded request" },
+        },
+        promptContext: "do a bounded task",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+      expect(response.status).toBe(200);
+
+      await waitFor(() =>
+        harness.calls.some(
+          (call) =>
+            call.content.type === "error" &&
+            call.content.body === "This request timed out after 25 ms.",
+        ),
+      );
+      expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+    } finally {
+      release.resolve();
+    }
   });
 
   it("rejects an invalid signature with 401 and enqueues nothing", async () => {
@@ -355,6 +513,7 @@ describe("startServer", () => {
     expect(harness.calls[0]).toEqual({
       agentSessionId: "agent-session-err",
       content: { type: "thought", body: "Reading the issue and gathering context…" },
+      ephemeral: true,
     });
     expect(harness.calls[1]).toEqual({
       agentSessionId: "agent-session-err",

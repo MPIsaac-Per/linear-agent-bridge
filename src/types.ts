@@ -16,7 +16,11 @@ export interface LinearAgentSessionEvent {
    * `agentActivity.content.body`; a bare `body` is kept as fallback.
    */
   agentActivity?:
-    | { body?: string | undefined; content?: { type?: string; body?: string } | undefined }
+    | {
+        body?: string | undefined;
+        content?: { type?: string; body?: string } | undefined;
+        signal?: string | undefined;
+      }
     | undefined;
   previousComments?: unknown;
   guidance?: string | undefined;
@@ -38,6 +42,8 @@ export interface SessionRequest {
   prompt: string;
   /** Runtime session id from a prior turn, when resuming. */
   resumeSessionId?: string | undefined;
+  /** Cancels the active runtime turn for a Linear stop signal or deadline. */
+  abortController?: AbortController | undefined;
 }
 
 /** Events a runtime yields while working a session. */
