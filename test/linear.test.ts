@@ -26,6 +26,39 @@ function jsonResponse(
 }
 
 describe("LinearAgentClient.createActivity", () => {
+  it("retains a newly rotated pair in memory when durable persistence fails", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+    });
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      await fsPromises.rm(tokenStorePath);
+      await fsPromises.mkdir(tokenStorePath);
+
+      await expect(
+        oauth.install({
+          access_token: "rotated-access",
+          refresh_token: "rotated-refresh",
+          expires_in: 86399,
+        }),
+      ).rejects.toThrow();
+      expect(await oauth.getAccessToken()).toBe("rotated-access");
+      expect(await oauth.hasRefreshToken()).toBe(true);
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("refreshes an expired OAuth token, persists the rotated pair, and retries once", async () => {
     const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
     const tokenStorePath = path.join(tmpDir, "tokens.json");

@@ -62,11 +62,10 @@ npm run dev
 
 ### 3. Install the app as an agent (actor=app)
 
-Open this URL (your client id substituted), approve the install:
-
-```
-https://linear.app/oauth/authorize?client_id=<CLIENT_ID>&redirect_uri=http%3A%2F%2Flocalhost%3A3979%2Foauth%2Fcallback&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app
-```
+Start the service, then open the `OAuth authorization URL` printed in its
+console or launchd log. The URL contains a random, one-time `state` value
+and is valid for 10 minutes. Restart the service to issue another URL if it
+expires.
 
 The callback stores Linear's access and refresh tokens in
 `data/oauth-tokens.json`. The app now appears as an assignable agent in your
@@ -83,7 +82,7 @@ excluded from Git.
 
 Installations created before refresh-token support have only an access token
 in `.env`. Pull the new version, rebuild and restart the service, then open the
-authorization URL above once. The callback will create the token store. No
+authorization URL printed at startup once. The callback will create the token store. No
 further browser authorization is needed during normal token rotation.
 
 If Linear returns `401` and the bridge reports that no refresh token is
@@ -134,8 +133,10 @@ session takes.
 
 ## Security notes
 
-The webhook endpoint verifies signatures and rejects stale timestamps;
-`/healthz` and `/oauth/callback` are the only other routes. Understand
+The webhook endpoint verifies signatures and rejects stale timestamps. The
+OAuth callback consumes a random, expiring state value before exchanging an
+authorization code; only the local service log receives the matching setup
+URL. `/healthz` and `/oauth/callback` are the only other routes. Understand
 what you are wiring up: anyone who can mention the agent in your Linear
 workspace steers an unattended agent session running with permissions
 bypassed in `KB_PATH`. Use it in workspaces you trust, and scope `KB_PATH`

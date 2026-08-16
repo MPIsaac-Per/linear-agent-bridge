@@ -32,6 +32,8 @@ refreshes it after an authenticated request returns 401.
 - Linear OAuth access tokens expire after 24 hours. Persist both replacement
   tokens atomically after every authorization and refresh. Never log either
   token.
+- OAuth callbacks consume a random, expiring, one-time `state` issued only in
+  the local service log. Never accept a bare authorization code.
 - Linear payload facts (verified against live payloads 2026-08-12): the
   prompted user text is `agentActivity.content.body`; AgentSessionEvent
   fields sit at the payload top level; the HMAC covers the raw body and

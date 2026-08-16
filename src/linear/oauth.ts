@@ -77,13 +77,18 @@ export class LinearOAuthTokenManager {
     return this.accessToken;
   }
 
+  async hasRefreshToken(): Promise<boolean> {
+    await this.load();
+    return this.refreshToken !== undefined;
+  }
+
   async install(response: LinearOAuthTokenResponse): Promise<void> {
     await this.load();
     const tokens = parseTokenResponse(response);
-    await this.persist(tokens);
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;
     this.expiresAt = tokens.expiresAt;
+    await this.persist(tokens);
   }
 
   async refreshAfterUnauthorized(failedAccessToken: string): Promise<string> {

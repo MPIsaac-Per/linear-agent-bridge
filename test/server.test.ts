@@ -107,6 +107,7 @@ interface Harness {
   store: JsonSessionStore;
   tokenFetch: ReturnType<typeof vi.fn>;
   oauthTokenStorePath: string;
+  authorizationUrl: Promise<string>;
 }
 
 async function startTestServer(
@@ -128,6 +129,10 @@ async function startTestServer(
   const listening = new Promise<number>((resolve) => {
     resolveListening = resolve;
   });
+  let resolveAuthorizationUrl!: (url: string) => void;
+  const authorizationUrl = new Promise<string>((resolve) => {
+    resolveAuthorizationUrl = resolve;
+  });
 
   const queue = new SerialQueue();
   const oauth = new LinearOAuthTokenManager({
@@ -146,6 +151,7 @@ async function startTestServer(
     queue,
     tokenFetch: tokenFetch as unknown as FetchFn,
     onListening: resolveListening,
+    onOAuthAuthorizationUrl: resolveAuthorizationUrl,
   };
 
   const server = startServer(deps);
@@ -164,6 +170,7 @@ async function startTestServer(
     store,
     tokenFetch,
     oauthTokenStorePath,
+    authorizationUrl,
   };
 }
 
@@ -380,8 +387,14 @@ describe("startServer", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     try {
+      const authorizationUrl = new URL(await harness.authorizationUrl);
+      const state = authorizationUrl.searchParams.get("state");
+      expect(authorizationUrl.origin).toBe("https://linear.app");
+      expect(authorizationUrl.pathname).toBe("/oauth/authorize");
+      expect(state).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+
       const response = await fetch(
-        `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz`,
+        `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz&state=${state}`,
       );
       expect(response.status).toBe(200);
 
@@ -415,6 +428,37 @@ describe("startServer", () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  it("oauth callback: rejects a missing or replayed state before token exchange", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime, {
+      tokenFetchImpl: (async () =>
+        jsonResponse({
+          access_token: "access",
+          refresh_token: "refresh",
+          expires_in: 86399,
+        })) as FetchFn,
+    });
+    const harness = activeHarness;
+
+    const missingState = await fetch(
+      `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz`,
+    );
+    expect(missingState.status).toBe(400);
+    expect(harness.tokenFetch).not.toHaveBeenCalled();
+
+    const state = new URL(await harness.authorizationUrl).searchParams.get("state");
+    expect(state).not.toBeNull();
+    const callbackUrl =
+      `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz&state=${state}`;
+
+    expect((await fetch(callbackUrl)).status).toBe(200);
+    expect(harness.tokenFetch).toHaveBeenCalledTimes(1);
+    expect((await fetch(callbackUrl)).status).toBe(400);
+    expect(harness.tokenFetch).toHaveBeenCalledTimes(1);
   });
 
   it("ignores a non-agent-session webhook category but still acks 200", async () => {
