@@ -25,8 +25,9 @@ Linear (mention / delegate / follow-up prompt)
   -> src/linear/client.ts   agentActivityCreate (thought/action/response)
 ```
 
-Session mapping (Linear session id -> SDK session id) persists in a JSON
-file, so follow-up prompts resume the same conversation.
+Session mapping (Linear session id -> SDK session id) and Linear's rotating
+OAuth token pair persist in JSON files, so follow-up prompts resume the same
+conversation and access refreshes without another browser authorization.
 
 ## Prerequisites
 
@@ -61,15 +62,32 @@ npm run dev
 
 ### 3. Install the app as an agent (actor=app)
 
-Open this URL (your client id substituted), approve the install:
+Start the service, then open the `OAuth authorization URL` printed in its
+console or launchd log. The URL contains a random, one-time `state` value
+and is valid for 10 minutes. Restart the service to issue another URL if it
+expires.
 
-```
-https://linear.app/oauth/authorize?client_id=<CLIENT_ID>&redirect_uri=http%3A%2F%2Flocalhost%3A3979%2Foauth%2Fcallback&response_type=code&scope=read,write,app:assignable,app:mentionable&actor=app
-```
+The callback stores Linear's access and refresh tokens in
+`data/oauth-tokens.json`. The app now appears as an assignable agent in your
+workspace. Access tokens expire after 24 hours; the bridge consumes the
+stored refresh token, saves Linear's replacement pair, and retries the failed
+request automatically.
 
-The service prints the access token on the callback; put it in `.env` as
-`LINEAR_ACCESS_TOKEN` and restart. The app now appears as an assignable
-agent in your workspace.
+`LINEAR_ACCESS_TOKEN` is a bootstrap value. After authorization, the token
+store takes precedence across process and machine restarts. Keep the token
+store on persistent local storage. Its file mode is `0600`, and `data/` is
+excluded from Git.
+
+#### Upgrading an existing installation
+
+Installations created before refresh-token support have only an access token
+in `.env`. Pull the new version, rebuild and restart the service, then open the
+authorization URL printed at startup once. The callback will create the token store. No
+further browser authorization is needed during normal token rotation.
+
+If Linear returns `401` and the bridge reports that no refresh token is
+stored, repeat the authorization step. Removing the app from Linear, revoking
+its grant, or deleting the token store also requires authorization again.
 
 ### 4. Expose the webhook
 
@@ -109,11 +127,16 @@ session takes.
 - Old Agent SDK versions (0.1.x) fail to resume sessions whose transcript
   contains empty text blocks (API 400: "text content blocks must be
   non-empty"). Use 0.3.x or later.
+- Linear OAuth access tokens expire after 24 hours. Every refresh returns a
+  replacement access token and refresh token; persist the pair atomically and
+  retry one failed 401 request with the replacement access token.
 
 ## Security notes
 
-The webhook endpoint verifies signatures and rejects stale timestamps;
-`/healthz` and `/oauth/callback` are the only other routes. Understand
+The webhook endpoint verifies signatures and rejects stale timestamps. The
+OAuth callback consumes a random, expiring state value before exchanging an
+authorization code; only the local service log receives the matching setup
+URL. `/healthz` and `/oauth/callback` are the only other routes. Understand
 what you are wiring up: anyone who can mention the agent in your Linear
 workspace steers an unattended agent session running with permissions
 bypassed in `KB_PATH`. Use it in workspaces you trust, and scope `KB_PATH`

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type {
   AgentRuntime,
@@ -8,6 +9,10 @@ import type {
 import type { Config } from "./config.js";
 import { verifyWebhook } from "./linear/webhook-verify.js";
 import type { LinearAgentClient, FetchFn } from "./linear/client.js";
+import type {
+  LinearOAuthTokenManager,
+  LinearOAuthTokenResponse,
+} from "./linear/oauth.js";
 import type { JsonSessionStore } from "./sessions/store.js";
 import type { SerialQueue } from "./queue.js";
 
@@ -19,6 +24,8 @@ const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
  * and passed to /oauth/authorize when installing the agent.
  */
 const OAUTH_REDIRECT_URI = "http://localhost:3979/oauth/callback";
+const LINEAR_AUTHORIZE_URL = "https://linear.app/oauth/authorize";
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 /** Emitted immediately on `created` to satisfy Linear's 10s liveness rule. */
 const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
@@ -27,6 +34,7 @@ export interface ServerDeps {
   config: Config;
   runtime: AgentRuntime;
   linear: LinearAgentClient;
+  oauth: LinearOAuthTokenManager;
   store: JsonSessionStore;
   queue: SerialQueue;
   /**
@@ -41,6 +49,33 @@ export interface ServerDeps {
    * and discover the real port to send requests to.
    */
   onListening?: (port: number) => void;
+  /** Test hook for the state-bearing URL printed during initial setup. */
+  onOAuthAuthorizationUrl?: (url: string) => void;
+}
+
+class OAuthStateStore {
+  private readonly states = new Map<string, number>();
+
+  issue(now = Date.now()): string {
+    this.removeExpired(now);
+    const state = randomBytes(32).toString("base64url");
+    this.states.set(state, now + OAUTH_STATE_TTL_MS);
+    return state;
+  }
+
+  consume(state: string, now = Date.now()): boolean {
+    const expiresAt = this.states.get(state);
+    this.states.delete(state);
+    return expiresAt !== undefined && expiresAt >= now;
+  }
+
+  private removeExpired(now: number): void {
+    for (const [state, expiresAt] of this.states) {
+      if (expiresAt < now) {
+        this.states.delete(state);
+      }
+    }
+  }
 }
 
 /**
@@ -58,13 +93,14 @@ export interface ServerDeps {
  *      Linear, persist the runtime session id on session-started, emit an
  *      `error` activity on failure so the session never hangs silently.
  *
- * GET /oauth/callback — one-time OAuth install flow: exchange code for an
- * actor=app access token, print it for .env. (setup convenience)
+ * GET /oauth/callback — verify one-time OAuth state, exchange the code for a
+ * rotating actor=app token pair, and persist it for automatic refresh.
  * GET /healthz — liveness for launchd.
  */
 export function startServer(deps: ServerDeps): { close(): Promise<void> } {
+  const oauthStates = new OAuthStateStore();
   const server = createServer((req, res) => {
-    handleRequest(req, res, deps).catch((err: unknown) => {
+    handleRequest(req, res, deps, oauthStates).catch((err: unknown) => {
       console.error("[linear-atlas-agent] request handler failed:", err);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
@@ -78,6 +114,7 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
     if (deps.onListening !== undefined && address !== null && typeof address === "object") {
       deps.onListening(address.port);
     }
+    void emitOAuthAuthorizationUrlIfNeeded(deps, oauthStates);
   });
 
   return {
@@ -102,6 +139,7 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   deps: ServerDeps,
+  oauthStates: OAuthStateStore,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
 
@@ -112,7 +150,7 @@ async function handleRequest(
   }
 
   if (req.method === "GET" && url.pathname === "/oauth/callback") {
-    await handleOAuthCallback(url, res, deps);
+    await handleOAuthCallback(url, res, deps, oauthStates);
     return;
   }
 
@@ -123,6 +161,30 @@ async function handleRequest(
 
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("not found");
+}
+
+async function emitOAuthAuthorizationUrlIfNeeded(
+  deps: ServerDeps,
+  oauthStates: OAuthStateStore,
+): Promise<void> {
+  if (await deps.oauth.hasRefreshToken()) {
+    return;
+  }
+
+  const url = new URL(LINEAR_AUTHORIZE_URL);
+  url.search = new URLSearchParams({
+    client_id: deps.config.linearClientId,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    response_type: "code",
+    scope: "read,write,app:assignable,app:mentionable",
+    actor: "app",
+    state: oauthStates.issue(),
+  }).toString();
+  const authorizationUrl = url.toString();
+  console.log(
+    `[linear-atlas-agent] OAuth authorization URL (valid for 10 minutes): ${authorizationUrl}`,
+  );
+  deps.onOAuthAuthorizationUrl?.(authorizationUrl);
 }
 
 async function handleWebhook(
@@ -313,7 +375,15 @@ async function handleOAuthCallback(
   url: URL,
   res: ServerResponse,
   deps: ServerDeps,
+  oauthStates: OAuthStateStore,
 ): Promise<void> {
+  const state = url.searchParams.get("state");
+  if (state === null || !oauthStates.consume(state)) {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("invalid or expired state parameter");
+    return;
+  }
+
   const code = url.searchParams.get("code");
   if (code === null) {
     res.writeHead(400, { "Content-Type": "text/plain" });
@@ -344,18 +414,13 @@ async function handleOAuthCallback(
       );
     }
 
-    const json = (await response.json()) as { access_token?: string };
-    if (typeof json.access_token !== "string") {
-      throw new Error("Linear OAuth token response missing access_token");
-    }
-
-    console.log(
-      `\nLinear access token acquired. Put this in .env as LINEAR_ACCESS_TOKEN:\n\nLINEAR_ACCESS_TOKEN=${json.access_token}\n`,
-    );
+    const json = (await response.json()) as LinearOAuthTokenResponse;
+    await deps.oauth.install(json);
+    console.log("[linear-atlas-agent] OAuth token pair installed");
 
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(
-      "<html><body><p>Authorization complete. Check the server console for the access token.</p></body></html>",
+      "<html><body><p>Authorization complete. The agent will refresh its Linear access automatically.</p></body></html>",
     );
   } catch (err) {
     console.error("[linear-atlas-agent] OAuth token exchange failed:", err);

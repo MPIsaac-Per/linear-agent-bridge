@@ -1,4 +1,5 @@
 import type { AgentActivityContent } from "../types.js";
+import type { LinearOAuthTokenManager } from "./oauth.js";
 
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 
@@ -41,7 +42,7 @@ export type FetchFn = typeof fetch;
  */
 export class LinearAgentClient {
   constructor(
-    private readonly accessToken: string,
+    private readonly tokenSource: string | LinearOAuthTokenManager,
     private readonly fetchFn: FetchFn = globalThis.fetch,
   ) {}
 
@@ -49,17 +50,18 @@ export class LinearAgentClient {
     agentSessionId: string,
     content: AgentActivityContent,
   ): Promise<void> {
-    const response = await this.fetchFn(LINEAR_GRAPHQL_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.accessToken}`,
-      },
-      body: JSON.stringify({
-        query: AGENT_ACTIVITY_CREATE_MUTATION,
-        variables: { input: { agentSessionId, content } },
-      }),
-    });
+    const accessToken = await this.getAccessToken();
+    let response = await this.postActivity(accessToken, agentSessionId, content);
+
+    if (response.status === 401 && typeof this.tokenSource !== "string") {
+      const refreshedAccessToken =
+        await this.tokenSource.refreshAfterUnauthorized(accessToken);
+      response = await this.postActivity(
+        refreshedAccessToken,
+        agentSessionId,
+        content,
+      );
+    }
 
     if (!response.ok) {
       const bodyText = await response.text();
@@ -83,5 +85,29 @@ export class LinearAgentClient {
         "Linear agentActivityCreate returned success: false with no GraphQL errors",
       );
     }
+  }
+
+  private async getAccessToken(): Promise<string> {
+    return typeof this.tokenSource === "string"
+      ? this.tokenSource
+      : this.tokenSource.getAccessToken();
+  }
+
+  private postActivity(
+    accessToken: string,
+    agentSessionId: string,
+    content: AgentActivityContent,
+  ): Promise<Response> {
+    return this.fetchFn(LINEAR_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        query: AGENT_ACTIVITY_CREATE_MUTATION,
+        variables: { input: { agentSessionId, content } },
+      }),
+    });
   }
 }
