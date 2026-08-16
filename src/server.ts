@@ -305,18 +305,35 @@ async function processWebhookPayload(
   const issueIdentifier = event.agentSession.issue?.identifier;
 
   if (event.action === "created") {
-    // 10s liveness rule: emit a thought before doing anything else.
-    await deps.linear.createActivity(
-      sessionId,
-      {
-        type: "thought",
-        body: CREATED_THOUGHT_BODY,
-      },
-      { ephemeral: true },
-    );
+    const controller = registerSessionRun(deps, sessionId);
+    let enqueued = false;
+    try {
+      // 10s liveness rule: emit a thought before doing anything else.
+      await deps.linear.createActivity(
+        sessionId,
+        {
+          type: "thought",
+          body: CREATED_THOUGHT_BODY,
+        },
+        { ephemeral: true },
+      );
+      if (controller.signal.aborted) {
+        return;
+      }
 
-    const prompt = event.promptContext ?? event.agentSession.issue?.title ?? "";
-    enqueueSessionRun(deps, { linearSessionId: sessionId, prompt }, issueIdentifier);
+      const prompt = event.promptContext ?? event.agentSession.issue?.title ?? "";
+      enqueueSessionRun(
+        deps,
+        { linearSessionId: sessionId, prompt },
+        issueIdentifier,
+        controller,
+      );
+      enqueued = true;
+    } finally {
+      if (!enqueued) {
+        unregisterRun(deps, sessionId, controller);
+      }
+    }
     return;
   }
 
@@ -324,7 +341,9 @@ async function processWebhookPayload(
   // (verified against live payloads 2026-08-12); bare body is a fallback.
   const prompt = event.agentActivity?.content?.body ?? event.agentActivity?.body ?? "";
   const isStop =
-    event.agentActivity?.signal === "stop" || /^stop[.!]?$/i.test(prompt.trim());
+    event.agentActivity?.content?.signal === "stop" ||
+    event.agentActivity?.signal === "stop" ||
+    /^stop[.!]?$/i.test(prompt.trim());
   if (isStop) {
     abortSessionRuns(deps, sessionId);
     await deps.linear.createActivity(sessionId, {
@@ -334,40 +353,63 @@ async function processWebhookPayload(
     return;
   }
 
-  const record = await deps.store.get(sessionId);
-  if (prompt === "") {
-    console.log(
-      `[linear-atlas-agent] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
+  const controller = registerSessionRun(deps, sessionId);
+  let enqueued = false;
+  try {
+    const record = await deps.store.get(sessionId);
+    if (controller.signal.aborted) {
+      return;
+    }
+    if (prompt === "") {
+      console.log(
+        `[linear-atlas-agent] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
+      );
+    }
+    await deps.linear.createActivity(
+      sessionId,
+      {
+        type: "thought",
+        body: PROMPTED_THOUGHT_BODY,
+      },
+      { ephemeral: true },
     );
+    if (controller.signal.aborted) {
+      return;
+    }
+    enqueueSessionRun(
+      deps,
+      { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
+      issueIdentifier ?? record?.issueIdentifier,
+      controller,
+    );
+    enqueued = true;
+  } finally {
+    if (!enqueued) {
+      unregisterRun(deps, sessionId, controller);
+    }
   }
-  await deps.linear.createActivity(
-    sessionId,
-    {
-      type: "thought",
-      body: PROMPTED_THOUGHT_BODY,
-    },
-    { ephemeral: true },
-  );
-  enqueueSessionRun(
-    deps,
-    { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
-    issueIdentifier ?? record?.issueIdentifier,
-  );
+}
+
+function registerSessionRun(
+  deps: InternalServerDeps,
+  sessionId: string,
+): AbortController {
+  const controller = new AbortController();
+  let controllers = deps.activeRuns.get(sessionId);
+  if (controllers === undefined) {
+    controllers = new Set<AbortController>();
+    deps.activeRuns.set(sessionId, controllers);
+  }
+  controllers.add(controller);
+  return controller;
 }
 
 function enqueueSessionRun(
   deps: InternalServerDeps,
   request: Omit<SessionRequest, "abortController">,
   issueIdentifier: string | undefined,
+  controller: AbortController,
 ): void {
-  const controller = new AbortController();
-  let controllers = deps.activeRuns.get(request.linearSessionId);
-  if (controllers === undefined) {
-    controllers = new Set<AbortController>();
-    deps.activeRuns.set(request.linearSessionId, controllers);
-  }
-  controllers.add(controller);
-
   void deps.queue.enqueue(async () => {
     try {
       if (!controller.signal.aborted) {

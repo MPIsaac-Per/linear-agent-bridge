@@ -18,7 +18,7 @@ export interface LinearAgentSessionEvent {
   agentActivity?:
     | {
         body?: string | undefined;
-        content?: { type?: string; body?: string } | undefined;
+        content?: { type?: string; body?: string; signal?: string } | undefined;
         signal?: string | undefined;
       }
     | undefined;

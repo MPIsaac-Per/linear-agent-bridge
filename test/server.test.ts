@@ -134,10 +134,17 @@ interface Harness {
 
 async function startTestServer(
   runtime: AgentRuntime,
-  options: { tokenFetchImpl?: FetchFn; configOverrides?: Partial<Config> } = {},
+  options: {
+    tokenFetchImpl?: FetchFn;
+    linearFetchImpl?: (calls: LinearCall[]) => FetchFn;
+    configOverrides?: Partial<Config>;
+  } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
-  const linear = new LinearAgentClient("test-linear-token", fakeLinearFetch(calls));
+  const linear = new LinearAgentClient(
+    "test-linear-token",
+    options.linearFetchImpl?.(calls) ?? fakeLinearFetch(calls),
+  );
 
   const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "server-test-"));
   const store = new JsonSessionStore(path.join(tmpDir, "sessions.json"));
@@ -363,8 +370,7 @@ describe("startServer", () => {
         action: "prompted",
         agentSession: { id: "agent-session-stop" },
         agentActivity: {
-          content: { type: "prompt", body: "stop" },
-          signal: "stop",
+          content: { type: "prompt", body: "cancel this run", signal: "stop" },
         },
         webhookTimestamp: Date.now(),
       };
@@ -389,6 +395,90 @@ describe("startServer", () => {
     } finally {
       release.resolve();
     }
+  });
+
+  it("a stop received during follow-up setup prevents the turn from being enqueued", async () => {
+    const thoughtStarted = createDeferred<void>();
+    const releaseThought = createDeferred<void>();
+    const thoughtFinished = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      linearFetchImpl: (calls) =>
+        (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const parsed = JSON.parse(init?.body as string) as {
+            variables: { input: LinearCall };
+          };
+          const input = parsed.variables.input;
+          calls.push({
+            agentSessionId: input.agentSessionId,
+            content: input.content,
+            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+          });
+          if (input.content.type === "thought" && input.content.body === "Working on it…") {
+            thoughtStarted.resolve();
+            await releaseThought.promise;
+            thoughtFinished.resolve();
+          }
+          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+        }) as FetchFn,
+    });
+    const harness = activeHarness;
+    await harness.store.put({
+      linearSessionId: "agent-session-setup-race",
+      runtimeSessionId: "runtime-prior",
+      runtime: "fake",
+      updatedAt: new Date().toISOString(),
+    });
+
+    const promptedPayload = {
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "agent-session-setup-race" },
+      agentActivity: { content: { type: "prompt", body: "continue the work" } },
+      webhookTimestamp: Date.now(),
+    };
+    const promptedBody = JSON.stringify(promptedPayload);
+    await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(promptedBody, WEBHOOK_SECRET),
+      },
+      body: promptedBody,
+    });
+    await thoughtStarted.promise;
+
+    const stopPayload = {
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "agent-session-setup-race" },
+      agentActivity: {
+        content: { type: "prompt", body: "cancel this run", signal: "stop" },
+      },
+      webhookTimestamp: Date.now(),
+    };
+    const stopBody = JSON.stringify(stopPayload);
+    await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+      },
+      body: stopBody,
+    });
+    await waitFor(() =>
+      harness.calls.some(
+        (call) => call.content.type === "response" && call.content.body === "Stopped.",
+      ),
+    );
+
+    releaseThought.resolve();
+    await thoughtFinished.promise;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(runtime.requests).toHaveLength(0);
   });
 
   it("aborts a turn at the configured deadline and reports the timeout", async () => {
