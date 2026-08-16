@@ -8,12 +8,14 @@ export interface Config {
   kbPath: string;
   sessionStorePath: string;
   oauthTokenStorePath: string;
+  runTimeoutMs: number;
 }
 
 const DEFAULT_PORT = "3979";
 const DEFAULT_RUNTIME = "claude";
 const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
 const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
+const DEFAULT_RUN_TIMEOUT_MS = "300000";
 
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
@@ -21,6 +23,14 @@ function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
     throw new Error(`Missing required environment variable: ${key}`);
   }
   return value;
+}
+
+function positiveInteger(value: string, key: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${key} "${value}": expected a positive integer`);
+  }
+  return parsed;
 }
 
 /**
@@ -41,10 +51,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const portRaw = env.PORT ?? DEFAULT_PORT;
-  const port = Number(portRaw);
-  if (!Number.isInteger(port) || port <= 0) {
-    throw new Error(`Invalid PORT "${portRaw}": expected a positive integer`);
-  }
+  const port = positiveInteger(portRaw, "PORT");
+  const runTimeoutMs = positiveInteger(
+    env.RUN_TIMEOUT_MS ?? DEFAULT_RUN_TIMEOUT_MS,
+    "RUN_TIMEOUT_MS",
+  );
 
   return {
     linearClientId,
@@ -60,5 +71,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sessionStorePath: env.SESSION_STORE_PATH ?? DEFAULT_SESSION_STORE_PATH,
     oauthTokenStorePath:
       env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
+    runTimeoutMs,
   };
 }

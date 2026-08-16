@@ -55,8 +55,27 @@ function assistantToolUse(
   sessionId: string,
   name: string,
   input: Record<string, unknown>,
+  toolUseId = "tool_1",
 ): SDKMessage {
-  return assistantMessage(sessionId, [{ type: "tool_use", id: "tool_1", name, input }]);
+  return assistantMessage(sessionId, [{ type: "tool_use", id: toolUseId, name, input }]);
+}
+
+function userToolResult(
+  sessionId: string,
+  toolUseId: string,
+  content: string,
+  isError = false,
+): SDKMessage {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: toolUseId, content, is_error: isError }],
+    },
+    parent_tool_use_id: null,
+    uuid: "00000000-0000-0000-0000-000000000003",
+    session_id: sessionId,
+  } as unknown as SDKMessage;
 }
 
 function resultSuccess(sessionId: string, result: string): SDKMessage {
@@ -183,6 +202,58 @@ describe("ClaudeRuntime", () => {
     ]);
   });
 
+  it("pairs completed tool results with their Linear actions", async () => {
+    const sessionId = "sdk-session-tool-result";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield systemInit(sessionId);
+      yield assistantToolUse(sessionId, "Bash", { command: "printf hello" }, "tool-1");
+      yield userToolResult(sessionId, "tool-1", "hello");
+      yield resultSuccess(sessionId, "done");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-tool-result", prompt: "run it" },
+      runtime,
+    );
+
+    expect(events).toContainEqual({
+      kind: "activity",
+      activity: {
+        type: "action",
+        action: "Bash",
+        parameter: '{"command":"printf hello"}',
+        result: "Completed.",
+      },
+    });
+  });
+
+  it("marks failed tool results as failed completed actions", async () => {
+    const sessionId = "sdk-session-tool-error";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield systemInit(sessionId);
+      yield assistantToolUse(sessionId, "WebFetch", { url: "https://example.com" }, "tool-err");
+      yield userToolResult(sessionId, "tool-err", "request timed out", true);
+      yield resultSuccess(sessionId, "Could not fetch that page.");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-tool-error", prompt: "fetch it" },
+      runtime,
+    );
+
+    expect(events).toContainEqual({
+      kind: "activity",
+      activity: {
+        type: "action",
+        action: "WebFetch",
+        parameter: '{"url":"https://example.com"}',
+        result: "Failed: request timed out",
+      },
+    });
+  });
+
   it("maps a result message with an error subtype to an error activity (no throw)", async () => {
     const sessionId = "sdk-session-err-result";
     async function* stub(): AsyncGenerator<SDKMessage> {
@@ -250,6 +321,31 @@ describe("ClaudeRuntime", () => {
     const runtimeWithout = new ClaudeRuntime(KB_PATH, stubWithout as QueryFn);
     await collect({ linearSessionId: "l2", prompt: "hi" }, runtimeWithout);
     expect(capturedWithoutResume).not.toHaveProperty("resume");
+  });
+
+  it("passes the request abort controller to the SDK query", async () => {
+    let captured: Options | undefined;
+    async function* stub(params: {
+      prompt: string;
+      options?: Options;
+    }): AsyncGenerator<SDKMessage> {
+      captured = params.options;
+      yield systemInit("s-abort");
+      yield resultSuccess("s-abort", "done");
+    }
+    const controller = new AbortController();
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    await collect(
+      {
+        linearSessionId: "linear-abort",
+        prompt: "start",
+        abortController: controller,
+      },
+      runtime,
+    );
+
+    expect(captured?.abortController).toBe(controller);
   });
 
   it("sets cwd, settingSources, and bypassPermissions; never sets model or tool allowlists", async () => {

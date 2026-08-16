@@ -22,6 +22,7 @@ describe("loadConfig", () => {
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
       oauthTokenStorePath: "./data/oauth-tokens.json",
+      runTimeoutMs: 300000,
     });
   });
 
@@ -33,6 +34,7 @@ describe("loadConfig", () => {
       KB_PATH: "/tmp/kb",
       SESSION_STORE_PATH: "/tmp/sessions.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
+      RUN_TIMEOUT_MS: "45000",
     });
 
     expect(config.port).toBe(8080);
@@ -40,6 +42,7 @@ describe("loadConfig", () => {
     expect(config.kbPath).toBe("/tmp/kb");
     expect(config.sessionStorePath).toBe("/tmp/sessions.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
+    expect(config.runTimeoutMs).toBe(45000);
   });
 
   it.each([
@@ -72,6 +75,15 @@ describe("loadConfig", () => {
     "throws for an invalid PORT value %s",
     (badPort) => {
       expect(() => loadConfig({ ...validEnv, PORT: badPort })).toThrow(/PORT/);
+    },
+  );
+
+  it.each(["not-a-number", "0", "-1", "3.5"])(
+    "throws for an invalid RUN_TIMEOUT_MS value %s",
+    (badTimeout) => {
+      expect(() =>
+        loadConfig({ ...validEnv, RUN_TIMEOUT_MS: badTimeout }),
+      ).toThrow(/RUN_TIMEOUT_MS/);
     },
   );
 

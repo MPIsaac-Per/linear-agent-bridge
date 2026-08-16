@@ -6,8 +6,8 @@ your machine, in a working directory you choose, with everything that
 directory carries: CLAUDE.md instructions, MCP servers, skills. Replies
 land in the issue's agent-session thread.
 
-This is a minimal reference implementation (under 1,000 lines, no framework,
-tested). It is not a coding agent; for assign-an-issue-get-a-PR flows,
+This is a compact reference implementation (no framework, tested). It is not
+a coding agent; for assign-an-issue-get-a-PR flows,
 see [Cyrus](https://github.com/ceedaragents/cyrus). This bridge is for
 talking to an agent that knows your context: a knowledge base, an ops
 repo, a project directory.
@@ -28,6 +28,10 @@ Linear (mention / delegate / follow-up prompt)
 Session mapping (Linear session id -> SDK session id) and Linear's rotating
 OAuth token pair persist in JSON files, so follow-up prompts resume the same
 conversation and access refreshes without another browser authorization.
+
+In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
+results close the matching action, `stop` cancels the active and queued turns
+for that session, and `RUN_TIMEOUT_MS` bounds each turn (5 minutes by default).
 
 ## Prerequisites
 
@@ -122,6 +126,12 @@ session takes.
   session unresponsive.
 - Keep runtime execution serial. Concurrent headless Claude sessions on
   one host have produced cross-session content contamination.
+- Claude Agent SDK tool results arrive as `user` messages containing
+  `tool_result` blocks. Pair them to the preceding `tool_use` ID so Linear
+  receives a completed action instead of a permanent spinner.
+- Forward Linear's `stop` signal through an `AbortController`. A plain `stop`
+  prompt is accepted as a fallback. Each turn also has the hard deadline set
+  by `RUN_TIMEOUT_MS` (default: `300000`).
 - `permissionMode: "bypassPermissions"` does nothing without
   `allowDangerouslySkipPermissions: true`; the SDK requires the pair.
 - Old Agent SDK versions (0.1.x) fail to resume sessions whose transcript

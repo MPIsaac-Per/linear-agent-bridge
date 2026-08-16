@@ -29,6 +29,9 @@ refreshes it after an authenticated request returns 401.
   apply inside runtime sessions automatically.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Ack first, work after.
+- Tool results must close their matching Linear action. Stop signals abort
+  active and queued turns for that session; each turn is bounded by
+  `RUN_TIMEOUT_MS`.
 - Linear OAuth access tokens expire after 24 hours. Persist both replacement
   tokens atomically after every authorization and refresh. Never log either
   token.
