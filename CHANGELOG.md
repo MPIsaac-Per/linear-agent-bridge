@@ -7,6 +7,25 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Changed
+
+- Publish non-empty Claude assistant text immediately when an `end_turn`
+  message arrives, suppress an identical trailing success result, and retain a
+  differing result as a second durable response.
+- Make turn deadlines release the global serial queue even when a runtime or
+  timeout activity request does not settle. The server invokes a synchronous
+  runtime force-close control before the next turn starts, aborts in-flight
+  turn activity delivery, ignores late runtime events, and reports the timeout
+  once while serial queue concurrency remains one.
+- Log bounded turn lifecycle records with session id, terminal reason, and
+  queue size without including prompt or issue content.
+
+### Fixed
+
+- Preserve and close the Claude Agent SDK `Query.close()` handle exactly once
+  when stop, timeout, or shutdown aborts an active turn, including through the
+  server's explicit force-close control.
+
 ## [0.1.0] - 2026-08-16
 
 ### Added

@@ -32,6 +32,7 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
+type TurnTerminalReason = "completed" | "timed_out" | "stopped" | "failed";
 
 interface InternalServerDeps extends ServerDeps {
   activeRuns: Map<string, Set<AbortController>>;
@@ -413,11 +414,21 @@ function enqueueSessionRun(
   void deps.queue.enqueue(async () => {
     try {
       if (!controller.signal.aborted) {
-        await runSessionTask(
-          deps,
-          { ...request, abortController: controller },
-          issueIdentifier,
+        console.log(
+          `[linear-atlas-agent] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
         );
+        let terminalReason: TurnTerminalReason = "failed";
+        try {
+          terminalReason = await runSessionTask(
+            deps,
+            { ...request, abortController: controller },
+            issueIdentifier,
+          );
+        } finally {
+          console.log(
+            `[linear-atlas-agent] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
+          );
+        }
       }
     } finally {
       unregisterRun(deps, request.linearSessionId, controller);
@@ -453,30 +464,70 @@ async function runSessionTask(
   deps: InternalServerDeps,
   request: SessionRequest,
   issueIdentifier: string | undefined,
-): Promise<void> {
+): Promise<TurnTerminalReason> {
   const controller = request.abortController;
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller?.abort(new Error("Session deadline exceeded"));
-  }, deps.config.runTimeoutMs);
-
-  try {
-    for await (const event of deps.runtime.runSession(request)) {
-      if (controller?.signal.aborted === true) {
-        break;
+  let acceptEvents = true;
+  const consumeRuntime = async (): Promise<{ error?: unknown }> => {
+    try {
+      for await (const event of deps.runtime.runSession(request)) {
+        if (!acceptEvents || controller?.signal.aborted === true) {
+          break;
+        }
+        await handleRuntimeEvent(deps, request, issueIdentifier, event);
       }
-      await handleRuntimeEvent(deps, request, issueIdentifier, event);
+      return {};
+    } catch (error) {
+      return { error };
     }
-  } catch (err) {
+  };
+
+  let timeout: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<{ timedOut: true }>((resolve) => {
+    timeout = setTimeout(() => {
+      acceptEvents = false;
+      controller?.abort(new Error("Session deadline exceeded"));
+      try {
+        deps.runtime.forceCloseSession?.(request);
+      } catch (error) {
+        console.error(
+          `[linear-atlas-agent] runtime force-close failed for ${request.linearSessionId}:`,
+          error,
+        );
+      }
+      resolve({ timedOut: true });
+    }, deps.config.runTimeoutMs);
+  });
+  const outcome = await Promise.race([
+    consumeRuntime().then((result) => ({ timedOut: false as const, ...result })),
+    deadline,
+  ]);
+
+  if (outcome.timedOut) {
+    void deps.linear
+      .createActivity(request.linearSessionId, {
+        type: "error",
+        body: `This request timed out after ${formatDuration(deps.config.runTimeoutMs)}.`,
+      })
+      .catch((activityErr: unknown) => {
+        console.error(
+          `[linear-atlas-agent] failed to emit timeout activity for ${request.linearSessionId}:`,
+          activityErr,
+        );
+      });
+    return "timed_out";
+  }
+
+  clearTimeout(timeout!);
+  if (outcome.error !== undefined) {
     if (controller?.signal.aborted === true) {
-      return;
+      return "stopped";
     }
     console.error(
       `[linear-atlas-agent] session run failed for ${request.linearSessionId}:`,
-      err,
+      outcome.error,
     );
-    const body = err instanceof Error ? err.message : String(err);
+    const body =
+      outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     try {
       await deps.linear.createActivity(request.linearSessionId, { type: "error", body });
     } catch (activityErr) {
@@ -485,22 +536,9 @@ async function runSessionTask(
         activityErr,
       );
     }
-  } finally {
-    clearTimeout(timeout);
-    if (timedOut) {
-      try {
-        await deps.linear.createActivity(request.linearSessionId, {
-          type: "error",
-          body: `This request timed out after ${formatDuration(deps.config.runTimeoutMs)}.`,
-        });
-      } catch (activityErr) {
-        console.error(
-          `[linear-atlas-agent] failed to emit timeout activity for ${request.linearSessionId}:`,
-          activityErr,
-        );
-      }
-    }
+    return "failed";
   }
+  return controller?.signal.aborted === true ? "stopped" : "completed";
 }
 
 async function handleRuntimeEvent(
@@ -527,7 +565,12 @@ async function handleRuntimeEvent(
     await deps.linear.createActivity(
       request.linearSessionId,
       event.activity,
-      ephemeral ? { ephemeral: true } : {},
+      {
+        ...(ephemeral ? { ephemeral: true } : {}),
+        ...(request.abortController !== undefined
+          ? { signal: request.abortController.signal }
+          : {}),
+      },
     );
   }
 }

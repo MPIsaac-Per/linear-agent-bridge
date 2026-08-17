@@ -49,7 +49,7 @@ export class LinearAgentClient {
   async createActivity(
     agentSessionId: string,
     content: AgentActivityContent,
-    options: { ephemeral?: boolean } = {},
+    options: { ephemeral?: boolean; signal?: AbortSignal } = {},
   ): Promise<void> {
     const accessToken = await this.getAccessToken();
     let response = await this.postActivity(
@@ -104,7 +104,7 @@ export class LinearAgentClient {
     accessToken: string,
     agentSessionId: string,
     content: AgentActivityContent,
-    options: { ephemeral?: boolean },
+    options: { ephemeral?: boolean; signal?: AbortSignal },
   ): Promise<Response> {
     return this.fetchFn(LINEAR_GRAPHQL_URL, {
       method: "POST",
@@ -124,6 +124,7 @@ export class LinearAgentClient {
           },
         },
       }),
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
   }
 }

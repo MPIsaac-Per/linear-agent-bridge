@@ -59,6 +59,12 @@ export type RuntimeEvent =
 export interface AgentRuntime {
   readonly name: string;
   runSession(request: SessionRequest): AsyncIterable<RuntimeEvent>;
+  /**
+   * Optional synchronous hard-stop control. Returning means the runtime has
+   * invoked its underlying resource closer; implementations must be
+   * idempotent. The server uses this before releasing a timed-out queue slot.
+   */
+  forceCloseSession?(request: SessionRequest): void;
 }
 
 export class NotImplementedError extends Error {

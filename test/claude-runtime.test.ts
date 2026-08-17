@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
 import type { RuntimeEvent, SessionRequest } from "../src/types.js";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -28,6 +28,7 @@ function systemInit(sessionId: string): SDKMessage {
 function assistantMessage(
   sessionId: string,
   content: Array<Record<string, unknown>>,
+  stopReason: string | null = null,
 ): SDKMessage {
   return {
     type: "assistant",
@@ -37,7 +38,7 @@ function assistantMessage(
       role: "assistant",
       model: "claude-opus-4",
       content,
-      stop_reason: null,
+      stop_reason: stopReason,
       stop_sequence: null,
       usage: {},
     },
@@ -173,6 +174,131 @@ describe("ClaudeRuntime", () => {
       { kind: "session-started", runtimeSessionId: sessionId },
       { kind: "activity", activity: { type: "thought", body: "Interim finding" } },
       { kind: "activity", activity: { type: "response", body: "The final answer" } },
+      { kind: "done" },
+    ]);
+  });
+
+  it("emits end-turn assistant text as a durable response when no result follows", async () => {
+    const sessionId = "sdk-session-end-turn";
+    let streamOpen!: () => void;
+    const streamOpenWait = new Promise<void>((resolve) => {
+      streamOpen = resolve;
+    });
+    let release!: () => void;
+    const releaseWait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield systemInit(sessionId);
+      yield assistantMessage(
+        sessionId,
+        [{ type: "text", text: "The durable answer" }],
+        "end_turn",
+      );
+      streamOpen();
+      await releaseWait;
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+    const events: RuntimeEvent[] = [];
+    const collection = (async () => {
+      for await (const event of runtime.runSession({
+        linearSessionId: "linear-end-turn",
+        prompt: "hello",
+      })) {
+        events.push(event);
+      }
+    })();
+
+    await streamOpenWait;
+    expect(events).toEqual([
+      { kind: "session-started", runtimeSessionId: sessionId },
+      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+    ]);
+
+    release();
+    await collection;
+    expect(events).toEqual([
+      { kind: "session-started", runtimeSessionId: sessionId },
+      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      { kind: "done" },
+    ]);
+  });
+
+  it("suppresses a success result that repeats an emitted end-turn response", async () => {
+    const sessionId = "sdk-session-end-turn-dedupe";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield assistantMessage(
+        sessionId,
+        [{ type: "text", text: "The durable answer" }],
+        "end_turn",
+      );
+      yield resultSuccess(sessionId, "The durable answer");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-end-turn-dedupe", prompt: "hello" },
+      runtime,
+    );
+
+    expect(events).toEqual([
+      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      { kind: "done" },
+    ]);
+  });
+
+  it("forwards a success result that differs from an emitted end-turn response", async () => {
+    const sessionId = "sdk-session-end-turn-different";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield assistantMessage(
+        sessionId,
+        [{ type: "text", text: "The immediate answer" }],
+        "end_turn",
+      );
+      yield resultSuccess(sessionId, "The corrected answer");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-end-turn-different", prompt: "hello" },
+      runtime,
+    );
+
+    expect(events).toEqual([
+      { kind: "activity", activity: { type: "response", body: "The immediate answer" } },
+      { kind: "activity", activity: { type: "response", body: "The corrected answer" } },
+      { kind: "done" },
+    ]);
+  });
+
+  it("combines multiple end-turn text blocks into one durable response", async () => {
+    const sessionId = "sdk-session-end-turn-blocks";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield assistantMessage(
+        sessionId,
+        [
+          { type: "text", text: "First paragraph." },
+          { type: "text", text: "Second paragraph." },
+        ],
+        "end_turn",
+      );
+      yield resultSuccess(sessionId, "First paragraph.\nSecond paragraph.");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-end-turn-blocks", prompt: "hello" },
+      runtime,
+    );
+
+    expect(events).toEqual([
+      {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body: "First paragraph.\nSecond paragraph.",
+        },
+      },
       { kind: "done" },
     ]);
   });
@@ -346,6 +472,120 @@ describe("ClaudeRuntime", () => {
     );
 
     expect(captured?.abortController).toBe(controller);
+  });
+
+  it("closes the active SDK query exactly once when the request is aborted", async () => {
+    let entered!: () => void;
+    const enteredWait = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const releaseWait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    async function* messages(): AsyncGenerator<SDKMessage> {
+      yield systemInit("s-close-on-abort");
+      entered();
+      await releaseWait;
+    }
+    const query = messages();
+    const close = vi.fn();
+    Object.assign(query, { close });
+    const runtime = new ClaudeRuntime(KB_PATH, (() => query) as QueryFn);
+    const controller = new AbortController();
+
+    const collection = collect(
+      {
+        linearSessionId: "linear-close-on-abort",
+        prompt: "start",
+        abortController: controller,
+      },
+      runtime,
+    );
+    await enteredWait;
+    controller.abort(new Error("cancelled"));
+    release();
+    await collection;
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("force-closes the active SDK query synchronously and idempotently", async () => {
+    let entered!: () => void;
+    const enteredWait = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const releaseWait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    async function* messages(): AsyncGenerator<SDKMessage> {
+      yield systemInit("s-force-close");
+      entered();
+      await releaseWait;
+    }
+    const query = messages();
+    const close = vi.fn();
+    Object.assign(query, { close });
+    const runtime = new ClaudeRuntime(KB_PATH, (() => query) as QueryFn);
+    const request: SessionRequest = {
+      linearSessionId: "linear-force-close",
+      prompt: "start",
+      abortController: new AbortController(),
+    };
+    const collection = collect(request, runtime);
+    await enteredWait;
+
+    runtime.forceCloseSession(request);
+    runtime.forceCloseSession(request);
+
+    expect(close).toHaveBeenCalledTimes(1);
+    release();
+    await collection;
+  });
+
+  it("preserves the default SDK query close handle across lazy loading", async () => {
+    let entered!: () => void;
+    const enteredWait = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const releaseWait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    async function* messages(): AsyncGenerator<SDKMessage> {
+      yield systemInit("s-default-close");
+      entered();
+      await releaseWait;
+    }
+    const sdkQuery = messages();
+    const close = vi.fn();
+    Object.assign(sdkQuery, { close });
+    vi.doMock("@anthropic-ai/claude-agent-sdk", () => ({
+      query: () => sdkQuery,
+    }));
+    const controller = new AbortController();
+
+    try {
+      const runtime = new ClaudeRuntime(KB_PATH);
+      const collection = collect(
+        {
+          linearSessionId: "linear-default-close",
+          prompt: "start",
+          abortController: controller,
+        },
+        runtime,
+      );
+      await enteredWait;
+      controller.abort(new Error("cancelled"));
+      release();
+      await collection;
+
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock("@anthropic-ai/claude-agent-sdk");
+      release();
+    }
   });
 
   it("sets cwd, settingSources, and bypassPermissions; never sets model or tool allowlists", async () => {

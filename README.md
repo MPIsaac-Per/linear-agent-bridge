@@ -32,6 +32,9 @@ conversation and access refreshes without another browser authorization.
 In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
 for that session, and `RUN_TIMEOUT_MS` bounds each turn (5 minutes by default).
+Completed assistant text is posted as a durable response as soon as Claude
+marks the turn `end_turn`; an identical trailing SDK result is suppressed,
+while a differing result is forwarded.
 
 ## Prerequisites
 
@@ -131,7 +134,15 @@ session takes.
   receives a completed action instead of a permanent spinner.
 - Forward Linear's `stop` signal through an `AbortController`. A plain `stop`
   prompt is accepted as a fallback. Each turn also has the hard deadline set
-  by `RUN_TIMEOUT_MS` (default: `300000`).
+  by `RUN_TIMEOUT_MS` (default: `300000`). Cancellation closes the SDK query
+  process handle exactly once. Before a deadline releases the global serial
+  queue, it invokes the runtime's synchronous force-close control; an
+  uncooperative iterator still cannot retain the queue. Turn-scoped Linear
+  activity requests receive the same abort signal, late events are ignored,
+  and the timeout is reported once on a best-effort basis.
+- Turn lifecycle logs contain bounded operational fields: session id and queue
+  size at start, then session id, terminal reason, and remaining queue size at
+  completion. Prompt and issue contents are not included.
 - `permissionMode: "bypassPermissions"` does nothing without
   `allowDangerouslySkipPermissions: true`; the SDK requires the pair.
 - Old Agent SDK versions (0.1.x) fail to resume sessions whose transcript
