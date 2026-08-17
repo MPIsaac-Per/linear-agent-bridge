@@ -29,6 +29,7 @@ function assistantMessage(
   sessionId: string,
   content: Array<Record<string, unknown>>,
   stopReason: string | null = null,
+  parentToolUseId: string | null = null,
 ): SDKMessage {
   return {
     type: "assistant",
@@ -42,7 +43,7 @@ function assistantMessage(
       stop_sequence: null,
       usage: {},
     },
-    parent_tool_use_id: null,
+    parent_tool_use_id: parentToolUseId,
     uuid: "00000000-0000-0000-0000-000000000002",
     session_id: sessionId,
   } as unknown as SDKMessage;
@@ -220,6 +221,34 @@ describe("ClaudeRuntime", () => {
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
       { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      { kind: "done" },
+    ]);
+  });
+
+  it("keeps nested subagent end-turn text ephemeral", async () => {
+    const sessionId = "sdk-session-subagent-end-turn";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield assistantMessage(
+        sessionId,
+        [{ type: "text", text: "Subagent intermediate result" }],
+        "end_turn",
+        "tool-use-subagent",
+      );
+      yield resultSuccess(sessionId, "Top-level final answer");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+
+    const events = await collect(
+      { linearSessionId: "linear-subagent-end-turn", prompt: "hello" },
+      runtime,
+    );
+
+    expect(events).toEqual([
+      {
+        kind: "activity",
+        activity: { type: "thought", body: "Subagent intermediate result" },
+      },
+      { kind: "activity", activity: { type: "response", body: "Top-level final answer" } },
       { kind: "done" },
     ]);
   });

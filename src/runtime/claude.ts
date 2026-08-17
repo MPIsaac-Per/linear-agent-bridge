@@ -270,7 +270,9 @@ export class ClaudeRuntime implements AgentRuntime {
     }
 
     if (message.type === "assistant") {
-      if (message.message.stop_reason === "end_turn") {
+      const isTopLevelEndTurn =
+        message.message.stop_reason === "end_turn" && message.parent_tool_use_id === null;
+      if (isTopLevelEndTurn) {
         const body = message.message.content
           .flatMap((block) =>
             block.type === "text" && block.text.trim() !== "" ? [block.text] : [],
@@ -282,7 +284,7 @@ export class ClaudeRuntime implements AgentRuntime {
       }
       for (const block of message.message.content) {
         if (block.type === "text") {
-          if (message.message.stop_reason !== "end_turn" && block.text.trim() !== "") {
+          if (!isTopLevelEndTurn && block.text.trim() !== "") {
             yield { kind: "activity", activity: { type: "thought", body: block.text } };
           }
         } else if (block.type === "tool_use") {
