@@ -173,3 +173,7 @@ Check current terms before depending on the economics.
 ## License
 
 MIT
+
+
+## Documentation
+- [Add contributor, security, and GitHub community documentation](CONTRIBUTING.md)
