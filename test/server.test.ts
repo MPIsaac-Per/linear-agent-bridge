@@ -9,6 +9,7 @@ import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
 import { SerialQueue } from "../src/queue.js";
+import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
 import type {
   AgentActivityContent,
   AgentRuntime,
@@ -36,6 +37,10 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
 
 function sign(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body).digest("hex");
+}
+
+function serverUrl(port: number, pathName: string): string {
+  return `http://[::1]:${port}${pathName}`;
 }
 
 function createDeferred<T>(): {
@@ -235,7 +240,7 @@ describe("startServer", () => {
     const body = JSON.stringify(payload);
     const signature = sign(body, WEBHOOK_SECRET);
 
-    const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "linear-signature": signature },
       body,
@@ -276,6 +281,52 @@ describe("startServer", () => {
     });
   });
 
+  it("logs turn lifecycle with bounded session, reason, and queue fields", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      activeHarness = await startTestServer(runtime);
+      const harness = activeHarness;
+      const payload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-log", issue: { title: "secret issue title" } },
+        promptContext: "secret prompt contents",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+
+      await waitFor(() =>
+        logSpy.mock.calls.some((call) => String(call[0]).includes("turn terminal")),
+      );
+      expect(
+        logSpy.mock.calls
+          .map((call) => call.join(" "))
+          .filter((line) => line.includes("[linear-atlas-agent] turn ")),
+      ).toEqual([
+        "[linear-atlas-agent] turn start: session=agent-session-log queue=1",
+        "[linear-atlas-agent] turn terminal: session=agent-session-log reason=completed queue=0",
+      ]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("signed prompted event with a pre-seeded store record: fake runtime receives resumeSessionId", async () => {
     const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
       yield { kind: "session-started", runtimeSessionId: "runtime-session-resumed" };
@@ -305,7 +356,7 @@ describe("startServer", () => {
     const body = JSON.stringify(payload);
     const signature = sign(body, WEBHOOK_SECRET);
 
-    const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "linear-signature": signature },
       body,
@@ -355,7 +406,7 @@ describe("startServer", () => {
         webhookTimestamp: Date.now(),
       };
       const createdBody = JSON.stringify(createdPayload);
-      await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+      await fetch(serverUrl(harness.port, "/webhook"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -375,7 +426,7 @@ describe("startServer", () => {
         webhookTimestamp: Date.now(),
       };
       const stopBody = JSON.stringify(stopPayload);
-      const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+      const response = await fetch(serverUrl(harness.port, "/webhook"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -441,7 +492,7 @@ describe("startServer", () => {
       webhookTimestamp: Date.now(),
     };
     const promptedBody = JSON.stringify(promptedPayload);
-    await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -461,7 +512,7 @@ describe("startServer", () => {
       webhookTimestamp: Date.now(),
     };
     const stopBody = JSON.stringify(stopPayload);
-    await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -515,7 +566,7 @@ describe("startServer", () => {
         webhookTimestamp: Date.now(),
       };
       const body = JSON.stringify(payload);
-      const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+      const response = await fetch(serverUrl(harness.port, "/webhook"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -538,6 +589,318 @@ describe("startServer", () => {
     }
   });
 
+  it("aborts an in-flight turn activity delivery at the hard deadline", async () => {
+    const activityStarted = createDeferred<void>();
+    let activitySignal: AbortSignal | null | undefined;
+    let activityCompleted = false;
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "activity delivery that hangs" },
+      };
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runTimeoutMs: 30 },
+      linearFetchImpl: (calls) =>
+        (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const parsed = JSON.parse(init?.body as string) as {
+            variables: { input: LinearCall };
+          };
+          const input = parsed.variables.input;
+          calls.push({
+            agentSessionId: input.agentSessionId,
+            content: input.content,
+            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+          });
+          if (
+            input.content.type === "response" &&
+            input.content.body === "activity delivery that hangs"
+          ) {
+            activitySignal = init?.signal;
+            activityStarted.resolve();
+            await new Promise<void>((_resolve, reject) => {
+              const rejectAbort = (): void => {
+                const error = new Error("activity delivery aborted");
+                error.name = "AbortError";
+                reject(error);
+              };
+              if (activitySignal?.aborted === true) {
+                rejectAbort();
+              } else {
+                activitySignal?.addEventListener("abort", rejectAbort, { once: true });
+              }
+            });
+            activityCompleted = true;
+          }
+          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+        }) as FetchFn,
+    });
+    const harness = activeHarness;
+    const payload = {
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "agent-session-activity-timeout", issue: { title: "Hang" } },
+      promptContext: "deliver a response",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await activityStarted.promise;
+    await waitFor(() =>
+      harness.calls.some(
+        (call) =>
+          call.agentSessionId === "agent-session-activity-timeout" &&
+          call.content.type === "error" &&
+          call.content.body === "This request timed out after 30 ms.",
+      ),
+    );
+
+    expect(activitySignal?.aborted).toBe(true);
+    expect(activityCompleted).toBe(false);
+  });
+
+  it("hard timeout releases the serial queue and ignores late runtime events", async () => {
+    const releaseFirst = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      yield {
+        kind: "session-started",
+        runtimeSessionId: `runtime-${request.linearSessionId}`,
+      };
+      if (request.linearSessionId === "agent-session-hard-timeout") {
+        await releaseFirst.promise;
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "late response must be ignored" },
+        };
+        return;
+      }
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "queued turn completed" },
+      };
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runTimeoutMs: 30 },
+      linearFetchImpl: (calls) =>
+        (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const parsed = JSON.parse(init?.body as string) as {
+            variables: { input: LinearCall };
+          };
+          const input = parsed.variables.input;
+          calls.push({
+            agentSessionId: input.agentSessionId,
+            content: input.content,
+            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+          });
+          if (
+            input.content.type === "error" &&
+            input.content.body === "This request timed out after 30 ms."
+          ) {
+            return await new Promise<Response>(() => {});
+          }
+          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+        }) as FetchFn,
+    });
+    const harness = activeHarness;
+
+    try {
+      for (const sessionId of ["agent-session-hard-timeout", "agent-session-queued"]) {
+        const payload = {
+          type: "AgentSessionEvent",
+          action: "created",
+          agentSession: { id: sessionId, issue: { title: "Bounded request" } },
+          promptContext: sessionId,
+          webhookTimestamp: Date.now(),
+        };
+        const body = JSON.stringify(payload);
+        expect(
+          (
+            await fetch(serverUrl(harness.port, "/webhook"), {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "linear-signature": sign(body, WEBHOOK_SECRET),
+              },
+              body,
+            })
+          ).status,
+        ).toBe(200);
+      }
+
+      await waitFor(
+        () =>
+          runtime.requests.length === 2 &&
+          harness.calls.some(
+            (call) =>
+              call.agentSessionId === "agent-session-queued" &&
+              call.content.type === "response" &&
+              call.content.body === "queued turn completed",
+          ),
+        250,
+      );
+
+      const timeoutCalls = harness.calls.filter(
+        (call) =>
+          call.agentSessionId === "agent-session-hard-timeout" &&
+          call.content.type === "error" &&
+          call.content.body === "This request timed out after 30 ms.",
+      );
+      expect(timeoutCalls).toHaveLength(1);
+
+      releaseFirst.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(
+        harness.calls.some(
+          (call) =>
+            call.content.type === "response" &&
+            call.content.body === "late response must be ignored",
+        ),
+      ).toBe(false);
+      expect(
+        harness.calls.filter(
+          (call) =>
+            call.agentSessionId === "agent-session-hard-timeout" &&
+            call.content.type === "error" &&
+            call.content.body === "This request timed out after 30 ms.",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
+  it("force-closes a timed-out runtime before the next queued turn starts", async () => {
+    const releaseFirst = createDeferred<void>();
+    const order: string[] = [];
+    const runtime: AgentRuntime = {
+      name: "force-close-aware",
+      forceCloseSession(request): void {
+        order.push(`closed:${request.linearSessionId}`);
+      },
+      async *runSession(request): AsyncGenerator<RuntimeEvent> {
+        order.push(`started:${request.linearSessionId}`);
+        if (request.linearSessionId === "agent-session-close-first") {
+          await releaseFirst.promise;
+          return;
+        }
+        yield { kind: "done" };
+      },
+    };
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runTimeoutMs: 30 },
+    });
+    const harness = activeHarness;
+
+    try {
+      for (const sessionId of ["agent-session-close-first", "agent-session-close-next"]) {
+        const payload = {
+          type: "AgentSessionEvent",
+          action: "created",
+          agentSession: { id: sessionId, issue: { title: "Force close ordering" } },
+          promptContext: sessionId,
+          webhookTimestamp: Date.now(),
+        };
+        const body = JSON.stringify(payload);
+        expect(
+          (
+            await fetch(serverUrl(harness.port, "/webhook"), {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "linear-signature": sign(body, WEBHOOK_SECRET),
+              },
+              body,
+            })
+          ).status,
+        ).toBe(200);
+      }
+
+      await waitFor(() => order.includes("started:agent-session-close-next"), 250);
+      expect(order).toEqual([
+        "started:agent-session-close-first",
+        "closed:agent-session-close-first",
+        "started:agent-session-close-next",
+      ]);
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
+  it("closes the first Claude query before starting the next queued Claude turn", async () => {
+    const releaseFirst = createDeferred<void>();
+    const order: string[] = [];
+    const queryFn: QueryFn = ({ prompt }) => {
+      order.push(`started:${prompt}`);
+      const stream = (async function* () {
+        if (prompt === "claude-close-first") {
+          await releaseFirst.promise;
+        }
+      })();
+      return Object.assign(stream, {
+        close(): void {
+          order.push(`closed:${prompt}`);
+        },
+      });
+    };
+    const runtime = new ClaudeRuntime("/tmp/kb-unused", queryFn);
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runTimeoutMs: 30 },
+    });
+    const harness = activeHarness;
+
+    try {
+      for (const sessionId of ["claude-close-first", "claude-close-next"]) {
+        const payload = {
+          type: "AgentSessionEvent",
+          action: "created",
+          agentSession: { id: sessionId, issue: { title: "Claude close ordering" } },
+          promptContext: sessionId,
+          webhookTimestamp: Date.now(),
+        };
+        const body = JSON.stringify(payload);
+        expect(
+          (
+            await fetch(serverUrl(harness.port, "/webhook"), {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "linear-signature": sign(body, WEBHOOK_SECRET),
+              },
+              body,
+            })
+          ).status,
+        ).toBe(200);
+      }
+
+      await waitFor(() => order.includes("started:claude-close-next"), 250);
+      expect(order).toEqual([
+        "started:claude-close-first",
+        "closed:claude-close-first",
+        "started:claude-close-next",
+      ]);
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
   it("rejects an invalid signature with 401 and enqueues nothing", async () => {
     const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
       yield { kind: "done" };
@@ -556,7 +919,7 @@ describe("startServer", () => {
     const body = JSON.stringify(payload);
     const badSignature = sign(body, "wrong-secret");
 
-    const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "linear-signature": badSignature },
       body,
@@ -590,7 +953,7 @@ describe("startServer", () => {
     const body = JSON.stringify(payload);
     const signature = sign(body, WEBHOOK_SECRET);
 
-    const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "linear-signature": signature },
       body,
@@ -610,7 +973,7 @@ describe("startServer", () => {
       content: { type: "error", body: "kaboom" },
     });
 
-    const health = await fetch(`http://127.0.0.1:${harness.port}/healthz`);
+    const health = await fetch(serverUrl(harness.port, "/healthz"));
     expect(health.status).toBe(200);
     expect(await health.text()).toBe("ok");
   });
@@ -643,7 +1006,7 @@ describe("startServer", () => {
       expect(state).toMatch(/^[A-Za-z0-9_-]{40,}$/);
 
       const response = await fetch(
-        `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz&state=${state}`,
+        serverUrl(harness.port, `/oauth/callback?code=auth-code-xyz&state=${state}`),
       );
       expect(response.status).toBe(200);
 
@@ -694,15 +1057,17 @@ describe("startServer", () => {
     const harness = activeHarness;
 
     const missingState = await fetch(
-      `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz`,
+      serverUrl(harness.port, "/oauth/callback?code=auth-code-xyz"),
     );
     expect(missingState.status).toBe(400);
     expect(harness.tokenFetch).not.toHaveBeenCalled();
 
     const state = new URL(await harness.authorizationUrl).searchParams.get("state");
     expect(state).not.toBeNull();
-    const callbackUrl =
-      `http://127.0.0.1:${harness.port}/oauth/callback?code=auth-code-xyz&state=${state}`;
+    const callbackUrl = serverUrl(
+      harness.port,
+      `/oauth/callback?code=auth-code-xyz&state=${state}`,
+    );
 
     expect((await fetch(callbackUrl)).status).toBe(200);
     expect(harness.tokenFetch).toHaveBeenCalledTimes(1);
@@ -727,7 +1092,7 @@ describe("startServer", () => {
     const body = JSON.stringify(payload);
     const signature = sign(body, WEBHOOK_SECRET);
 
-    const response = await fetch(`http://127.0.0.1:${harness.port}/webhook`, {
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "linear-signature": signature },
       body,

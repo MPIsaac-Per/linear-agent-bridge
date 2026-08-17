@@ -4,7 +4,7 @@ import type {
   RuntimeEvent,
   SessionRequest,
 } from "../types.js";
-import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 /** Max length of a compact, one-line tool-input summary before truncation. */
 const MAX_ACTION_PARAMETER_LENGTH = 200;
@@ -21,23 +21,50 @@ interface PendingToolUse {
  * lazy-imported (see `defaultQuery` below) so importing this module never
  * loads the Claude Code CLI; tests inject their own stub and never touch it.
  */
+type QueryStream = AsyncIterable<SDKMessage> & { close?: () => void };
+
 export type QueryFn = (params: {
   prompt: string;
   options?: Options;
-}) => AsyncIterable<SDKMessage>;
+}) => QueryStream;
 
 /**
- * Default `QueryFn`: an async generator function. Calling it returns the
- * generator object synchronously without running any body code, so the
- * dynamic `import()` — and therefore the CLI — only loads on first
- * iteration (i.e. when a real session actually runs).
+ * Default `QueryFn`: a decorated async generator. Calling it returns the
+ * stream synchronously without loading the CLI; first iteration performs
+ * the dynamic import. Its `close()` method forwards to the SDK Query once
+ * available, preserving the process-cleanup handle across lazy loading.
  */
-async function* defaultQuery(params: {
+function defaultQuery(params: {
   prompt: string;
   options?: Options;
-}): AsyncGenerator<SDKMessage, void> {
-  const { query } = await import("@anthropic-ai/claude-agent-sdk");
-  yield* query(params);
+}): QueryStream {
+  let activeQuery: Query | undefined;
+  let closeRequested = false;
+  let activeQueryClosed = false;
+  const closeActiveQuery = (): void => {
+    if (activeQuery !== undefined && !activeQueryClosed) {
+      activeQueryClosed = true;
+      activeQuery.close();
+    }
+  };
+  const stream = (async function* (): AsyncGenerator<SDKMessage, void> {
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
+    activeQuery = query(params);
+    if (closeRequested) {
+      closeActiveQuery();
+      return;
+    }
+    yield* activeQuery;
+  })();
+  return Object.assign(stream, {
+    close(): void {
+      if (closeRequested) {
+        return;
+      }
+      closeRequested = true;
+      closeActiveQuery();
+    },
+  });
 }
 
 /** Compact one-line JSON summary of a tool call's input, truncated if long. */
@@ -109,11 +136,18 @@ function summarizeToolResult(content: unknown, isError: boolean): string {
  */
 export class ClaudeRuntime implements AgentRuntime {
   readonly name = "claude";
+  private readonly activeQueryClosers = new WeakMap<AbortController, () => void>();
 
   constructor(
     private readonly kbPath: string,
     private readonly queryFn: QueryFn = defaultQuery,
   ) {}
+
+  forceCloseSession(request: SessionRequest): void {
+    if (request.abortController !== undefined) {
+      this.activeQueryClosers.get(request.abortController)?.();
+    }
+  }
 
   async *runSession(request: SessionRequest): AsyncIterable<RuntimeEvent> {
     const options: Options = {
@@ -136,13 +170,38 @@ export class ClaudeRuntime implements AgentRuntime {
     // body; forwarding both renders duplicated text in Linear. Hold each
     // thought back one step and drop it if the result repeats it.
     let pendingThought: RuntimeEvent | undefined;
+    let durableAssistantResponseBody: string | undefined;
     const pendingToolUses = new Map<string, PendingToolUse>();
+    const query = this.queryFn({ prompt: request.prompt, options });
+    let queryClosed = false;
+    const closeQuery = (): void => {
+      if (!queryClosed && query.close !== undefined) {
+        queryClosed = true;
+        query.close();
+      }
+    };
+    if (request.abortController !== undefined) {
+      this.activeQueryClosers.set(request.abortController, closeQuery);
+    }
+    request.abortController?.signal.addEventListener("abort", closeQuery, { once: true });
+    if (request.abortController?.signal.aborted === true) {
+      closeQuery();
+    }
     try {
-      for await (const message of this.queryFn({ prompt: request.prompt, options })) {
+      for await (const message of query) {
         if (request.abortController?.signal.aborted === true) {
           break;
         }
         for (const ev of this.mapMessage(message, pendingToolUses)) {
+          const repeatsDurableAssistantResponse =
+            message.type === "result" &&
+            message.subtype === "success" &&
+            ev.kind === "activity" &&
+            ev.activity.type === "response" &&
+            ev.activity.body === durableAssistantResponseBody;
+          if (repeatsDurableAssistantResponse) {
+            continue;
+          }
           const isDuplicateResponse =
             ev.kind === "activity" &&
             ev.activity.type === "response" &&
@@ -158,6 +217,13 @@ export class ClaudeRuntime implements AgentRuntime {
           if (ev.kind === "activity" && ev.activity.type === "thought") {
             pendingThought = ev;
           } else {
+            if (
+              message.type === "assistant" &&
+              ev.kind === "activity" &&
+              ev.activity.type === "response"
+            ) {
+              durableAssistantResponseBody = ev.activity.body;
+            }
             yield ev;
           }
         }
@@ -181,6 +247,14 @@ export class ClaudeRuntime implements AgentRuntime {
       const body = err instanceof Error ? err.message : String(err);
       yield { kind: "activity", activity: { type: "error", body } };
       throw err;
+    } finally {
+      request.abortController?.signal.removeEventListener("abort", closeQuery);
+      if (
+        request.abortController !== undefined &&
+        this.activeQueryClosers.get(request.abortController) === closeQuery
+      ) {
+        this.activeQueryClosers.delete(request.abortController);
+      }
     }
   }
 
@@ -196,9 +270,19 @@ export class ClaudeRuntime implements AgentRuntime {
     }
 
     if (message.type === "assistant") {
+      if (message.message.stop_reason === "end_turn") {
+        const body = message.message.content
+          .flatMap((block) =>
+            block.type === "text" && block.text.trim() !== "" ? [block.text] : [],
+          )
+          .join("\n");
+        if (body !== "") {
+          yield { kind: "activity", activity: { type: "response", body } };
+        }
+      }
       for (const block of message.message.content) {
         if (block.type === "text") {
-          if (block.text.trim() !== "") {
+          if (message.message.stop_reason !== "end_turn" && block.text.trim() !== "") {
             yield { kind: "activity", activity: { type: "thought", body: block.text } };
           }
         } else if (block.type === "tool_use") {
