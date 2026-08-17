@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.linear-claude-bridge</string>
+	<string>com.linear-agent-bridge</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>__REPO_DIR__/deploy/run.sh</string>
@@ -15,9 +15,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>__HOME__/Library/Logs/linear-claude-bridge.log</string>
+	<string>__HOME__/Library/Logs/linear-agent-bridge.log</string>
 	<key>StandardErrorPath</key>
-	<string>__HOME__/Library/Logs/linear-claude-bridge.log</string>
+	<string>__HOME__/Library/Logs/linear-agent-bridge.log</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>

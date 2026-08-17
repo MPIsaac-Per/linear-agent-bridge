@@ -1,9 +1,9 @@
 {
-  "name": "linear-claude-bridge",
+  "name": "linear-agent-bridge",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Run your Claude Code context as a Linear agent: mention it on an issue, chat in the session thread",
+  "description": "Bridge Linear agent sessions to a local agent runtime",
   "engines": {
     "node": ">=22"
   },

@@ -1,4 +1,4 @@
-# linear-claude-bridge
+# linear-agent-bridge
 
 Run your Claude Code setup as a Linear agent. Delegate an issue to it or
 message it in an agent session, and a Claude Agent SDK session runs on

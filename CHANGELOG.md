@@ -9,6 +9,9 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ### Changed
 
+- Rename the project from `linear-claude-bridge` to `linear-agent-bridge` to
+  reflect its runtime-agnostic architecture. The macOS installer removes the
+  legacy launchd job during upgrade so only one bridge process remains active.
 - Publish non-empty Claude assistant text immediately when an `end_turn`
   message arrives, suppress an identical trailing success result, and retain a
   differing result as a second durable response.
@@ -52,5 +55,5 @@ Changes awaiting a tagged release remain under Unreleased.
   cancellation before asynchronous follow-up setup, preventing work from being
   queued after a stop response. ([#3](https://github.com/MPIsaac-Per/linear-claude-bridge/pull/3))
 
-[Unreleased]: https://github.com/MPIsaac-Per/linear-claude-bridge/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/MPIsaac-Per/linear-claude-bridge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/MPIsaac-Per/linear-agent-bridge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/MPIsaac-Per/linear-agent-bridge/releases/tag/v0.1.0

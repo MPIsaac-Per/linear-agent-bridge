@@ -1,4 +1,4 @@
-# linear-claude-bridge
+# linear-agent-bridge
 
 Bridge between Linear's Agent Interaction API and a local agent runtime
 (Claude Agent SDK by default). Mention or assign the agent in Linear; it

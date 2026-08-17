@@ -317,10 +317,10 @@ describe("startServer", () => {
       expect(
         logSpy.mock.calls
           .map((call) => call.join(" "))
-          .filter((line) => line.includes("[linear-atlas-agent] turn ")),
+          .filter((line) => line.includes("[linear-agent-bridge] turn ")),
       ).toEqual([
-        "[linear-atlas-agent] turn start: session=agent-session-log queue=1",
-        "[linear-atlas-agent] turn terminal: session=agent-session-log reason=completed queue=0",
+        "[linear-agent-bridge] turn start: session=agent-session-log queue=1",
+        "[linear-agent-bridge] turn terminal: session=agent-session-log reason=completed queue=0",
       ]);
     } finally {
       logSpy.mockRestore();
@@ -1026,7 +1026,7 @@ describe("startServer", () => {
       expect(params.get("redirect_uri")).toBe("http://localhost:3979/oauth/callback");
 
       expect(logSpy).toHaveBeenCalledWith(
-        "[linear-atlas-agent] OAuth token pair installed",
+        "[linear-agent-bridge] OAuth token pair installed",
       );
       const logged = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(logged).not.toContain("tok-secret-123");

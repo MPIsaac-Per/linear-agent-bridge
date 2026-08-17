@@ -28,4 +28,4 @@ startServer({
   store: new JsonSessionStore(config.sessionStorePath),
   queue: new SerialQueue(),
 });
-console.log(`linear-atlas-agent listening on :${config.port} (runtime: ${config.runtime})`);
+console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);

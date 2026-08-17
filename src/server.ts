@@ -113,7 +113,7 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
   };
   const server = createServer((req, res) => {
     handleRequest(req, res, internalDeps, oauthStates).catch((err: unknown) => {
-      console.error("[linear-atlas-agent] request handler failed:", err);
+      console.error("[linear-agent-bridge] request handler failed:", err);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
       }
@@ -199,7 +199,7 @@ async function emitOAuthAuthorizationUrlIfNeeded(
   }).toString();
   const authorizationUrl = url.toString();
   console.log(
-    `[linear-atlas-agent] OAuth authorization URL (valid for 10 minutes): ${authorizationUrl}`,
+    `[linear-agent-bridge] OAuth authorization URL (valid for 10 minutes): ${authorizationUrl}`,
   );
   deps.onOAuthAuthorizationUrl?.(authorizationUrl);
 }
@@ -217,7 +217,7 @@ async function handleWebhook(
     : signatureHeaderRaw;
 
   if (!verifyWebhook(rawBody, signatureHeader, deps.config.linearWebhookSecret)) {
-    console.error("[linear-atlas-agent] webhook rejected: invalid signature or stale timestamp");
+    console.error("[linear-agent-bridge] webhook rejected: invalid signature or stale timestamp");
     res.writeHead(401, { "Content-Type": "text/plain" });
     res.end("invalid signature");
     return;
@@ -228,7 +228,7 @@ async function handleWebhook(
   res.end("ok");
 
   processWebhookPayload(rawBody, deps).catch((err: unknown) => {
-    console.error("[linear-atlas-agent] webhook processing failed:", err);
+    console.error("[linear-agent-bridge] webhook processing failed:", err);
   });
 }
 
@@ -294,12 +294,12 @@ async function processWebhookPayload(
     // what arrived so payload-shape mismatches are visible in the log.
     const p = payload as Record<string, unknown> | null;
     console.log(
-      `[linear-atlas-agent] ignored webhook: type=${String(p?.type)} action=${String(p?.action)} keys=${p ? Object.keys(p).join(",") : "null"}`,
+      `[linear-agent-bridge] ignored webhook: type=${String(p?.type)} action=${String(p?.action)} keys=${p ? Object.keys(p).join(",") : "null"}`,
     );
     return;
   }
   console.log(
-    `[linear-atlas-agent] agent session event: action=${event.action} session=${event.agentSession.id}`,
+    `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id}`,
   );
 
   const sessionId = event.agentSession.id;
@@ -363,7 +363,7 @@ async function processWebhookPayload(
     }
     if (prompt === "") {
       console.log(
-        `[linear-atlas-agent] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
+        `[linear-agent-bridge] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
       );
     }
     await deps.linear.createActivity(
@@ -415,7 +415,7 @@ function enqueueSessionRun(
     try {
       if (!controller.signal.aborted) {
         console.log(
-          `[linear-atlas-agent] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
+          `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
         );
         let terminalReason: TurnTerminalReason = "failed";
         try {
@@ -426,7 +426,7 @@ function enqueueSessionRun(
           );
         } finally {
           console.log(
-            `[linear-atlas-agent] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
+            `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
           );
         }
       }
@@ -490,7 +490,7 @@ async function runSessionTask(
         deps.runtime.forceCloseSession?.(request);
       } catch (error) {
         console.error(
-          `[linear-atlas-agent] runtime force-close failed for ${request.linearSessionId}:`,
+          `[linear-agent-bridge] runtime force-close failed for ${request.linearSessionId}:`,
           error,
         );
       }
@@ -510,7 +510,7 @@ async function runSessionTask(
       })
       .catch((activityErr: unknown) => {
         console.error(
-          `[linear-atlas-agent] failed to emit timeout activity for ${request.linearSessionId}:`,
+          `[linear-agent-bridge] failed to emit timeout activity for ${request.linearSessionId}:`,
           activityErr,
         );
       });
@@ -523,7 +523,7 @@ async function runSessionTask(
       return "stopped";
     }
     console.error(
-      `[linear-atlas-agent] session run failed for ${request.linearSessionId}:`,
+      `[linear-agent-bridge] session run failed for ${request.linearSessionId}:`,
       outcome.error,
     );
     const body =
@@ -532,7 +532,7 @@ async function runSessionTask(
       await deps.linear.createActivity(request.linearSessionId, { type: "error", body });
     } catch (activityErr) {
       console.error(
-        `[linear-atlas-agent] failed to emit error activity for ${request.linearSessionId}:`,
+        `[linear-agent-bridge] failed to emit error activity for ${request.linearSessionId}:`,
         activityErr,
       );
     }
@@ -632,14 +632,14 @@ async function handleOAuthCallback(
 
     const json = (await response.json()) as LinearOAuthTokenResponse;
     await deps.oauth.install(json);
-    console.log("[linear-atlas-agent] OAuth token pair installed");
+    console.log("[linear-agent-bridge] OAuth token pair installed");
 
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(
       "<html><body><p>Authorization complete. The agent will refresh its Linear access automatically.</p></body></html>",
     );
   } catch (err) {
-    console.error("[linear-atlas-agent] OAuth token exchange failed:", err);
+    console.error("[linear-agent-bridge] OAuth token exchange failed:", err);
     res.writeHead(500, { "Content-Type": "text/plain" });
     res.end("OAuth token exchange failed");
   }

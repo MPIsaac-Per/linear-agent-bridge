@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 REPO_DIR=$(pwd)
-LABEL="com.linear-claude-bridge"
+LABEL="com.linear-agent-bridge"
+LEGACY_LABEL="com.linear-claude-bridge"
 PLIST=~/Library/LaunchAgents/$LABEL.plist
 
 # 1. Refuse to install without config
@@ -22,7 +23,10 @@ mkdir -p ~/Library/Logs ~/Library/LaunchAgents
 sed -e "s|__REPO_DIR__|$REPO_DIR|g" -e "s|__HOME__|$HOME|g" \
 	deploy/launchd.plist.template > "$PLIST"
 
-# 4. (Re)load the service
+# 4. (Re)load the service. Remove the pre-rename launchd job so upgrades
+# do not leave two bridge processes consuming the same webhook and stores.
+launchctl bootout "gui/$(id -u)/$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
