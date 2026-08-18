@@ -8,7 +8,10 @@ import type { Config } from "../src/config.js";
 import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
-import { JsonBridgeStateStore } from "../src/state/store.js";
+import {
+  JsonBridgeStateStore,
+  type JsonBridgeStateStoreOptions,
+} from "../src/state/store.js";
 import { SerialQueue } from "../src/queue.js";
 import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
 import type {
@@ -139,6 +142,7 @@ interface Harness {
   calls: LinearCall[];
   store: JsonSessionStore;
   bridgeState: JsonBridgeStateStore;
+  bridgeStatePath: string;
   activityIds: string[];
   tokenFetch: ReturnType<typeof vi.fn>;
   oauthTokenStorePath: string;
@@ -153,6 +157,7 @@ async function startTestServer(
     configOverrides?: Partial<Config>;
     makeBridgeStatePathDirectory?: boolean;
     bridgeStateOwnerId?: string;
+    bridgeStateOptions?: JsonBridgeStateStoreOptions;
     prepareBridgeState?: (storePath: string) => Promise<void>;
   } = {},
 ): Promise<Harness> {
@@ -171,6 +176,7 @@ async function startTestServer(
   }
   await options.prepareBridgeState?.(bridgeStatePath);
   const bridgeState = new JsonBridgeStateStore(bridgeStatePath, {
+    ...options.bridgeStateOptions,
     ...(options.bridgeStateOwnerId !== undefined
       ? { ownerId: options.bridgeStateOwnerId }
       : {}),
@@ -226,6 +232,7 @@ async function startTestServer(
     calls,
     store,
     bridgeState,
+    bridgeStatePath,
     activityIds,
     tokenFetch,
     oauthTokenStorePath,
@@ -357,6 +364,339 @@ describe("startServer", () => {
       expect(logged).not.toContain("raw-persistence-prompt-body");
       expect(logged).not.toContain("EISDIR");
       expect(logged).not.toContain("bridge-state.json");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("retries a visible claim after its directory sync fails and executes it once", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        bridgeStateOwnerId: "runtime-a",
+      });
+      const harness = activeHarness;
+      const stateDirectory = path.dirname(harness.bridgeStatePath);
+      const originalOpen = fsPromises.open.bind(fsPromises);
+      let stateDirectorySyncs = 0;
+      openSpy = vi
+        .spyOn(fsPromises, "open")
+        .mockImplementation(async (...args) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]) === stateDirectory) {
+            const originalSync = handle.sync.bind(handle);
+            vi.spyOn(handle, "sync").mockImplementation(async () => {
+              stateDirectorySyncs += 1;
+              if (stateDirectorySyncs === 2) {
+                throw new Error("synthetic final claim directory sync failure");
+              }
+              await originalSync();
+            });
+          }
+          return handle;
+        });
+      const payload = {
+        webhookId: "webhook-final-claim-sync-retry",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-final-claim-sync-retry" },
+        promptContext: "private retry exactly once prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const send = async (): Promise<Response> => {
+        const body = JSON.stringify(payload);
+        return fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        });
+      };
+
+      expect((await send()).status).toBe(503);
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt(payload.webhookId),
+      ).resolves.toMatchObject({
+        status: "claimed",
+        ownerId: "runtime-a",
+      });
+
+      const [retry, concurrentRetry] = await Promise.all([send(), send()]);
+      expect(retry.status).toBe(200);
+      expect(concurrentRetry.status).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(runtime.requests).toHaveLength(1);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("private retry exactly once prompt");
+      expect(logged).not.toContain("synthetic final claim directory sync failure");
+    } finally {
+      openSpy?.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("retries after marker and release fail before either state write", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        bridgeStateOwnerId: "runtime-a",
+      });
+      const harness = activeHarness;
+      const originalOpen = fsPromises.open.bind(fsPromises);
+      let stateTempOpens = 0;
+      let markerOpenFailed = false;
+      openSpy = vi
+        .spyOn(fsPromises, "open")
+        .mockImplementation(async (...args) => {
+          const openedPath = String(args[0]);
+          if (
+            openedPath.includes(".bridge-state.json.") &&
+            openedPath.endsWith(".tmp")
+          ) {
+            stateTempOpens += 1;
+            if (stateTempOpens === 3) {
+              markerOpenFailed = true;
+              throw new Error("synthetic marker open failure");
+            }
+          }
+          return await originalOpen(...args);
+        });
+      const originalReadFile = fsPromises.readFile.bind(fsPromises);
+      let releaseReadFailed = false;
+      readSpy = vi
+        .spyOn(fsPromises, "readFile")
+        .mockImplementation(async (...args) => {
+          if (
+            markerOpenFailed &&
+            !releaseReadFailed &&
+            String(args[0]) === harness.bridgeStatePath
+          ) {
+            releaseReadFailed = true;
+            throw new Error("synthetic release read failure");
+          }
+          return await originalReadFile(...args);
+        });
+      const payload = {
+        webhookId: "webhook-marker-release-retry",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-marker-release-retry" },
+        promptContext: "private marker release retry prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const send = async (): Promise<Response> => {
+        const body = JSON.stringify(payload);
+        return fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        });
+      };
+
+      expect((await send()).status).toBe(200);
+      await waitFor(() => releaseReadFailed);
+      expect(runtime.requests).toHaveLength(0);
+      const visibleReceipt = await harness.bridgeState.getReceipt(payload.webhookId);
+      expect(visibleReceipt?.dispatchStartedAt).toBeUndefined();
+
+      const [retry, concurrentRetry] = await Promise.all([send(), send()]);
+      expect(retry.status).toBe(200);
+      expect(concurrentRetry.status).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(runtime.requests).toHaveLength(1);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("private marker release retry prompt");
+      expect(logged).not.toContain("synthetic marker open failure");
+      expect(logged).not.toContain("synthetic release read failure");
+    } finally {
+      readSpy?.mockRestore();
+      openSpy?.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("returns 503 with headroom before Linear's five-second deadline when the state lock is busy", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        prepareBridgeState: async (storePath) => {
+          const lockPath = `${storePath}.lock`;
+          const token = "live-lock-owner";
+          await fsPromises.mkdir(lockPath, { mode: 0o700 });
+          await fsPromises.writeFile(
+            path.join(lockPath, `${token}.json`),
+            `${JSON.stringify({ token, pid: process.pid, hostname: os.hostname() })}\n`,
+            { mode: 0o600 },
+          );
+        },
+      });
+      const harness = activeHarness;
+      const payload = {
+        webhookId: "webhook-lock-contention",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-lock-contention" },
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      const startedAt = Date.now();
+      const response = await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+
+      expect(response.status).toBe(503);
+      expect(Date.now() - startedAt).toBeLessThan(2_500);
+      expect(runtime.requests).toHaveLength(0);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("error=BridgeStateLockTimeoutError"),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("times out while queued behind a same-store mutation and never runs the abandoned claim later", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        bridgeStateOptions: { lockTimeoutMs: 100 },
+      });
+      const harness = activeHarness;
+      const releaseMutationTail = createDeferred<void>();
+      (
+        harness.bridgeState as unknown as {
+          mutationTail: Promise<void>;
+        }
+      ).mutationTail = releaseMutationTail.promise;
+
+      const payload = {
+        webhookId: "webhook-queued-timeout",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-queued-timeout" },
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      const startedAt = Date.now();
+      const responsePromise = fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+      let queuedMutationDrain: Promise<void> | undefined;
+      try {
+        const response = await responsePromise;
+        expect(response.status).toBe(503);
+        expect(Date.now() - startedAt).toBeLessThan(1_000);
+        queuedMutationDrain = (
+          harness.bridgeState as unknown as {
+            mutationTail: Promise<void>;
+          }
+        ).mutationTail;
+      } finally {
+        releaseMutationTail.resolve(undefined);
+        await queuedMutationDrain;
+      }
+      await expect(
+        harness.bridgeState.getReceipt(payload.webhookId),
+      ).resolves.toBeUndefined();
+      expect(runtime.requests).toHaveLength(0);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("error=BridgeStateLockTimeoutError"),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("releases a pre-dispatch claim when the dispatch marker fails so a retry can run", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime);
+      const harness = activeHarness;
+      const originalMarkDispatchStarted =
+        harness.bridgeState.markDispatchStarted.bind(harness.bridgeState);
+      const markSpy = vi
+        .spyOn(harness.bridgeState, "markDispatchStarted")
+        .mockImplementation(originalMarkDispatchStarted);
+      markSpy.mockRejectedValueOnce(new Error("synthetic marker write failure"));
+      const payload = {
+        webhookId: "webhook-dispatch-marker-retry",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-dispatch-marker-retry" },
+        promptContext: "private retry prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const send = async (): Promise<Response> => {
+        const body = JSON.stringify(payload);
+        return fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        });
+      };
+
+      expect((await send()).status).toBe(200);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "received",
+      );
+      expect(runtime.requests).toHaveLength(0);
+
+      expect((await send()).status).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(markSpy).toHaveBeenCalledTimes(2);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("private retry prompt");
+      expect(logged).not.toContain("synthetic marker write failure");
     } finally {
       errorSpy.mockRestore();
     }
@@ -937,7 +1277,10 @@ describe("startServer", () => {
 
     releaseThought.resolve();
     await thoughtFinished.promise;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt(promptedPayload.webhookId))?.status ===
+      "completed",
+    );
     expect(runtime.requests).toHaveLength(0);
   });
 

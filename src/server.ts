@@ -27,7 +27,10 @@ import type {
   IngressEventIdentity,
   ReceiptErrorClass,
 } from "./state/store.js";
-import { ClaimOwnershipError } from "./state/store.js";
+import {
+  BridgeStateLockTimeoutError,
+  ClaimOwnershipError,
+} from "./state/store.js";
 import type { SerialQueue } from "./queue.js";
 
 /** Linear's OAuth2 token-exchange endpoint (linear.app/developers/oauth-2-0-authentication). */
@@ -98,6 +101,13 @@ class OAuthStateStore {
         this.states.delete(state);
       }
     }
+  }
+}
+
+class PreDispatchClaimReleasedError extends Error {
+  constructor() {
+    super("Dispatch marker was not persisted; the ingress claim was released");
+    this.name = "PreDispatchClaimReleasedError";
   }
 }
 
@@ -313,7 +323,10 @@ async function handleWebhook(
     console.error(
       `[linear-agent-bridge] webhook processing failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
     );
-    if (!(error instanceof ClaimOwnershipError)) {
+    if (
+      !(error instanceof ClaimOwnershipError) &&
+      !(error instanceof PreDispatchClaimReleasedError)
+    ) {
       await markIngressFailed(deps, identity, "WebhookProcessingError");
     }
   });
@@ -390,7 +403,24 @@ async function processClaimedWebhook(
   identity: IngressEventIdentity,
   deps: InternalServerDeps,
 ): Promise<void> {
-  await deps.bridgeState.markDispatchStarted(identity.webhookId);
+  try {
+    await deps.bridgeState.markDispatchStarted(identity.webhookId);
+  } catch (error) {
+    let released = false;
+    try {
+      released = await deps.bridgeState.releasePreDispatchClaim(
+        identity.webhookId,
+      );
+    } catch (releaseError) {
+      console.error(
+        `[linear-agent-bridge] pre-dispatch claim release failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(releaseError)}`,
+      );
+    }
+    if (released) {
+      throw new PreDispatchClaimReleasedError();
+    }
+    throw error;
+  }
   console.log(
     `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
   );
@@ -807,6 +837,12 @@ function boundedLogValue(value: unknown): string {
 }
 
 function boundedErrorClass(error: unknown): string {
+  if (error instanceof BridgeStateLockTimeoutError) {
+    return "BridgeStateLockTimeoutError";
+  }
+  if (error instanceof PreDispatchClaimReleasedError) {
+    return "PreDispatchClaimReleasedError";
+  }
   if (error instanceof ClaimOwnershipError) {
     return "ClaimOwnershipError";
   }

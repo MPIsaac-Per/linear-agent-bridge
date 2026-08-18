@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 export const DEFAULT_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_RECEIPT_MAX_ENTRIES = 10_000;
@@ -10,8 +13,9 @@ const MAX_EXECUTION_ID_LENGTH = 512;
 const MAX_ACTIVITY_KEY_LENGTH = 128;
 const MAX_ACTIVITY_IDS_PER_CLAIM = 10_000;
 const LOCK_RETRY_MS = 10;
-const LOCK_TIMEOUT_MS = 5_000;
-const STALE_LOCK_MS = 30_000;
+const LOCK_TIMEOUT_MS = 1_000;
+const MAX_PROCESS_IDENTITY_LENGTH = 512;
+const execFileAsync = promisify(execFile);
 
 export type IngressAction = "created" | "prompted";
 export type IngressStatus =
@@ -91,6 +95,7 @@ export type ClaimEventResult =
 export interface BridgeStateStore {
   claimEvent(identity: IngressEventIdentity): Promise<ClaimEventResult>;
   markDispatchStarted(webhookId: string): Promise<void>;
+  releasePreDispatchClaim(webhookId: string): Promise<boolean>;
   completeEvent(webhookId: string): Promise<void>;
   failEvent(webhookId: string, errorClass?: ReceiptErrorClass): Promise<void>;
   getReceipt(webhookId: string): Promise<IngressReceipt | undefined>;
@@ -109,12 +114,32 @@ export interface JsonBridgeStateStoreOptions {
   retentionMs?: number;
   now?: () => number;
   ownerId?: string;
+  lockRetryMs?: number;
+  lockTimeoutMs?: number;
+  lockProcessIdentity?: (pid: number) => Promise<string | undefined>;
+}
+
+interface LegacyLockOwnerRecord {
+  token: string;
+  pid: number;
+  hostname: string;
+}
+
+interface LockOwnerRecord extends LegacyLockOwnerRecord {
+  processIdentity: string;
 }
 
 export class ClaimOwnershipError extends Error {
   constructor(webhookId: string) {
     super(`Claim ownership was lost for webhookId "${webhookId}"`);
     this.name = "ClaimOwnershipError";
+  }
+}
+
+export class BridgeStateLockTimeoutError extends Error {
+  constructor() {
+    super("Timed out acquiring bridge state lock");
+    this.name = "BridgeStateLockTimeoutError";
   }
 }
 
@@ -131,6 +156,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   private readonly retentionMs: number;
   private readonly now: () => number;
   private readonly ownerId: string;
+  private readonly lockRetryMs: number;
+  private readonly lockTimeoutMs: number;
+  private readonly lockProcessIdentity: (
+    pid: number,
+  ) => Promise<string | undefined>;
+  // This process may reclaim a visible pre-dispatch claim only when the
+  // mutation that created it never completed through lock release.
+  private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -141,6 +174,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     this.retentionMs = options.retentionMs ?? DEFAULT_RECEIPT_RETENTION_MS;
     this.now = options.now ?? Date.now;
     this.ownerId = options.ownerId ?? randomUUID();
+    this.lockRetryMs = options.lockRetryMs ?? LOCK_RETRY_MS;
+    this.lockTimeoutMs = options.lockTimeoutMs ?? LOCK_TIMEOUT_MS;
+    this.lockProcessIdentity =
+      options.lockProcessIdentity ?? defaultLockProcessIdentity;
 
     if (!Number.isInteger(this.maxEntries) || this.maxEntries <= 0) {
       throw new Error("maxEntries must be a positive integer");
@@ -148,13 +185,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (!Number.isInteger(this.retentionMs) || this.retentionMs <= 0) {
       throw new Error("retentionMs must be a positive integer");
     }
+    if (!Number.isInteger(this.lockRetryMs) || this.lockRetryMs <= 0) {
+      throw new Error("lockRetryMs must be a positive integer");
+    }
+    if (!Number.isInteger(this.lockTimeoutMs) || this.lockTimeoutMs <= 0) {
+      throw new Error("lockTimeoutMs must be a positive integer");
+    }
     validateIdentifier(this.ownerId, "ownerId");
   }
 
   async claimEvent(identity: IngressEventIdentity): Promise<ClaimEventResult> {
     validateIdentity(identity);
 
-    return await this.mutate(async () => {
+    return await this.mutateClaim(async () => {
       const state = await this.readState();
       this.prune(state);
       const existingReceipt = state.receipts[identity.webhookId];
@@ -281,6 +324,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       const state = await this.readState();
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
       if (claim.dispatchStartedAt !== undefined) {
+        this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return;
       }
 
@@ -295,6 +339,36 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         disposition: "claimed",
       };
       await this.writeState(state);
+      this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+    });
+  }
+
+  releasePreDispatchClaim(webhookId: string): Promise<boolean> {
+    validateIdentifier(webhookId, "webhookId");
+    this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
+      if (claim.dispatchStartedAt !== undefined) {
+        return false;
+      }
+
+      const timestamp = this.timestamp();
+      delete state.claims[claim.executionId];
+      receipt.status = "received";
+      receipt.updatedAt = timestamp;
+      delete receipt.ownerId;
+      delete receipt.claimedAt;
+      delete receipt.dispatchStartedAt;
+      receipt.outcome = {
+        httpStatus: 503,
+        result: "retry",
+        disposition: "received",
+        errorClass: "IngressPersistenceError",
+      };
+      await this.writeState(state);
+      return true;
     });
   }
 
@@ -428,6 +502,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         return { disposition: "ambiguous", receipt };
       }
 
+      if (
+        claim.dispatchStartedAt === undefined &&
+        !this.locallyAcceptedPreDispatchClaims.has(receipt.webhookId)
+      ) {
+        claim.claimedAt = timestamp;
+        claim.updatedAt = timestamp;
+        receipt.claimedAt = timestamp;
+        receipt.updatedAt = timestamp;
+        receipt.outcome = acceptedOutcome();
+        await this.writeState(state);
+        return { disposition: "claimed", receipt };
+      }
+
       receipt.updatedAt = timestamp;
       receipt.outcome = {
         httpStatus: 200,
@@ -474,57 +561,206 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     return { claim, receipt };
   }
 
-  private mutate<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.mutationTail.then(() => this.withFileLock(operation));
-    this.mutationTail = result.then(
+  private mutateClaim(
+    operation: () => Promise<ClaimEventResult>,
+  ): Promise<ClaimEventResult> {
+    return this.mutate(operation, (result) => {
+      if (result.disposition === "claimed") {
+        this.locallyAcceptedPreDispatchClaims.add(result.receipt.webhookId);
+      }
+    });
+  }
+
+  private mutate<T>(
+    operation: () => Promise<T>,
+    onSuccess?: (result: T) => void,
+  ): Promise<T> {
+    const deadline = Date.now() + this.lockTimeoutMs;
+    let started = false;
+    let timeout: NodeJS.Timeout | undefined;
+    const scheduled = this.mutationTail.then(() => {
+      if (Date.now() >= deadline) {
+        throw new BridgeStateLockTimeoutError();
+      }
+      started = true;
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+      return this.withFileLock(operation, deadline).then((result) => {
+        onSuccess?.(result);
+        return result;
+      });
+    });
+    this.mutationTail = scheduled.then(
       () => undefined,
       () => undefined,
     );
-    return result;
+    return new Promise<T>((resolve, reject) => {
+      timeout = setTimeout(() => {
+        if (!started) {
+          reject(new BridgeStateLockTimeoutError());
+        }
+      }, this.lockTimeoutMs);
+      scheduled.then(resolve, reject).finally(() => {
+        if (timeout !== undefined) {
+          clearTimeout(timeout);
+        }
+      });
+    });
   }
 
-  private async withFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  private async withFileLock<T>(
+    operation: () => Promise<T>,
+    deadline: number,
+  ): Promise<T> {
     const directory = path.dirname(this.statePath);
     const lockPath = `${this.statePath}.lock`;
     await fs.mkdir(directory, { recursive: true });
-    const startedAt = Date.now();
-    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-
-    while (handle === undefined) {
-      try {
-        handle = await fs.open(lockPath, "wx", 0o600);
-      } catch (error) {
-        if (!isNodeError(error, "EEXIST")) {
-          throw error;
-        }
-        await this.removeStaleLock(lockPath);
-        if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) {
-          throw new Error(`Timed out acquiring bridge state lock: ${lockPath}`);
-        }
-        await delay(LOCK_RETRY_MS);
-      }
-    }
-
+    const lockToken = randomUUID();
+    const candidatePath = `${lockPath}.${lockToken}.candidate`;
+    const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
+    await fs.mkdir(candidatePath, { mode: 0o700 });
+    let acquired = false;
     try {
+      await this.writeLockOwner(candidateOwnerPath, lockToken);
+      while (!acquired) {
+        if (Date.now() >= deadline) {
+          throw new BridgeStateLockTimeoutError();
+        }
+        try {
+          await fs.rename(candidatePath, lockPath);
+          acquired = true;
+          if (Date.now() >= deadline) {
+            throw new BridgeStateLockTimeoutError();
+          }
+        } catch (error) {
+          if (
+            !isNodeError(error, "EEXIST") &&
+            !isNodeError(error, "ENOTEMPTY")
+          ) {
+            throw error;
+          }
+          await this.removeAbandonedLock(lockPath);
+          if (Date.now() >= deadline) {
+            throw new BridgeStateLockTimeoutError();
+          }
+          await delay(this.lockRetryMs);
+        }
+      }
+
       return await operation();
     } finally {
-      await handle.close();
-      await fs.unlink(lockPath).catch((error: unknown) => {
-        if (!isNodeError(error, "ENOENT")) {
-          throw error;
-        }
-      });
+      if (acquired) {
+        await this.releaseOwnedLock(lockPath, lockToken);
+      }
+      await fs.rm(candidatePath, { recursive: true, force: true });
     }
   }
 
-  private async removeStaleLock(lockPath: string): Promise<void> {
+  private async writeLockOwner(ownerPath: string, token: string): Promise<void> {
+    const handle = await fs.open(ownerPath, "wx", 0o600);
     try {
-      const stat = await fs.stat(lockPath);
-      if (Date.now() - stat.mtimeMs > STALE_LOCK_MS) {
-        await fs.unlink(lockPath);
+      const processIdentity = await this.lockProcessIdentity(process.pid);
+      if (!isValidProcessIdentity(processIdentity)) {
+        throw new Error("Could not determine current process identity for state lock");
       }
+      const owner: LockOwnerRecord = {
+        token,
+        pid: process.pid,
+        hostname: os.hostname(),
+        processIdentity,
+      };
+      await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+      await handle.chmod(0o600);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async removeAbandonedLock(lockPath: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(lockPath);
     } catch (error) {
-      if (!isNodeError(error, "ENOENT")) {
+      if (isNodeError(error, "ENOENT")) {
+        return;
+      }
+      throw error;
+    }
+    if (entries.length !== 1 || !entries[0]!.endsWith(".json")) {
+      return;
+    }
+
+    const ownerPath = path.join(lockPath, entries[0]!);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fs.readFile(ownerPath, "utf8"));
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return;
+      }
+      return;
+    }
+    if (!isLegacyLockOwnerRecord(parsed)) {
+      return;
+    }
+    const owner = parsed;
+    const expectedName = `${owner.token}.json`;
+    if (
+      entries[0] !== expectedName ||
+      owner.hostname !== os.hostname() ||
+      !Number.isSafeInteger(owner.pid) ||
+      owner.pid <= 0
+    ) {
+      return;
+    }
+
+    if (!isProcessAlive(owner.pid)) {
+      await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+      return;
+    }
+    if (!isLockOwnerRecord(owner)) {
+      return;
+    }
+    let currentProcessIdentity: string | undefined;
+    try {
+      currentProcessIdentity = await this.lockProcessIdentity(owner.pid);
+    } catch {
+      return;
+    }
+    if (
+      currentProcessIdentity === undefined ||
+      currentProcessIdentity === owner.processIdentity
+    ) {
+      return;
+    }
+
+    await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+  }
+
+  private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
+    await this.removeLockDirectoryOwnedBy(lockPath, token);
+  }
+
+  private async removeLockDirectoryOwnedBy(
+    lockPath: string,
+    token: string,
+  ): Promise<void> {
+    const ownerPath = path.join(lockPath, `${token}.json`);
+    try {
+      await fs.unlink(ownerPath);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      await fs.rmdir(lockPath);
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT") && !isNodeError(error, "ENOTEMPTY")) {
         throw error;
       }
     }
@@ -562,15 +798,25 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       directory,
       `.${path.basename(this.statePath)}.${randomUUID()}.tmp`,
     );
+    let tmpHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
 
     try {
-      await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      tmpHandle = await fs.open(tmpPath, "wx", 0o600);
+      await tmpHandle.writeFile(JSON.stringify(state, null, 2), "utf8");
+      await tmpHandle.chmod(0o600);
+      await tmpHandle.sync();
+      await tmpHandle.close();
+      tmpHandle = undefined;
+
       await fs.rename(tmpPath, this.statePath);
-      await fs.chmod(this.statePath, 0o600);
+      const directoryHandle = await fs.open(directory, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
     } finally {
+      await tmpHandle?.close().catch(() => undefined);
       await fs.unlink(tmpPath).catch((error: unknown) => {
         if (!isNodeError(error, "ENOENT")) {
           throw error;
@@ -697,6 +943,112 @@ function isPersistedBridgeState(value: unknown): value is PersistedBridgeState {
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isNodeError(error, "ESRCH");
+  }
+}
+
+function isLegacyLockOwnerRecord(
+  value: unknown,
+): value is LegacyLockOwnerRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.token === "string" &&
+    record.token.length > 0 &&
+    record.token.length <= 256 &&
+    typeof record.pid === "number" &&
+    Number.isSafeInteger(record.pid) &&
+    typeof record.hostname === "string" &&
+    record.hostname.length > 0 &&
+    record.hostname.length <= 256
+  );
+}
+
+function isLockOwnerRecord(value: unknown): value is LockOwnerRecord {
+  if (!isLegacyLockOwnerRecord(value)) {
+    return false;
+  }
+  const record = value as unknown as Record<string, unknown>;
+  return isValidProcessIdentity(record.processIdentity);
+}
+
+function isValidProcessIdentity(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_PROCESS_IDENTITY_LENGTH
+  );
+}
+
+let currentProcessIdentityPromise: Promise<string | undefined> | undefined;
+
+function defaultLockProcessIdentity(
+  pid: number,
+): Promise<string | undefined> {
+  if (pid === process.pid) {
+    currentProcessIdentityPromise ??= readCurrentProcessIdentity();
+    return currentProcessIdentityPromise;
+  }
+  return readProcessIdentity(pid);
+}
+
+async function readCurrentProcessIdentity(): Promise<string | undefined> {
+  return readProcessIdentity(process.pid);
+}
+
+async function readProcessIdentity(pid: number): Promise<string | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return undefined;
+  }
+  if (process.platform === "linux") {
+    try {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      if (commandEnd < 0) {
+        return undefined;
+      }
+      const fieldsAfterCommand = stat
+        .slice(commandEnd + 1)
+        .trim()
+        .split(/\s+/);
+      const startTime = fieldsAfterCommand[19];
+      return startTime !== undefined && /^\d+$/.test(startTime)
+        ? `linux-proc-start:${startTime}`
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (process.platform === "darwin") {
+    try {
+      const result = await execFileAsync(
+        "/bin/ps",
+        ["-o", "lstart=", "-p", String(pid)],
+        {
+          encoding: "utf8",
+          timeout: 1_000,
+          maxBuffer: 4_096,
+          env: { ...process.env, LC_ALL: "C" },
+        },
+      );
+      const startedAt = result.stdout.trim().replace(/\s+/g, " ");
+      return startedAt === ""
+        ? undefined
+        : `darwin-ps-start:${startedAt}`;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 function delay(milliseconds: number): Promise<void> {

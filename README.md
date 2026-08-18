@@ -38,6 +38,8 @@ prompted turns use `agentActivity.id`. A claim left active by a process crash is
 reclaimed by a replacement process only when dispatch never started. The bridge
 persists a dispatch marker as the first processing step; a retry after that
 marker is explicitly recorded as ambiguous and is not run automatically.
+If persisting that marker fails before it is written, the bridge releases the
+pre-dispatch claim so a later delivery can reclaim it without a restart.
 Terminal state is retained for seven days and capped at 10,000 receipts; active
 claims are never evicted. State can exceed the cap only if more than 10,000
 claims are simultaneously active.
@@ -103,7 +105,12 @@ excluded from Git.
 persistent local storage as well. It contains only bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
 and caller-generated activity UUIDs, never prompt or activity bodies. Writes
-use a same-directory atomic rename and owner-only file mode.
+set an owner-only mode and sync the temporary file before a same-directory
+atomic rename, then sync the containing directory. A process-owned lock bounds
+contention to one second so the webhook can still return 503 before Linear's
+five-second deadline. An old lock is retained while its recorded local process
+is alive; an exited process's lock can be reclaimed without allowing the prior
+owner to unlink a replacement lock.
 
 #### Upgrading an existing installation
 
