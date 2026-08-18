@@ -27,7 +27,14 @@ assert_not_contains() {
 }
 
 file_mode() {
-	stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+	local mode
+	if mode=$(stat -f '%Lp' "$1" 2>/dev/null); then
+		printf '%s\n' "$mode"
+	elif mode=$(stat -c '%a' "$1" 2>/dev/null); then
+		printf '%s\n' "$mode"
+	else
+		return 1
+	fi
 }
 
 make_fixture() {
@@ -115,7 +122,31 @@ EOF
 #!/bin/bash
 exit 0
 EOF
-	chmod +x "$fixture/bin/npm" "$fixture/bin/node" "$fixture/bin/launchctl" "$fixture/bin/curl" "$fixture/bin/sleep"
+	cat > "$fixture/bin/stat" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ "$#" -ne 3 ] || [ "$1" != "-f" ]; then
+	echo "fixture stat supports only the macOS stat -f interface" >&2
+	exit 64
+fi
+if value=$(/usr/bin/stat -f "$2" "$3" 2>/dev/null); then
+	printf '%s\n' "$value"
+elif [ "$2" = '%u' ]; then
+	/usr/bin/stat -c '%u' "$3"
+elif [ "$2" = '%Lp' ]; then
+	/usr/bin/stat -c '%a' "$3"
+else
+	echo "unsupported fixture stat format" >&2
+	exit 64
+fi
+EOF
+	chmod +x \
+		"$fixture/bin/npm" \
+		"$fixture/bin/node" \
+		"$fixture/bin/launchctl" \
+		"$fixture/bin/curl" \
+		"$fixture/bin/sleep" \
+		"$fixture/bin/stat"
 	printf '%s\n' "$fixture"
 }
 
