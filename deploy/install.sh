@@ -50,7 +50,7 @@ rollback_service() {
 		rm -f "$LEGACY_PLIST"
 	fi
 	if curl -fsS --connect-timeout 1 --max-time 1 \
-		"http://localhost:$PORT/healthz" >/dev/null 2>&1; then
+		"http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
 		echo "Install failed; the previous build and launchd configuration were restored and are healthy." >&2
 	elif [ "$PREVIOUS_HEALTHY" -eq 1 ]; then
 		echo "Install failed; the previous build and launchd configuration were restored, but the service was healthy before install and is now unconfirmed. Check ~/Library/Logs/linear-agent-bridge.log." >&2
@@ -141,7 +141,7 @@ fi
 # Record whether this port was healthy for the rollback report. A failed probe
 # does not prevent install because this may be the first installation.
 if curl -fsS --connect-timeout 1 --max-time 1 \
-	"http://localhost:$PORT/healthz" >/dev/null 2>&1; then
+	"http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
 	PREVIOUS_HEALTHY=1
 fi
 
@@ -155,12 +155,14 @@ rm -f "$LEGACY_PLIST"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
-# 6. Poll health for a bounded window. An unhealthy candidate exits nonzero;
-# the EXIT trap restores the previous build and launchd configuration.
+# 6. Poll health for a bounded window against the loopback listener the Funnel
+# will target. An unhealthy candidate exits nonzero; the EXIT trap restores the
+# previous build and launchd configuration.
+HEALTH_URL="http://127.0.0.1:$PORT/healthz"
 HEALTH_RESULT=""
 for attempt in 1 2 3 4 5; do
-	if HEALTH_RESULT=$(curl -fsS --connect-timeout 1 --max-time 1 \
-		"http://localhost:$PORT/healthz" 2>/dev/null); then
+	if HEALTH_RESULT=$(curl -q -fsS --connect-timeout 1 --max-time 1 \
+		"$HEALTH_URL" 2>/dev/null); then
 		break
 	fi
 	HEALTH_RESULT=""
@@ -169,26 +171,78 @@ for attempt in 1 2 3 4 5; do
 	fi
 done
 if [ -z "$HEALTH_RESULT" ]; then
-	echo "Health check failed after 5 attempts." >&2
+	echo "Local health check failed after 5 attempts: $HEALTH_URL" >&2
+	exit 1
+fi
+if [ "$HEALTH_RESULT" != "ok" ]; then
+	echo "Local health check returned an unexpected response: $HEALTH_URL" >&2
 	exit 1
 fi
 echo "Health check: $HEALTH_RESULT"
 ROLLBACK_NEEDED=0
 DIST_BACKED_UP=0
 
-# 7. Optional: expose publicly with tailscale funnel (macOS keeps the CLI
-#    inside the app bundle). Skip silently if tailscale isn't present.
-TAILSCALE=$(command -v tailscale || echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+# 7. Expose this exact loopback listener directly with Tailscale Funnel when
+#    available (macOS keeps the CLI inside the app bundle).
+TAILSCALE=${TAILSCALE_BIN:-$(command -v tailscale || echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale")}
 if [ -x "$TAILSCALE" ]; then
-	"$TAILSCALE" funnel --bg "$PORT" || echo "Funnel failed; front the service with any public HTTPS ingress (see README)"
-	echo ""
-	FUNNEL_STATUS=$("$TAILSCALE" funnel status 2>/dev/null || echo "")
-	FUNNEL_URL=$(echo "$FUNNEL_STATUS" | grep -oE 'https://[^/ ]+' | head -1 || echo "")
-	if [ -n "$FUNNEL_URL" ]; then
-		echo "Webhook URL: $FUNNEL_URL/webhook"
-	else
-		echo "Run '$TAILSCALE funnel status' and use https://<host>/webhook as the webhook URL"
+	FUNNEL_TARGET="http://127.0.0.1:$PORT"
+	FUNNEL_CLEANUP_REQUIRED=0
+	FUNNEL_STATUS_FILE=$(mktemp "${TMPDIR:-/tmp}/linear-agent-funnel.XXXXXX")
+	cleanup_funnel_setup() {
+		cleanup_status=$?
+		trap - EXIT HUP INT TERM
+		rm -f -- "$FUNNEL_STATUS_FILE"
+		rm -rf -- "$INSTALL_TEMP"
+		if [ "$FUNNEL_CLEANUP_REQUIRED" = "1" ]; then
+			if ! "$TAILSCALE" funnel --https=443 off >/dev/null 2>&1; then
+				echo "Funnel cleanup failed; run: '$TAILSCALE' funnel --https=443 off" >&2
+			fi
+		fi
+		exit "$cleanup_status"
+	}
+	trap cleanup_funnel_setup EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+
+	# Refuse to overwrite an unrelated public route. Only an empty public
+	# Funnel state may be changed; the exact target is an idempotent success.
+	"$TAILSCALE" funnel status --json > "$FUNNEL_STATUS_FILE"
+	if ! FUNNEL_PREFLIGHT=$(node deploy/parse-funnel-status.mjs preflight "$FUNNEL_TARGET" "$FUNNEL_STATUS_FILE"); then
+		echo "Refusing to replace unrelated or ambiguous public Funnel state" >&2
+		exit 1
 	fi
+
+	case "$FUNNEL_PREFLIGHT" in
+		empty)
+			# Arm teardown before mutation. Preflight proved there is no unrelated
+			# public Funnel route, so `off` can only remove this attempted setup.
+			FUNNEL_CLEANUP_REQUIRED=1
+			"$TAILSCALE" funnel --bg "$FUNNEL_TARGET"
+			"$TAILSCALE" funnel status --json > "$FUNNEL_STATUS_FILE"
+			if ! WEBHOOK_URL=$(node deploy/parse-funnel-status.mjs verify "$FUNNEL_TARGET" "$FUNNEL_STATUS_FILE"); then
+				echo "Funnel status did not contain exactly one public route to $FUNNEL_TARGET" >&2
+				exit 1
+			fi
+			FUNNEL_CLEANUP_REQUIRED=0
+			;;
+		existing\ *)
+			WEBHOOK_URL=${FUNNEL_PREFLIGHT#existing }
+			echo "Funnel already targets $FUNNEL_TARGET; leaving it unchanged"
+			;;
+		*)
+			echo "Invalid Funnel preflight result" >&2
+			exit 1
+			;;
+	esac
+	echo "Webhook URL: $WEBHOOK_URL"
+	echo "Verify with: WEBHOOK_URL='$WEBHOOK_URL' LINEAR_WEBHOOK_SECRET='<from .env>' ./deploy/verify-ingress.sh"
 else
-	echo "tailscale not found; front the service with any public HTTPS ingress (see README)"
+	if [ "${SKIP_FUNNEL:-0}" = "1" ]; then
+		echo "SKIP_FUNNEL=1: service installed without public ingress"
+	else
+		echo "tailscale not found; refusing to complete without public ingress (set SKIP_FUNNEL=1 for an explicit local-only install)" >&2
+		exit 1
+	fi
 fi
