@@ -29,28 +29,32 @@ Linear (mention / delegate / follow-up prompt)
 Session mapping (Linear session id -> SDK session id), bounded webhook state,
 and Linear's rotating OAuth token pair persist in JSON files. Follow-up prompts
 resume the same conversation, webhook retries do not dispatch the same turn
-twice, accepted work survives a process exit before dispatch, and access
-refreshes without another browser authorization.
+twice, pre-intent work survives a process exit, and access refreshes without
+another browser authorization.
 
 For each valid agent event, the bridge durably persists a receipt keyed by
 Linear's `webhookId` and a semantic execution claim before returning 200.
 Created turns use `created:<agentSession.id>` as the execution identity;
-prompted turns use `agentActivity.id`. A claim left active by a process crash is
-reclaimed by a replacement process only when dispatch never started. The bridge
-persists a dispatch marker as the first processing step; a retry after that
-marker is explicitly recorded as ambiguous and is not run automatically.
-Before acknowledging a new turn, the bridge stores its recovery payload in an
-AES-256-GCM envelope. Startup processes marker-free accepted turns in durable
-order before reporting healthy. If persisting the dispatch marker fails before
-it is written, the bridge releases the pre-dispatch claim and schedules the
-same recovery path without requiring another Linear delivery. The envelope is
-deleted atomically with the dispatch marker; terminal and superseded receipts
-do not retain it.
-Marker-free accepted events are hard-capped at 128; new ingress fails closed
-with 503 when that recovery capacity is full. Separately, terminal state is
-retained for seven days and capped at 10,000 receipts. Active claims are never
-evicted, so the receipt store can exceed 10,000 only when active claims alone
-exceed that limit.
+prompted turns use `agentActivity.id`. Before acknowledging a new turn, the
+bridge stores its recovery payload in an AES-256-GCM envelope. The envelope
+remains through the Linear liveness activity, serial-queue wait, and durable
+runtime-start intent written immediately before runtime invocation. Failures
+before that intent release the claim for ordered replay without another Linear
+delivery. A stop or shutdown that wins before invocation rolls the intent back.
+
+A replacement process replays accepted work with no runtime-start intent. An
+intent-bearing receipt is kept as conservative `AmbiguousDispatch` state and is
+not invoked again because the replacement cannot prove whether runtime work
+started. This irreversible runtime-start window is the remaining ambiguous
+execution boundary. Recovery ciphertext is removed only when the receipt
+becomes terminal or is superseded.
+
+Retained recovery events, including intent-bearing receipts, are hard-capped at
+128. Normal ingress leaves one slot reserved for stop. At capacity, a
+same-session stop can supersede older pre-intent work to enter; other new
+ingress fails closed with 503. Separately, terminal state is retained for seven
+days and capped at 10,000 receipts. Active claims are never evicted, so the
+receipt store can exceed 10,000 only when active claims alone exceed that limit.
 
 In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
@@ -126,17 +130,27 @@ store takes precedence across process and machine restarts. Keep the token
 store on persistent local storage. Its file mode is `0600`, and `data/` is
 excluded from Git.
 
+OAuth tokens are adopted only after the rotating pair is written and synced;
+a failed persistence attempt keeps the pair pending and retries it. OAuth,
+runtime-session mappings, and bridge state use owner-only temporary files,
+file sync, same-directory atomic rename, and directory sync. A missing store
+starts empty where allowed. Malformed or unreadable durable state fails closed
+instead of being treated as empty.
+
 `BRIDGE_STATE_STORE_PATH` defaults to `data/bridge-state.json`. Keep it on
 persistent local storage as well. It contains bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
-caller-generated activity UUIDs, and recovery ciphertext for accepted turns
-whose dispatch marker is absent. Plaintext recovery routing metadata includes
-the action, session/webhook/execution IDs, recovery sequence, event timestamp,
-envelope `keyId`, and stop-fence provenance. Prompt, issue, and comment text,
-the raw signal, and the stop/body semantics remain inside the encrypted
-envelope until the dispatch marker is committed. Ciphertext length still
-reveals an approximate prompt length, so protect the state file and its backups
-as sensitive data.
+caller-generated activity UUIDs, a bounded pre-intent activity outbox, and
+recovery ciphertext for accepted turns that have not reached terminal state.
+The plaintext outbox records the activity UUID, session ID, content digest,
+attempt count, delivery status, and timestamps, but not the activity content.
+Plaintext recovery routing metadata includes the action,
+session/webhook/execution IDs, recovery sequence, event timestamp, envelope
+`keyId`, runtime-start intent timestamp, and stop-fence provenance. Prompt,
+issue, and comment text, the raw signal, and the stop/body semantics remain
+inside the encrypted envelope until terminalization or supersession.
+Ciphertext length still reveals an approximate prompt length, so protect the
+state file and its backups as sensitive data.
 
 AES-256-GCM authenticates each encrypted payload against its routing identity,
 sequence, and `keyId`. It does not authenticate the state file as a whole.
@@ -172,7 +186,8 @@ chmod 600 .env
 ```
 
 The restart loads the new writer and all retained readers before accepting
-webhooks. Envelopes normally disappear when the dispatch marker is committed.
+webhooks. Envelopes disappear when their receipts become terminal or are
+superseded; intent-bearing receipts retain their envelopes.
 The following conservative check prints `0` when no envelope needs any
 previous key. Substitute your configured state path if it differs:
 
@@ -182,7 +197,7 @@ node -e 'const s=require("./data/bridge-state.json"); console.log(Object.values(
 
 Remove retired keys from `INGRESS_RECOVERY_PREVIOUS_KEYS` and run the installer
 again only after that check prints `0`. Losing a key while one of its
-marker-free envelopes remains makes recovery unavailable and keeps the service
+retained envelopes remains makes recovery unavailable and keeps the service
 unhealthy.
 
 #### Upgrading an existing installation
@@ -256,16 +271,29 @@ session takes.
   is `created:<agentSession.id>`; prompted execution is identified by
   `agentActivity.id`. Linear activity creation receives a caller-generated UUID
   persisted before the request, so an OAuth retry reuses the same id.
-- A restart recovers an accepted claim whose dispatch marker is absent by
-  decrypting its bounded recovery envelope. Once the marker exists, a
-  different process records `AmbiguousDispatch` and does not execute the turn
-  again. Same-process duplicate deliveries remain ordinary duplicates.
+- Before replaying an uncertain pre-intent activity, the bridge queries its
+  exact caller UUID and verifies the owning session up to four times over a
+  bounded convergence window. If it remains absent, creation is retried with
+  the same UUID. Linear's [agent interaction guide](https://linear.app/developers/agent-interaction)
+  and [published SDL](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql)
+  expose caller IDs and activity lookup, but specify neither query-visibility
+  delay nor create idempotency for a repeated UUID. A delayed query can
+  therefore lead to a duplicate or create error. The bridge accepts that
+  availability tradeoff rather than leave accepted liveness or stop output
+  permanently pending.
+- A restart recovers accepted pre-intent work by decrypting its bounded
+  envelope. The runtime-start intent is written only after liveness and queue
+  work, immediately before runtime invocation. A different process treats an
+  intent-bearing receipt as `AmbiguousDispatch`; same-process stop or shutdown
+  before invocation can roll the intent back safely. Same-process duplicate
+  deliveries remain ordinary duplicates.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.
-- Persist the receipt and semantic claim, then ack the webhook within the 5s
-  limit. Do external work after the ack and emit a thought immediately on
-  `created` (10s liveness limit), or Linear marks the session unresponsive.
+- Persist the receipt, semantic claim, and recovery envelope, then ack the
+  webhook within the 5s limit. Persist each activity UUID and outbox entry
+  before its outbound request. Emit a thought immediately on `created` (10s
+  liveness limit), or Linear marks the session unresponsive.
 - Keep runtime execution serial. Concurrent headless Claude sessions on
   one host have produced cross-session content contamination.
 - Claude Agent SDK tool results arrive as `user` messages containing
@@ -306,14 +334,15 @@ session takes.
 
 The webhook endpoint verifies signatures, rejects stale timestamps, and does
 not return 200 for a valid agent event unless its receipt and claim are durable.
-Marker-free accepted turns retain encrypted prompt material until the dispatch
-marker is durable. Bounded action, identity, sequence, timestamp, `keyId`, and
-stop-fence provenance remain plaintext for routing. Prompt, issue, and comment
-text, raw signal, and stop/body semantics remain encrypted, while ciphertext
-size leaks an approximate length. The envelope authenticates its payload and
-routing association, not the whole state file. Keep `.env`, the state file, and
-their backups owner-only; losing every reader key for an active envelope blocks
-startup rather than dropping accepted work.
+Accepted turns retain encrypted prompt material through pre-intent delivery,
+queueing, and runtime-start intent until terminalization or supersession.
+Bounded action, identity, sequence, timestamp, `keyId`, runtime-start intent,
+and stop-fence provenance remain plaintext for routing. Prompt, issue, and
+comment text, raw signal, and stop/body semantics remain encrypted, while
+ciphertext size leaks an approximate length. The envelope authenticates its
+payload and routing association, not the whole state file. Keep `.env`, the
+state file, and their backups owner-only; losing every reader key for a retained
+envelope blocks startup rather than dropping accepted work.
 The OAuth callback consumes a random, expiring state value before exchanging an
 authorization code; only the local service log receives the matching setup
 URL. `/healthz` and `/oauth/callback` are the only other routes. Understand

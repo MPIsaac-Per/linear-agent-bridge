@@ -15,20 +15,32 @@ Changes awaiting a tagged release remain under Unreleased.
   turns claim `created:<agentSession.id>` and `agentActivity.id` respectively.
   Terminal entries expire after seven days and are capped at 10,000 while
   active claims are preserved.
-- Mark dispatch durably before any external or runtime side effect. A replacement
-  process safely reclaims a claim when dispatch never began; retries after the
-  marker persist an `AmbiguousDispatch` outcome and remain undispatched.
-- Encrypt the bounded recovery payload for each marker-free accepted turn with
+- Retain recovery through the liveness activity and serial queue, then persist
+  runtime-start intent immediately before invocation. Pre-intent failures
+  release for ordered replay. A stop or shutdown that wins before invocation
+  rolls intent back; a replacement process treats retained intent as
+  `AmbiguousDispatch` because runtime execution can no longer be disproved.
+- Encrypt the bounded recovery payload for each accepted turn with
   a required AES-256-GCM ingress key. Startup replays recoverable work before
-  becoming healthy, and dispatch-marker persistence removes the envelope.
+  becoming healthy, and terminalization or supersession removes the envelope.
   Bounded routing metadata remains plaintext: action, session/webhook/execution
   IDs, recovery sequence, event timestamp, envelope `keyId`, and stop-fence
   provenance. Prompt, issue, and comment text, raw signal, and stop/body
   semantics remain encrypted. The envelope authenticates its payload and
   routing association, not the state file as a whole.
-- Hard-cap marker-free accepted recovery events at 128. New ingress fails
-  closed with 503 at capacity; the separate receipt-retention cap remains
-  10,000 entries while active claims remain non-evictable.
+- Hard-cap retained recovery events at 128, including intent-bearing receipts.
+  Normal ingress reserves one slot for stop; a same-session stop can supersede
+  older pre-intent work at capacity, while other ingress fails closed with 503.
+  The separate receipt-retention cap remains 10,000 entries while active claims
+  remain non-evictable.
+- Persist a content-bound pre-intent activity outbox before delivery. An
+  uncertain replay queries the exact caller UUID and session over a bounded
+  convergence window, then retries create with the same UUID if still absent.
+  Linear documents caller IDs and lookup but gives no query-visibility or
+  repeated-create idempotency guarantee, leaving a disclosed duplicate or
+  create-error risk in exchange for availability. Outbox state retains bounded
+  IDs, a content digest, attempt count, delivery status, and timestamps without
+  storing activity content.
 - Add reader-first recovery-key rotation through up to four retained previous
   keys. The primary key writes new envelopes while the retained keyring reads
   outstanding envelopes from earlier deployments.
@@ -41,6 +53,9 @@ Changes awaiting a tagged release remain under Unreleased.
 - Make the macOS installer validate configuration and recovery keys before any
   launchd mutation, repair `.env` to mode `0600`, poll health with a bounded
   deadline, and restore the prior build and launchd files when restart fails.
+- Harden OAuth token, runtime-session, and bridge-state writes with owner-only
+  synced temporary files, atomic replacement, directory sync, and fail-closed
+  reads. Rotated OAuth tokens are not adopted before persistence succeeds.
 - Publish non-empty Claude assistant text immediately when an `end_turn`
   message arrives, suppress an identical trailing success result, and retain a
   differing result as a second durable response.
