@@ -25,8 +25,10 @@ interface RecordedNodeCall {
 
 async function makeFakeChildren(options: {
   healthExit?: string;
+  authenticationControlExit?: string;
   webhookExit?: string;
   healthStatus?: string;
+  authenticationControlStatus?: string;
   webhookStatus?: string;
 }): Promise<{
   curlPath: string;
@@ -50,9 +52,18 @@ const body = dataIndex === -1 ? "" : fs.readFileSync(args[dataIndex + 1].slice(1
 fs.appendFileSync(${JSON.stringify(curlLogPath)}, JSON.stringify({ args, body, headers, env: process.env }) + "\\n");
 const url = args[args.length - 1];
 const isHealth = new URL(url).pathname.endsWith("/healthz");
-const exitCode = Number(isHealth ? ${JSON.stringify(options.healthExit ?? "0")} : ${JSON.stringify(options.webhookExit ?? "0")});
-const status = isHealth ? ${JSON.stringify(options.healthStatus ?? "200")} : ${JSON.stringify(options.webhookStatus ?? "200")};
-process.stdout.write(status + " " + (isHealth ? "0.041" : "0.052"));
+const isSigned = headers.some(header => header.toLowerCase().startsWith("linear-signature:"));
+const exitCode = Number(isHealth
+  ? ${JSON.stringify(options.healthExit ?? "0")}
+  : isSigned
+    ? ${JSON.stringify(options.webhookExit ?? "0")}
+    : ${JSON.stringify(options.authenticationControlExit ?? "0")});
+const status = isHealth
+  ? ${JSON.stringify(options.healthStatus ?? "200")}
+  : isSigned
+    ? ${JSON.stringify(options.webhookStatus ?? "200")}
+    : ${JSON.stringify(options.authenticationControlStatus ?? "401")};
+process.stdout.write(status + " " + (isHealth ? "0.041" : isSigned ? "0.052" : "0.047"));
 process.exit(exitCode);
 `;
   const curlPath = path.join(binDir, "curl");
@@ -88,6 +99,12 @@ async function runVerifier(
       : {}),
     ...(envOverrides.FAKE_HEALTH_STATUS !== undefined
       ? { healthStatus: envOverrides.FAKE_HEALTH_STATUS }
+      : {}),
+    ...(envOverrides.FAKE_AUTH_CONTROL_EXIT !== undefined
+      ? { authenticationControlExit: envOverrides.FAKE_AUTH_CONTROL_EXIT }
+      : {}),
+    ...(envOverrides.FAKE_AUTH_CONTROL_STATUS !== undefined
+      ? { authenticationControlStatus: envOverrides.FAKE_AUTH_CONTROL_STATUS }
       : {}),
     ...(envOverrides.FAKE_WEBHOOK_STATUS !== undefined
       ? { webhookStatus: envOverrides.FAKE_WEBHOOK_STATUS }
@@ -130,8 +147,11 @@ async function runVerifier(
     .then((text) => text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)))
     .catch(() => [] as RecordedNodeCall[]);
 
-  if (calls[1] !== undefined) {
-    const payload = JSON.parse(calls[1].body) as { webhookTimestamp: number };
+  const firstWebhookCall = calls.find(
+    (call) => optionValue(call.args, "--request") === "POST",
+  );
+  if (firstWebhookCall !== undefined) {
+    const payload = JSON.parse(firstWebhookCall.body) as { webhookTimestamp: number };
     expect(payload.webhookTimestamp).toBeGreaterThanOrEqual(startedAt);
     expect(payload.webhookTimestamp).toBeLessThanOrEqual(finishedAt);
   }
@@ -247,16 +267,22 @@ afterEach(async () => {
 });
 
 describe("deploy/verify-ingress.sh", () => {
-  it("probes the prefixed sibling health path and exact signed harmless webhook", async () => {
+  it("requires an unsigned 401 control before accepting the exact signed harmless webhook", async () => {
     const result = await runVerifier();
 
     expect(result.code).toBe(0);
-    expect(result.calls).toHaveLength(2);
-    const [health, webhook] = result.calls;
+    expect(result.calls).toHaveLength(3);
+    const [health, authenticationControl, webhook] = result.calls;
     expect(optionValue(health.args, "--request")).toBe("GET");
     expect(health.args.at(-1)).toBe("https://edge.example/linear/healthz");
+    expect(optionValue(authenticationControl.args, "--request")).toBe("POST");
+    expect(authenticationControl.args.at(-1)).toBe(
+      "https://edge.example/linear/webhook",
+    );
+    expect(authenticationControl.headers).toEqual(["content-type: application/json"]);
     expect(optionValue(webhook.args, "--request")).toBe("POST");
     expect(webhook.args.at(-1)).toBe("https://edge.example/linear/webhook");
+    expect(authenticationControl.body).toBe(webhook.body);
     expect(JSON.parse(webhook.body)).toEqual({
       type: "IngressVerificationEvent",
       action: "verify",
@@ -280,11 +306,12 @@ describe("deploy/verify-ingress.sh", () => {
       WEBHOOK_URL: "https://edge.example/linear/webhook",
     });
     expect(verifierControlledEnv(result.nodeCalls[1].env)).toEqual({});
-    expect(verifierControlledEnv(result.nodeCalls[2].env)).toEqual({
-      LINEAR_WEBHOOK_SECRET: secret,
-    });
+    expect(verifierControlledEnv(result.nodeCalls[2].env)).toEqual({});
     expect(result.stdout).toContain(
       "healthz url=https://edge.example/linear/healthz http_status=200 elapsed_seconds=0.041",
+    );
+    expect(result.stdout).toContain(
+      "authentication_control url=https://edge.example/linear/webhook http_status=401 elapsed_seconds=0.047",
     );
     expect(result.stdout).toContain(
       "webhook url=https://edge.example/linear/webhook http_status=200 elapsed_seconds=0.052",
@@ -292,9 +319,34 @@ describe("deploy/verify-ingress.sh", () => {
     expect(result.stdout + result.stderr).not.toContain(secret);
     expect(result.stdout + result.stderr).not.toContain(webhook.body);
     expect(result.stdout + result.stderr).not.toContain(signatureHeader ?? "missing-signature");
-    expect(webhook.args.join(" ")).not.toContain(secret);
-    expect(webhook.args.join(" ")).not.toContain(webhook.body);
-    expect(webhook.args.join(" ")).not.toContain(signatureHeader ?? "missing-signature");
+    for (const call of [authenticationControl, webhook]) {
+      expect(call.args.join(" ")).not.toContain(secret);
+      expect(call.args.join(" ")).not.toContain(call.body);
+      expect(call.args.join(" ")).not.toContain(signatureHeader ?? "missing-signature");
+    }
+    for (const call of result.nodeCalls) {
+      expect(call.args.join(" ")).not.toContain(secret);
+      expect(call.args.join(" ")).not.toContain(webhook.body);
+      expect(call.args.join(" ")).not.toContain(signatureHeader ?? "missing-signature");
+      expect(Object.values(call.env).join(" ")).not.toContain(secret);
+      expect(Object.values(call.env).join(" ")).not.toContain(webhook.body);
+      expect(Object.values(call.env).join(" ")).not.toContain(
+        signatureHeader ?? "missing-signature",
+      );
+    }
+  });
+
+  it("rejects an ingress that accepts the unsigned authentication control", async () => {
+    const result = await runVerifier({ FAKE_AUTH_CONTROL_STATUS: "200" });
+
+    expect(result.code).not.toBe(0);
+    expect(result.calls).toHaveLength(2);
+    expect(result.calls[1].headers).toEqual(["content-type: application/json"]);
+    expect(result.stdout).toContain(
+      "authentication_control url=https://edge.example/linear/webhook http_status=200 elapsed_seconds=0.047",
+    );
+    expect(result.stdout + result.stderr).not.toContain(secret);
+    expect(result.stdout + result.stderr).not.toContain(result.calls[1].body);
   });
 
   it.each([
@@ -328,6 +380,8 @@ describe("deploy/verify-ingress.sh", () => {
     ["DNS", { FAKE_HEALTH_EXIT: "6" }],
     ["TLS", { FAKE_HEALTH_EXIT: "35" }],
     ["connection", { FAKE_HEALTH_EXIT: "7" }],
+    ["authentication control timeout", { FAKE_AUTH_CONTROL_EXIT: "28" }],
+    ["authentication control HTTP", { FAKE_AUTH_CONTROL_STATUS: "403" }],
     ["timeout", { FAKE_WEBHOOK_EXIT: "28" }],
     ["HTTP", { FAKE_WEBHOOK_STATUS: "401" }],
   ])("returns nonzero for %s failures without leaking request material", async (_kind, env) => {
@@ -458,6 +512,19 @@ describe("deploy/install.sh", () => {
       "curl -q -fsS --connect-timeout 1 --max-time 1 http://127.0.0.1:4123/healthz",
     );
     expect(result.calls).not.toContain("tailscale funnel");
+  });
+
+  it("completes an explicit local-only install without invoking Tailscale", async () => {
+    const result = await runInstaller({ SKIP_FUNNEL: "1" });
+
+    expect(result.code).toBe(0);
+    expect(result.calls).toContain(
+      "curl -q -fsS --connect-timeout 1 --max-time 1 http://127.0.0.1:4123/healthz",
+    );
+    expect(result.calls).not.toContain("tailscale");
+    expect(result.stdout).toContain(
+      "SKIP_FUNNEL=1: service installed without public ingress",
+    );
   });
 
   it("enables direct Funnel only from empty state and verifies the exact route", async () => {

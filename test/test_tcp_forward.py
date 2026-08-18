@@ -3,6 +3,8 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -56,6 +58,24 @@ class ErrorReader:
 
 
 class TcpForwardTests(unittest.IsolatedAsyncioTestCase):
+    def test_cli_rejects_a_non_loopback_upstream(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "8899",
+                "100.64.0.2",
+                "3979",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("local tunnel endpoint at 127.0.0.1", result.stderr)
+
     async def test_logs_bounded_lifecycle_and_cancels_sibling_on_half_close(self):
         client_reader = EofReader()
         upstream_reader = BlockingReader()

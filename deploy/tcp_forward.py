@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Diagnostic-only TCP forwarder bound to 127.0.0.1.
 
-Use temporarily while diagnosing a private last hop; it is not the supported
-production ingress. Run it on a host with an existing HTTPS ingress and point
-it at the bridge over a private network:
-ingress :8443 -> 127.0.0.1:8899 -> (private net) -> bridge host :3979.
+Use temporarily on a separate HTTPS-ingress host after establishing a local
+SSH tunnel to the bridge host's loopback-only listener:
 
-Usage: tcp_forward.py <listen_port> <target_host> <target_port>
+ssh -N -T -o ExitOnForwardFailure=yes \\
+    -L 127.0.0.1:9900:127.0.0.1:3979 bridge-host
+tcp_forward.py 8899 127.0.0.1 9900
+
+The diagnostic path is ingress -> 127.0.0.1:8899 -> tcp_forward.py ->
+127.0.0.1:9900 -> SSH tunnel -> bridge 127.0.0.1:3979. Never target the
+bridge's private address because the bridge does not listen on that interface.
+
+Usage: tcp_forward.py <listen_port> 127.0.0.1 <local_tunnel_port>
 """
 import asyncio
 import secrets
@@ -99,6 +105,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[2] != "127.0.0.1":
+        print(
+            "tcp_forward.py requires a local tunnel endpoint at 127.0.0.1",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     LISTEN_PORT = int(sys.argv[1])
     TARGET_HOST = sys.argv[2]
     TARGET_PORT = int(sys.argv[3])
