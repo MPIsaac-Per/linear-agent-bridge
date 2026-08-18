@@ -1134,6 +1134,135 @@ describe("JsonBridgeStateStore", () => {
     await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("syncs each newly created state-directory parent before any state write", async () => {
+    const firstCreatedDirectory = path.join(tmpDir, "state");
+    const stateDirectory = path.join(firstCreatedDirectory, "nested");
+    const storePath = path.join(stateDirectory, "bridge-state.json");
+    const operations: string[] = [];
+    let failCreatedParentSync = true;
+    const originalMkdir = fs.mkdir.bind(fs);
+    const originalOpen = fs.open.bind(fs);
+    const mkdirSpy = vi.spyOn(fs, "mkdir").mockImplementation(async (...args) => {
+      const result = await originalMkdir(...args);
+      if (String(args[0]) === stateDirectory) {
+        operations.push("mkdir-state-directory");
+      }
+      return result;
+    });
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const openedPath = String(args[0]);
+      if (openedPath === tmpDir || openedPath === firstCreatedDirectory) {
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          operations.push(`sync-parent:${path.basename(openedPath)}`);
+          if (openedPath === firstCreatedDirectory && failCreatedParentSync) {
+            throw new Error("synthetic created-parent sync failure");
+          }
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+    });
+
+    try {
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        "synthetic created-parent sync failure",
+      );
+      expect(operations).toEqual([
+        "mkdir-state-directory",
+        `sync-parent:${path.basename(tmpDir)}`,
+        "sync-parent:state",
+      ]);
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      operations.length = 0;
+      failCreatedParentSync = false;
+      await expect(store.claimEvent(event())).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      expect(operations).toEqual([
+        "mkdir-state-directory",
+        `sync-parent:${path.basename(tmpDir)}`,
+        "sync-parent:state",
+      ]);
+
+      operations.length = 0;
+      const restartedStore = new JsonBridgeStateStore(storePath, {
+        ...TEST_LOCK_OPTIONS,
+        ownerId: "runtime-a",
+      });
+      await expect(restartedStore.claimEvent(event())).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      expect(operations).toEqual([
+        "mkdir-state-directory",
+        `sync-parent:${path.basename(tmpDir)}`,
+        "sync-parent:state",
+      ]);
+    } finally {
+      mkdirSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("times out a stalled ancestor sync before lock creation and closes after settlement", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const stalledSync = deferred();
+    const originalOpen = fs.open.bind(fs);
+    const originalMkdir = fs.mkdir.bind(fs);
+    let candidateCreated = false;
+    let directoryClosed = false;
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === tmpDir) {
+        const originalClose = handle.close.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(() => stalledSync.promise);
+        vi.spyOn(handle, "close").mockImplementation(async () => {
+          directoryClosed = true;
+          await originalClose();
+        });
+      }
+      return handle;
+    });
+    const mkdirSpy = vi
+      .spyOn(fs, "mkdir")
+      .mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith(".candidate")) {
+          candidateCreated = true;
+        }
+        return originalMkdir(...args);
+      });
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 40,
+    });
+
+    try {
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      expect(candidateCreated).toBe(false);
+      expect(directoryClosed).toBe(false);
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      stalledSync.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(directoryClosed).toBe(true);
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      stalledSync.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      openSpy.mockRestore();
+      mkdirSpy.mockRestore();
+    }
+  });
+
   it("syncs and secures each temporary state file before rename, then syncs the directory", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const directory = path.dirname(storePath);
@@ -1181,6 +1310,7 @@ describe("JsonBridgeStateStore", () => {
       const store = new JsonBridgeStateStore(storePath, { ownerId: "runtime-a" });
       await store.claimEvent(event());
       expect(operations).toEqual([
+        "directory-sync",
         "temp-chmod:600",
         "temp-sync",
         "rename",
@@ -1446,6 +1576,95 @@ describe("JsonBridgeStateStore", () => {
     ).resolves.toBe("dispatch_started");
   });
 
+  it("does not advance a stop fence for the same execution under a new webhook id", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    const occurredAt = "2026-08-18T12:00:00.000Z";
+    const originalStop = event({
+      webhookId: "webhook-stop-original",
+      executionId: "activity-stop",
+      action: "prompted",
+    });
+    const promptAcceptedAfterStop = event({
+      webhookId: "webhook-prompt-after-stop",
+      executionId: "activity-prompt-after-stop",
+      action: "prompted",
+    });
+    const laterDistinctStop = event({
+      webhookId: "webhook-distinct-stop",
+      executionId: "activity-distinct-stop",
+      action: "prompted",
+    });
+    const duplicateStop = event({
+      webhookId: "webhook-stop-redelivery",
+      executionId: originalStop.executionId,
+      action: "prompted",
+    });
+    const stopPayload = {
+      action: "prompted" as const,
+      prompt: "stop",
+      signal: "stop",
+      occurredAt,
+      stop: true,
+    };
+
+    await expect(
+      store.claimEvent(originalStop, stopPayload),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+    await expect(
+      store.claimEvent(laterDistinctStop, stopPayload),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+    await expect(
+      store.claimEvent(promptAcceptedAfterStop, {
+        action: "prompted",
+        prompt: "legitimate same-time follow-up",
+        occurredAt,
+        stop: false,
+      }),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+    await expect(
+      store.claimEvent(duplicateStop, stopPayload),
+    ).resolves.toMatchObject({ disposition: "superseded" });
+    const persisted = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+      recoveryStopFences: Record<
+        string,
+        {
+          occurredAt: string;
+          sequence: number;
+          webhookId: string;
+          executionId: string;
+        }
+      >;
+    };
+    expect(persisted.recoveryStopFences[originalStop.linearSessionId]).toEqual({
+      occurredAt,
+      sequence: 2,
+      webhookId: laterDistinctStop.webhookId,
+      executionId: laterDistinctStop.executionId,
+    });
+
+    const restartedStore = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-b",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await expect(
+      restartedStore.claimEvent(promptAcceptedAfterStop, {
+        action: "prompted",
+        prompt: "legitimate same-time follow-up",
+        occurredAt,
+        stop: false,
+      }),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+    await expect(
+      restartedStore.markDispatchStarted(promptAcceptedAfterStop.webhookId),
+    ).resolves.toBe("dispatch_started");
+  });
+
   it("fails closed on a malformed persisted stop fence", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const store = new JsonBridgeStateStore(storePath, {
@@ -1578,7 +1797,7 @@ describe("JsonBridgeStateStore", () => {
         const originalSync = handle.sync.bind(handle);
         vi.spyOn(handle, "sync").mockImplementation(async () => {
           directorySyncs += 1;
-          if (directorySyncs === 2) {
+          if (directorySyncs === 3) {
             throw new Error("synthetic final claim directory sync failure");
           }
           await originalSync();
@@ -1633,7 +1852,7 @@ describe("JsonBridgeStateStore", () => {
         const originalSync = handle.sync.bind(handle);
         vi.spyOn(handle, "sync").mockImplementation(async () => {
           directorySyncs += 1;
-          if (directorySyncs === 3) {
+          if (directorySyncs === 4) {
             throw new Error("synthetic dispatch marker directory sync failure");
           }
           await originalSync();

@@ -1562,6 +1562,7 @@ describe("startServer", () => {
     });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       activeHarness = await startTestServer(runtime, {
         bridgeStateOwnerId: "runtime-a",
@@ -1569,7 +1570,17 @@ describe("startServer", () => {
       const harness = activeHarness;
       const stateDirectory = path.dirname(harness.bridgeStatePath);
       const originalOpen = fsPromises.open.bind(fsPromises);
-      let stateDirectorySyncs = 0;
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      let stateRenames = 0;
+      let failedFinalClaimSync = false;
+      renameSpy = vi
+        .spyOn(fsPromises, "rename")
+        .mockImplementation(async (from, to) => {
+          await originalRename(from, to);
+          if (String(to) === harness.bridgeStatePath) {
+            stateRenames += 1;
+          }
+        });
       openSpy = vi
         .spyOn(fsPromises, "open")
         .mockImplementation(async (...args) => {
@@ -1577,8 +1588,8 @@ describe("startServer", () => {
           if (String(args[0]) === stateDirectory) {
             const originalSync = handle.sync.bind(handle);
             vi.spyOn(handle, "sync").mockImplementation(async () => {
-              stateDirectorySyncs += 1;
-              if (stateDirectorySyncs === 2) {
+              if (stateRenames === 2 && !failedFinalClaimSync) {
+                failedFinalClaimSync = true;
                 throw new Error("synthetic final claim directory sync failure");
               }
               await originalSync();
@@ -1628,6 +1639,7 @@ describe("startServer", () => {
       expect(logged).not.toContain("private retry exactly once prompt");
       expect(logged).not.toContain("synthetic final claim directory sync failure");
     } finally {
+      renameSpy?.mockRestore();
       openSpy?.mockRestore();
       errorSpy.mockRestore();
     }
@@ -2115,6 +2127,7 @@ describe("startServer", () => {
       yield { kind: "done" } as RuntimeEvent;
     });
     let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       activeHarness = await startTestServer(runtime, {
         awaitReady: false,
@@ -2131,7 +2144,17 @@ describe("startServer", () => {
           });
           const stateDirectory = path.dirname(storePath);
           const originalOpen = fsPromises.open.bind(fsPromises);
-          let stateDirectorySyncs = 0;
+          const originalRename = fsPromises.rename.bind(fsPromises);
+          let stateRenames = 0;
+          let failedVisibleRepairSync = false;
+          renameSpy = vi
+            .spyOn(fsPromises, "rename")
+            .mockImplementation(async (from, to) => {
+              await originalRename(from, to);
+              if (String(to) === storePath) {
+                stateRenames += 1;
+              }
+            });
           openSpy = vi
             .spyOn(fsPromises, "open")
             .mockImplementation(async (...args) => {
@@ -2139,8 +2162,8 @@ describe("startServer", () => {
               if (String(args[0]) === stateDirectory) {
                 const originalSync = handle.sync.bind(handle);
                 vi.spyOn(handle, "sync").mockImplementation(async () => {
-                  stateDirectorySyncs += 1;
-                  if (stateDirectorySyncs === 1) {
+                  if (stateRenames === 1 && !failedVisibleRepairSync) {
+                    failedVisibleRepairSync = true;
                     throw new Error("synthetic visible legacy repair sync failure");
                   }
                   await originalSync();
@@ -2195,6 +2218,7 @@ describe("startServer", () => {
       );
       expect(runtime.requests).toHaveLength(1);
     } finally {
+      renameSpy?.mockRestore();
       openSpy?.mockRestore();
     }
   });

@@ -264,6 +264,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   // This process may reclaim a visible pre-dispatch claim only when the
   // mutation that created it never completed through lock release.
   private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
+  private stateDirectoryReady: Promise<void> | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -780,6 +781,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (payload.action !== "prompted" || !payload.stop) {
       return;
     }
+    const semanticDeliveryExists = Object.values(state.receipts).some(
+      (receipt) =>
+        receipt.webhookId !== identity.webhookId &&
+        receipt.executionId === identity.executionId,
+    );
+    if (semanticDeliveryExists) {
+      return;
+    }
     const fences = (state.recoveryStopFences ??= {});
     const existing = fences[identity.linearSessionId];
     if (
@@ -1073,7 +1082,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   ): Promise<T> {
     const directory = path.dirname(this.statePath);
     const lockPath = `${this.statePath}.lock`;
-    await fs.mkdir(directory, { recursive: true });
+    await this.ensureDurableStateDirectory(directory, deadline);
     const lockToken = randomUUID();
     const candidatePath = `${lockPath}.${lockToken}.candidate`;
     const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
@@ -1112,6 +1121,35 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         await this.releaseOwnedLock(lockPath, lockToken);
       }
       await fs.rm(candidatePath, { recursive: true, force: true });
+    }
+  }
+
+  private async ensureDurableStateDirectory(
+    directory: string,
+    deadline: number,
+  ): Promise<void> {
+    const resolvedDirectory = path.resolve(directory);
+    try {
+      assertBeforeLockDeadline(deadline);
+      const firstCreated = await resolveBeforeLockDeadline(
+        fs.mkdir(resolvedDirectory, { recursive: true }),
+        deadline,
+      );
+      if (
+        firstCreated === undefined &&
+        this.stateDirectoryReady !== undefined
+      ) {
+        return;
+      }
+
+      this.stateDirectoryReady = undefined;
+      for (const prefix of absoluteDirectoryPrefixes(resolvedDirectory)) {
+        await syncDirectoryBeforeLockDeadline(prefix, deadline);
+      }
+      this.stateDirectoryReady = Promise.resolve();
+    } catch (error) {
+      this.stateDirectoryReady = undefined;
+      throw error;
     }
   }
 
@@ -1422,7 +1460,6 @@ export class JsonBridgeStateStore implements BridgeStateStore {
 
   private async writeState(state: PersistedBridgeState): Promise<void> {
     const directory = path.dirname(this.statePath);
-    await fs.mkdir(directory, { recursive: true });
     const tmpPath = path.join(
       directory,
       `.${path.basename(this.statePath)}.${randomUUID()}.tmp`,
@@ -1964,6 +2001,62 @@ export function buildDarwinLockProcessIdentity(
   return bootSessionUuid === undefined || processStartTime === undefined
     ? undefined
     : `darwin-boot:${bootSessionUuid}:proc-start:${processStartTime}`;
+}
+
+function absoluteDirectoryPrefixes(directory: string): string[] {
+  const { root } = path.parse(directory);
+  const prefixes = [root];
+  let prefix = root;
+  const relative = path.relative(root, directory);
+  for (const segment of relative.split(path.sep)) {
+    if (segment.length === 0) {
+      continue;
+    }
+    prefix = path.join(prefix, segment);
+    prefixes.push(prefix);
+  }
+  return prefixes;
+}
+
+async function syncDirectoryBeforeLockDeadline(
+  directory: string,
+  deadline: number,
+): Promise<void> {
+  assertBeforeLockDeadline(deadline);
+  const openPromise = fs.open(directory, "r");
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  try {
+    handle = await resolveBeforeLockDeadline(openPromise, deadline);
+  } catch (error) {
+    void openPromise
+      .then((lateHandle) => lateHandle.close())
+      .catch(() => undefined);
+    throw error;
+  }
+
+  let syncPromise: Promise<void> | undefined;
+  try {
+    assertBeforeLockDeadline(deadline);
+    syncPromise = handle.sync();
+    await resolveBeforeLockDeadline(syncPromise, deadline);
+  } catch (error) {
+    if (
+      error instanceof BridgeStateLockTimeoutError &&
+      syncPromise !== undefined
+    ) {
+      void syncPromise
+        .then(
+          () => handle.close(),
+          () => handle.close(),
+        )
+        .catch(() => undefined);
+    } else {
+      await handle.close().catch(() => undefined);
+    }
+    throw error;
+  }
+
+  await resolveBeforeLockDeadline(handle.close(), deadline);
 }
 
 function assertBeforeLockDeadline(deadline: number): void {
