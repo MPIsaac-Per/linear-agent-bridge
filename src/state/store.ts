@@ -1165,6 +1165,20 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
       throw error;
     }
+    if (entries.length === 0) {
+      assertBeforeLockDeadline(deadline);
+      try {
+        await fs.rmdir(lockPath);
+      } catch (error) {
+        if (
+          !isNodeError(error, "ENOENT") &&
+          !isNodeError(error, "ENOTEMPTY")
+        ) {
+          throw error;
+        }
+      }
+      return;
+    }
     if (entries.length !== 1 || !entries[0]!.endsWith(".json")) {
       return;
     }

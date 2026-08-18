@@ -246,6 +246,53 @@ describe("ingress recovery envelopes", () => {
 });
 
 describe("JsonBridgeStateStore", () => {
+  it("reclaims an empty lock directory left after owner unlink", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    await fs.mkdir(lockPath, { mode: 0o700 });
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi
+      .spyOn(fs, "rename")
+      .mockImplementation(async (from, to) => {
+        if (String(to) === lockPath) {
+          try {
+            await fs.stat(lockPath);
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              error.code === "ENOENT"
+            ) {
+              return originalRename(from, to);
+            }
+            throw error;
+          }
+          throw Object.assign(new Error("lock directory exists"), {
+            code: "EEXIST",
+          });
+        }
+        return originalRename(from, to);
+      });
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-after-release-crash",
+      lockTimeoutMs: 100,
+      lockRetryMs: 1,
+      ...TEST_LOCK_OPTIONS,
+    });
+
+    try {
+      await expect(store.claimEvent(event())).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      await expect(store.getReceipt("webhook-1")).resolves.toMatchObject({
+        status: "claimed",
+      });
+      await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
   it("retries current-process identity lookup after a transient unavailable result", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     let currentLookups = 0;
