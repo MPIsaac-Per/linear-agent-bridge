@@ -189,6 +189,9 @@ export class ClaudeRuntime implements AgentRuntime {
     }
     try {
       for await (const message of query) {
+        // Every raw SDK message proves the runtime is alive, including
+        // messages whose mapped output is buffered or intentionally hidden.
+        yield { kind: "progress" };
         if (request.abortController?.signal.aborted === true) {
           break;
         }

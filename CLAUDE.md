@@ -30,8 +30,10 @@ refreshes it after an authenticated request returns 401.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Ack first, work after.
 - Tool results must close their matching Linear action. Stop signals abort
-  active and queued turns for that session; each turn is bounded by
-  `RUN_TIMEOUT_MS`.
+  active and queued turns for that session. `RUN_INACTIVITY_TIMEOUT_MS` bounds
+  runtime silence, not total wall-clock duration; raw runtime progress resets
+  the watchdog without rendering in Linear. A runtime `done` event ends the
+  turn immediately and never resets the watchdog.
 - Linear OAuth access tokens expire after 24 hours. Persist both replacement
   tokens atomically after every authorization and refresh. Never log either
   token.

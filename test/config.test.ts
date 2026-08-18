@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 const validEnv = {
@@ -22,7 +22,7 @@ describe("loadConfig", () => {
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
       oauthTokenStorePath: "./data/oauth-tokens.json",
-      runTimeoutMs: 300000,
+      runInactivityTimeoutMs: 300000,
     });
   });
 
@@ -34,7 +34,7 @@ describe("loadConfig", () => {
       KB_PATH: "/tmp/kb",
       SESSION_STORE_PATH: "/tmp/sessions.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
-      RUN_TIMEOUT_MS: "45000",
+      RUN_INACTIVITY_TIMEOUT_MS: "45000",
     });
 
     expect(config.port).toBe(8080);
@@ -42,7 +42,7 @@ describe("loadConfig", () => {
     expect(config.kbPath).toBe("/tmp/kb");
     expect(config.sessionStorePath).toBe("/tmp/sessions.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
-    expect(config.runTimeoutMs).toBe(45000);
+    expect(config.runInactivityTimeoutMs).toBe(45000);
   });
 
   it.each([
@@ -79,13 +79,38 @@ describe("loadConfig", () => {
   );
 
   it.each(["not-a-number", "0", "-1", "3.5"])(
-    "throws for an invalid RUN_TIMEOUT_MS value %s",
+    "throws for an invalid RUN_INACTIVITY_TIMEOUT_MS value %s",
     (badTimeout) => {
       expect(() =>
-        loadConfig({ ...validEnv, RUN_TIMEOUT_MS: badTimeout }),
-      ).toThrow(/RUN_TIMEOUT_MS/);
+        loadConfig({ ...validEnv, RUN_INACTIVITY_TIMEOUT_MS: badTimeout }),
+      ).toThrow(/RUN_INACTIVITY_TIMEOUT_MS/);
     },
   );
+
+  it("uses the deprecated fallback, gives the new variable precedence, and warns once whenever the old variable is present", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      expect(
+        loadConfig({
+          ...validEnv,
+          RUN_INACTIVITY_TIMEOUT_MS: "43000",
+          RUN_TIMEOUT_MS: "not-a-number",
+        }).runInactivityTimeoutMs,
+      ).toBe(43000);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(
+        loadConfig({ ...validEnv, RUN_TIMEOUT_MS: "41000" })
+          .runInactivityTimeoutMs,
+      ).toBe(41000);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        "[linear-agent-bridge] RUN_TIMEOUT_MS is deprecated; use RUN_INACTIVITY_TIMEOUT_MS instead.",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
 
   it("parses a valid PORT string to a number", () => {
     const config = loadConfig({ ...validEnv, PORT: "5000" });

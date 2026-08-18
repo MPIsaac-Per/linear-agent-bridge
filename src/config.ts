@@ -8,14 +8,15 @@ export interface Config {
   kbPath: string;
   sessionStorePath: string;
   oauthTokenStorePath: string;
-  runTimeoutMs: number;
+  runInactivityTimeoutMs: number;
 }
 
 const DEFAULT_PORT = "3979";
 const DEFAULT_RUNTIME = "claude";
 const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
 const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
-const DEFAULT_RUN_TIMEOUT_MS = "300000";
+const DEFAULT_RUN_INACTIVITY_TIMEOUT_MS = "300000";
+let warnedAboutDeprecatedRunTimeout = false;
 
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key];
@@ -52,9 +53,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const portRaw = env.PORT ?? DEFAULT_PORT;
   const port = positiveInteger(portRaw, "PORT");
-  const runTimeoutMs = positiveInteger(
-    env.RUN_TIMEOUT_MS ?? DEFAULT_RUN_TIMEOUT_MS,
-    "RUN_TIMEOUT_MS",
+  let inactivityTimeoutRaw = env.RUN_INACTIVITY_TIMEOUT_MS;
+  let inactivityTimeoutKey = "RUN_INACTIVITY_TIMEOUT_MS";
+  if (env.RUN_TIMEOUT_MS !== undefined && !warnedAboutDeprecatedRunTimeout) {
+    warnedAboutDeprecatedRunTimeout = true;
+    console.warn(
+      "[linear-agent-bridge] RUN_TIMEOUT_MS is deprecated; use RUN_INACTIVITY_TIMEOUT_MS instead.",
+    );
+  }
+  if (inactivityTimeoutRaw === undefined && env.RUN_TIMEOUT_MS !== undefined) {
+    inactivityTimeoutRaw = env.RUN_TIMEOUT_MS;
+    inactivityTimeoutKey = "RUN_TIMEOUT_MS";
+  }
+  const runInactivityTimeoutMs = positiveInteger(
+    inactivityTimeoutRaw ?? DEFAULT_RUN_INACTIVITY_TIMEOUT_MS,
+    inactivityTimeoutKey,
   );
 
   return {
@@ -71,6 +84,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sessionStorePath: env.SESSION_STORE_PATH ?? DEFAULT_SESSION_STORE_PATH,
     oauthTokenStorePath:
       env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
-    runTimeoutMs,
+    runInactivityTimeoutMs,
   };
 }
