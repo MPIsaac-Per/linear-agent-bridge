@@ -1,19 +1,33 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type {
+  AgentActivityContent,
   AgentRuntime,
   LinearAgentSessionEvent,
   RuntimeEvent,
   SessionRequest,
 } from "./types.js";
 import type { Config } from "./config.js";
-import { verifyWebhook } from "./linear/webhook-verify.js";
-import type { LinearAgentClient, FetchFn } from "./linear/client.js";
+import {
+  hasFreshWebhookTimestamp,
+  verifyWebhookSignature,
+} from "./linear/webhook-verify.js";
+import {
+  LinearActivityError,
+  type LinearAgentClient,
+  type FetchFn,
+} from "./linear/client.js";
 import type {
   LinearOAuthTokenManager,
   LinearOAuthTokenResponse,
 } from "./linear/oauth.js";
 import type { JsonSessionStore } from "./sessions/store.js";
+import type {
+  BridgeStateStore,
+  IngressEventIdentity,
+  ReceiptErrorClass,
+} from "./state/store.js";
+import { ClaimOwnershipError } from "./state/store.js";
 import type { SerialQueue } from "./queue.js";
 
 /** Linear's OAuth2 token-exchange endpoint (linear.app/developers/oauth-2-0-authentication). */
@@ -44,6 +58,7 @@ export interface ServerDeps {
   linear: LinearAgentClient;
   oauth: LinearOAuthTokenManager;
   store: JsonSessionStore;
+  bridgeState: BridgeStateStore;
   queue: SerialQueue;
   /**
    * Fetch used for the OAuth token exchange in GET /oauth/callback.
@@ -91,13 +106,14 @@ class OAuthStateStore {
  *
  * POST /webhook
  *   1. Read raw body, verify signature (webhook-verify).
- *   2. Ack 200 immediately (Linear requires a response within 5s).
- *   3. For agent session events:
+ *   2. Persist a delivery receipt and semantic execution claim.
+ *   3. Ack 200 (Linear requires a response within 5s).
+ *   4. For newly claimed agent session events:
  *      - created: emit an immediate `thought` activity (10s liveness rule),
  *        then enqueue the session run.
  *      - prompted: look up the stored runtime session id and enqueue a
  *        resumed run with the follow-up prompt.
- *   4. Session run: iterate runtime.runSession(), forward each activity to
+ *   5. Session run: iterate runtime.runSession(), forward each activity to
  *      Linear, persist the runtime session id on session-started, emit an
  *      `error` activity on failure so the session never hangs silently.
  *
@@ -112,8 +128,10 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
     activeRuns: new Map<string, Set<AbortController>>(),
   };
   const server = createServer((req, res) => {
-    handleRequest(req, res, internalDeps, oauthStates).catch((err: unknown) => {
-      console.error("[linear-agent-bridge] request handler failed:", err);
+    handleRequest(req, res, internalDeps, oauthStates).catch((error: unknown) => {
+      console.error(
+        `[linear-agent-bridge] request handler failed: error=${boundedErrorClass(error)}`,
+      );
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
       }
@@ -216,19 +234,88 @@ async function handleWebhook(
     ? signatureHeaderRaw[0]
     : signatureHeaderRaw;
 
-  if (!verifyWebhook(rawBody, signatureHeader, deps.config.linearWebhookSecret)) {
-    console.error("[linear-agent-bridge] webhook rejected: invalid signature or stale timestamp");
+  if (
+    !verifyWebhookSignature(
+      rawBody,
+      signatureHeader,
+      deps.config.linearWebhookSecret,
+    )
+  ) {
+    console.error("[linear-agent-bridge] webhook rejected: error=InvalidSignature");
     res.writeHead(401, { "Content-Type": "text/plain" });
     res.end("invalid signature");
     return;
   }
 
-  // Ack first — Linear requires a response within 5s — then work.
+  let payload: unknown;
+  try {
+    payload = JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    console.error("[linear-agent-bridge] webhook rejected: error=InvalidJson");
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("invalid JSON");
+    return;
+  }
+
+  if (!hasFreshWebhookTimestamp(payload)) {
+    console.error("[linear-agent-bridge] webhook rejected: error=InvalidTimestamp");
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("invalid timestamp");
+    return;
+  }
+
+  const event = parseAgentSessionEvent(payload);
+  if (event === undefined) {
+    const record = asRecord(payload);
+    if (record?.type === "AgentSessionEvent") {
+      console.error(
+        "[linear-agent-bridge] webhook rejected: error=InvalidAgentSessionEvent",
+      );
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("invalid agent session event");
+      return;
+    }
+
+    console.log(
+      `[linear-agent-bridge] ignored webhook: type=${boundedLogValue(record?.type)} action=${boundedLogValue(record?.action)}`,
+    );
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+
+  const identity = eventIdentity(event);
+  let claimResult;
+  try {
+    claimResult = await deps.bridgeState.claimEvent(identity);
+  } catch (error) {
+    console.error(
+      `[linear-agent-bridge] ingress persistence failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+    );
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("ingress persistence unavailable");
+    return;
+  }
+
+  // Linear requires a response within 5s. The durable receipt and semantic
+  // claim above are the only work allowed to precede this acknowledgement.
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok");
 
-  processWebhookPayload(rawBody, deps).catch((err: unknown) => {
-    console.error("[linear-agent-bridge] webhook processing failed:", err);
+  if (claimResult.disposition !== "claimed") {
+    console.log(
+      `[linear-agent-bridge] ingress ${claimResult.disposition}: webhook=${identity.webhookId} execution=${identity.executionId}`,
+    );
+    return;
+  }
+
+  processClaimedWebhook(event, identity, deps).catch(async (error: unknown) => {
+    console.error(
+      `[linear-agent-bridge] webhook processing failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+    );
+    if (!(error instanceof ClaimOwnershipError)) {
+      await markIngressFailed(deps, identity, "WebhookProcessingError");
+    }
   });
 }
 
@@ -265,41 +352,47 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
   if (obj.action !== "created" && obj.action !== "prompted") {
     return undefined;
   }
+  if (!isBoundedIdentifier(obj.webhookId)) {
+    return undefined;
+  }
 
   const agentSession = obj.agentSession;
   if (agentSession === null || typeof agentSession !== "object") {
     return undefined;
   }
-  if (typeof (agentSession as Record<string, unknown>).id !== "string") {
+  if (!isBoundedIdentifier((agentSession as Record<string, unknown>).id)) {
     return undefined;
+  }
+  if (obj.action === "prompted") {
+    const agentActivity = asRecord(obj.agentActivity);
+    if (!isBoundedIdentifier(agentActivity?.id)) {
+      return undefined;
+    }
   }
 
   return obj as unknown as LinearAgentSessionEvent;
 }
 
-async function processWebhookPayload(
-  rawBody: Buffer,
+function eventIdentity(event: LinearAgentSessionEvent): IngressEventIdentity {
+  return {
+    webhookId: event.webhookId,
+    executionId:
+      event.action === "created"
+        ? `created:${event.agentSession.id}`
+        : event.agentActivity.id,
+    linearSessionId: event.agentSession.id,
+    action: event.action,
+  };
+}
+
+async function processClaimedWebhook(
+  event: LinearAgentSessionEvent,
+  identity: IngressEventIdentity,
   deps: InternalServerDeps,
 ): Promise<void> {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(rawBody.toString("utf8"));
-  } catch {
-    return;
-  }
-
-  const event = parseAgentSessionEvent(payload);
-  if (event === undefined) {
-    // Other webhook categories: already acked 200, nothing to do — but say
-    // what arrived so payload-shape mismatches are visible in the log.
-    const p = payload as Record<string, unknown> | null;
-    console.log(
-      `[linear-agent-bridge] ignored webhook: type=${String(p?.type)} action=${String(p?.action)} keys=${p ? Object.keys(p).join(",") : "null"}`,
-    );
-    return;
-  }
+  await deps.bridgeState.markDispatchStarted(identity.webhookId);
   console.log(
-    `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id}`,
+    `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
   );
 
   const sessionId = event.agentSession.id;
@@ -310,7 +403,10 @@ async function processWebhookPayload(
     let enqueued = false;
     try {
       // 10s liveness rule: emit a thought before doing anything else.
-      await deps.linear.createActivity(
+      await emitActivity(
+        deps,
+        identity.executionId,
+        "liveness",
         sessionId,
         {
           type: "thought",
@@ -319,6 +415,7 @@ async function processWebhookPayload(
         { ephemeral: true },
       );
       if (controller.signal.aborted) {
+        await deps.bridgeState.completeEvent(identity.webhookId);
         return;
       }
 
@@ -328,6 +425,7 @@ async function processWebhookPayload(
         { linearSessionId: sessionId, prompt },
         issueIdentifier,
         controller,
+        identity,
       );
       enqueued = true;
     } finally {
@@ -347,10 +445,14 @@ async function processWebhookPayload(
     /^stop[.!]?$/i.test(prompt.trim());
   if (isStop) {
     abortSessionRuns(deps, sessionId);
-    await deps.linear.createActivity(sessionId, {
-      type: "response",
-      body: STOPPED_RESPONSE_BODY,
-    });
+    await emitActivity(
+      deps,
+      identity.executionId,
+      "stop-response",
+      sessionId,
+      { type: "response", body: STOPPED_RESPONSE_BODY },
+    );
+    await deps.bridgeState.completeEvent(identity.webhookId);
     return;
   }
 
@@ -359,14 +461,18 @@ async function processWebhookPayload(
   try {
     const record = await deps.store.get(sessionId);
     if (controller.signal.aborted) {
+      await deps.bridgeState.completeEvent(identity.webhookId);
       return;
     }
     if (prompt === "") {
       console.log(
-        `[linear-agent-bridge] prompted with empty body; agentActivity=${JSON.stringify((payload as Record<string, unknown>).agentActivity)?.slice(0, 600)}`,
+        `[linear-agent-bridge] prompted with empty body: session=${sessionId} activity=${event.agentActivity.id}`,
       );
     }
-    await deps.linear.createActivity(
+    await emitActivity(
+      deps,
+      identity.executionId,
+      "liveness",
       sessionId,
       {
         type: "thought",
@@ -375,6 +481,7 @@ async function processWebhookPayload(
       { ephemeral: true },
     );
     if (controller.signal.aborted) {
+      await deps.bridgeState.completeEvent(identity.webhookId);
       return;
     }
     enqueueSessionRun(
@@ -382,6 +489,7 @@ async function processWebhookPayload(
       { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
       issueIdentifier ?? record?.issueIdentifier,
       controller,
+      identity,
     );
     enqueued = true;
   } finally {
@@ -410,30 +518,50 @@ function enqueueSessionRun(
   request: Omit<SessionRequest, "abortController">,
   issueIdentifier: string | undefined,
   controller: AbortController,
+  identity: IngressEventIdentity,
 ): void {
-  void deps.queue.enqueue(async () => {
-    try {
-      if (!controller.signal.aborted) {
-        console.log(
-          `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
-        );
-        let terminalReason: TurnTerminalReason = "failed";
-        try {
+  void deps.queue
+    .enqueue(async () => {
+      let terminalReason: TurnTerminalReason = controller.signal.aborted
+        ? "stopped"
+        : "failed";
+      try {
+        if (!controller.signal.aborted) {
+          console.log(
+            `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
+          );
           terminalReason = await runSessionTask(
             deps,
             { ...request, abortController: controller },
             issueIdentifier,
-          );
-        } finally {
-          console.log(
-            `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
+            identity.executionId,
           );
         }
+      } finally {
+        console.log(
+          `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
+        );
+        try {
+          if (terminalReason === "failed" || terminalReason === "inactive") {
+            await deps.bridgeState.failEvent(
+              identity.webhookId,
+              terminalReason === "inactive"
+                ? "RuntimeTimeout"
+                : "RuntimeExecutionError",
+            );
+          } else {
+            await deps.bridgeState.completeEvent(identity.webhookId);
+          }
+        } finally {
+          unregisterRun(deps, request.linearSessionId, controller);
+        }
       }
-    } finally {
-      unregisterRun(deps, request.linearSessionId, controller);
-    }
-  });
+    })
+    .catch((error: unknown) => {
+      console.error(
+        `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+      );
+    });
 }
 
 function abortSessionRuns(deps: InternalServerDeps, sessionId: string): void {
@@ -464,8 +592,10 @@ async function runSessionTask(
   deps: InternalServerDeps,
   request: SessionRequest,
   issueIdentifier: string | undefined,
+  executionId: string,
 ): Promise<TurnTerminalReason> {
   const controller = request.abortController;
+  let activitySequence = 0;
   let acceptEvents = true;
   let inactivityTriggered = false;
   let inactivityTimer: ReturnType<typeof setTimeout>;
@@ -478,8 +608,7 @@ async function runSessionTask(
       deps.runtime.forceCloseSession?.(request);
     } catch (error) {
       console.error(
-        `[linear-agent-bridge] runtime force-close failed for ${request.linearSessionId}:`,
-        error,
+        `[linear-agent-bridge] runtime force-close failed: session=${request.linearSessionId} error=${boundedErrorClass(error)}`,
       );
     }
   };
@@ -513,7 +642,17 @@ async function runSessionTask(
         // Reset before persistence or outbound Linear delivery. Those
         // operations and any retries they perform are not runtime progress.
         armWatchdog();
-        await handleRuntimeEvent(deps, request, issueIdentifier, event);
+        await handleRuntimeEvent(
+          deps,
+          request,
+          issueIdentifier,
+          event,
+          executionId,
+          activitySequence,
+        );
+        if (event.kind === "activity") {
+          activitySequence += 1;
+        }
       }
       return {};
     } catch (error) {
@@ -531,15 +670,19 @@ async function runSessionTask(
     inactivityTriggered ||
     (outcome.source === "watchdog" && outcome.reason === "inactive")
   ) {
-    void deps.linear
-      .createActivity(request.linearSessionId, {
+    void emitActivity(
+      deps,
+      executionId,
+      "inactivity-error",
+      request.linearSessionId,
+      {
         type: "error",
         body: `This request was inactive for ${formatDuration(deps.config.runInactivityTimeoutMs)} and was stopped.`,
-      })
+      },
+    )
       .catch((activityErr: unknown) => {
         console.error(
-          `[linear-agent-bridge] failed to emit inactivity activity for ${request.linearSessionId}:`,
-          activityErr,
+          `[linear-agent-bridge] failed to emit inactivity activity: session=${request.linearSessionId} error=${boundedErrorClass(activityErr)}`,
         );
       });
     return "inactive";
@@ -553,17 +696,21 @@ async function runSessionTask(
       return "stopped";
     }
     console.error(
-      `[linear-agent-bridge] session run failed for ${request.linearSessionId}:`,
-      outcome.error,
+      `[linear-agent-bridge] session run failed: session=${request.linearSessionId} error=RuntimeExecutionError`,
     );
     const body =
       outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     try {
-      await deps.linear.createActivity(request.linearSessionId, { type: "error", body });
+      await emitActivity(
+        deps,
+        executionId,
+        "runtime-error",
+        request.linearSessionId,
+        { type: "error", body },
+      );
     } catch (activityErr) {
       console.error(
-        `[linear-agent-bridge] failed to emit error activity for ${request.linearSessionId}:`,
-        activityErr,
+        `[linear-agent-bridge] failed to emit error activity: session=${request.linearSessionId} error=${boundedErrorClass(activityErr)}`,
       );
     }
     return "failed";
@@ -576,6 +723,8 @@ async function handleRuntimeEvent(
   request: SessionRequest,
   issueIdentifier: string | undefined,
   event: RuntimeEvent,
+  executionId: string,
+  activitySequence: number,
 ): Promise<void> {
   if (event.kind === "session-started") {
     await deps.store.put({
@@ -592,7 +741,10 @@ async function handleRuntimeEvent(
     const ephemeral =
       event.activity.type === "thought" ||
       (event.activity.type === "action" && event.activity.result === undefined);
-    await deps.linear.createActivity(
+    await emitActivity(
+      deps,
+      executionId,
+      `runtime-${activitySequence}`,
       request.linearSessionId,
       event.activity,
       {
@@ -603,6 +755,74 @@ async function handleRuntimeEvent(
       },
     );
   }
+}
+
+async function emitActivity(
+  deps: InternalServerDeps,
+  executionId: string,
+  activityKey: string,
+  agentSessionId: string,
+  content: AgentActivityContent,
+  options: { ephemeral?: boolean; signal?: AbortSignal } = {},
+): Promise<void> {
+  const activityId = await deps.bridgeState.getOrCreateActivityId(
+    executionId,
+    activityKey,
+  );
+  await deps.linear.createActivity(agentSessionId, content, {
+    activityId,
+    ...options,
+  });
+}
+
+async function markIngressFailed(
+  deps: InternalServerDeps,
+  identity: IngressEventIdentity,
+  errorClass: ReceiptErrorClass,
+): Promise<void> {
+  try {
+    await deps.bridgeState.failEvent(identity.webhookId, errorClass);
+  } catch (error) {
+    console.error(
+      `[linear-agent-bridge] ingress failure state could not be persisted: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+    );
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function isBoundedIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+
+function boundedLogValue(value: unknown): string {
+  if (typeof value !== "string") {
+    return "unknown";
+  }
+  return value.slice(0, 64).replace(/[^A-Za-z0-9_.:-]/g, "_");
+}
+
+function boundedErrorClass(error: unknown): string {
+  if (error instanceof ClaimOwnershipError) {
+    return "ClaimOwnershipError";
+  }
+  if (error instanceof LinearActivityError) {
+    return "LinearActivityError";
+  }
+  if (
+    error instanceof Error &&
+    typeof (error as NodeJS.ErrnoException).code === "string"
+  ) {
+    return "FilesystemError";
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return "AbortError";
+  }
+  return "UnknownError";
 }
 
 function formatDuration(milliseconds: number): string {
@@ -654,9 +874,8 @@ async function handleOAuthCallback(
     });
 
     if (!response.ok) {
-      const text = await response.text();
       throw new Error(
-        `Linear OAuth token exchange failed: ${response.status} ${response.statusText} — ${text}`,
+        `Linear OAuth token exchange failed: ${response.status} ${response.statusText}`,
       );
     }
 
@@ -669,7 +888,9 @@ async function handleOAuthCallback(
       "<html><body><p>Authorization complete. The agent will refresh its Linear access automatically.</p></body></html>",
     );
   } catch (err) {
-    console.error("[linear-agent-bridge] OAuth token exchange failed:", err);
+    console.error(
+      `[linear-agent-bridge] OAuth token exchange failed: error=${boundedErrorClass(err)}`,
+    );
     res.writeHead(500, { "Content-Type": "text/plain" });
     res.end("OAuth token exchange failed");
   }

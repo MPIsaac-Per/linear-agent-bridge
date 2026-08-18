@@ -19,15 +19,28 @@ Runs on Claude Code subscription auth. No Anthropic API key.
 ```
 Linear (mention / delegate / follow-up prompt)
   -> webhook: AgentSessionEvent (created | prompted)
-  -> src/server.ts        verify HMAC, ack < 5s, first activity < 10s
+  -> src/server.ts        verify HMAC, persist ingress, ack < 5s
+  -> src/state/store.ts   durable receipt + semantic execution claim
   -> src/queue.ts         serial execution, concurrency 1
   -> src/runtime/claude.ts  Agent SDK query(), cwd = KB_PATH, resume
   -> src/linear/client.ts   agentActivityCreate (thought/action/response)
 ```
 
-Session mapping (Linear session id -> SDK session id) and Linear's rotating
-OAuth token pair persist in JSON files, so follow-up prompts resume the same
-conversation and access refreshes without another browser authorization.
+Session mapping (Linear session id -> SDK session id), bounded webhook state,
+and Linear's rotating OAuth token pair persist in JSON files. Follow-up prompts
+resume the same conversation, webhook retries do not dispatch the same turn
+twice, and access refreshes without another browser authorization.
+
+For each valid agent event, the bridge durably persists a receipt keyed by
+Linear's `webhookId` and a semantic execution claim before returning 200.
+Created turns use `created:<agentSession.id>` as the execution identity;
+prompted turns use `agentActivity.id`. A claim left active by a process crash is
+reclaimed by a replacement process only when dispatch never started. The bridge
+persists a dispatch marker as the first processing step; a retry after that
+marker is explicitly recorded as ambiguous and is not run automatically.
+Terminal state is retained for seven days and capped at 10,000 receipts; active
+claims are never evicted. State can exceed the cap only if more than 10,000
+claims are simultaneously active.
 
 In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
@@ -86,6 +99,12 @@ store takes precedence across process and machine restarts. Keep the token
 store on persistent local storage. Its file mode is `0600`, and `data/` is
 excluded from Git.
 
+`BRIDGE_STATE_STORE_PATH` defaults to `data/bridge-state.json`. Keep it on
+persistent local storage as well. It contains only bounded identifiers, status
+timestamps, intended HTTP/result/disposition metadata, static error classes,
+and caller-generated activity UUIDs, never prompt or activity bodies. Writes
+use a same-directory atomic rename and owner-only file mode.
+
 #### Upgrading an existing installation
 
 Installations created before refresh-token support have only an access token
@@ -122,12 +141,20 @@ session takes.
   because it is resumed with an empty prompt.
 - AgentSessionEvent payloads put their fields at the top level of the
   webhook body (no `data` wrapper, unlike data-change webhooks).
+- `webhookId` identifies a Linear delivery. The created semantic execution id
+  is `created:<agentSession.id>`; prompted execution is identified by
+  `agentActivity.id`. Linear activity creation receives a caller-generated UUID
+  persisted before the request, so an OAuth retry reuses the same id.
+- A restart can reclaim a claim whose dispatch marker is absent. Once the
+  marker exists, a different process records `AmbiguousDispatch` and does not
+  execute the turn again. Same-process duplicate deliveries remain ordinary
+  duplicates.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.
-- Ack the webhook before doing any work (5s limit) and emit a thought
-  immediately on `created` (10s liveness limit), or Linear marks the
-  session unresponsive.
+- Persist the receipt and semantic claim, then ack the webhook within the 5s
+  limit. Do external work after the ack and emit a thought immediately on
+  `created` (10s liveness limit), or Linear marks the session unresponsive.
 - Keep runtime execution serial. Concurrent headless Claude sessions on
   one host have produced cross-session content contamination.
 - Claude Agent SDK tool results arrive as `user` messages containing
@@ -152,6 +179,9 @@ session takes.
 - Turn lifecycle logs contain bounded operational fields: session id and queue
   size at start, then session id, terminal reason, and remaining queue size at
   completion. Prompt and issue contents are not included.
+- Invalid JSON and invalid agent-event diagnostics are static classes. Ingress
+  failures log bounded error classes rather than raw errors, and Linear HTTP or
+  GraphQL response bodies are not copied into thrown errors or logs.
 - `permissionMode: "bypassPermissions"` does nothing without
   `allowDangerouslySkipPermissions: true`; the SDK requires the pair.
 - Old Agent SDK versions (0.1.x) fail to resume sessions whose transcript
@@ -163,8 +193,9 @@ session takes.
 
 ## Security notes
 
-The webhook endpoint verifies signatures and rejects stale timestamps. The
-OAuth callback consumes a random, expiring state value before exchanging an
+The webhook endpoint verifies signatures, rejects stale timestamps, and does
+not return 200 for a valid agent event unless its receipt and claim are durable.
+The OAuth callback consumes a random, expiring state value before exchanging an
 authorization code; only the local service log receives the matching setup
 URL. `/healthz` and `/oauth/callback` are the only other routes. Understand
 what you are wiring up: anyone who can mention the agent in your Linear

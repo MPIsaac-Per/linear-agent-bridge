@@ -21,6 +21,7 @@ describe("loadConfig", () => {
       runtime: "claude",
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
+      bridgeStateStorePath: "./data/bridge-state.json",
       oauthTokenStorePath: "./data/oauth-tokens.json",
       runInactivityTimeoutMs: 300000,
     });
@@ -33,6 +34,7 @@ describe("loadConfig", () => {
       RUNTIME: "codex",
       KB_PATH: "/tmp/kb",
       SESSION_STORE_PATH: "/tmp/sessions.json",
+      BRIDGE_STATE_STORE_PATH: "/tmp/bridge-state.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
       RUN_INACTIVITY_TIMEOUT_MS: "45000",
     });
@@ -41,6 +43,7 @@ describe("loadConfig", () => {
     expect(config.runtime).toBe("codex");
     expect(config.kbPath).toBe("/tmp/kb");
     expect(config.sessionStorePath).toBe("/tmp/sessions.json");
+    expect(config.bridgeStateStorePath).toBe("/tmp/bridge-state.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
     expect(config.runInactivityTimeoutMs).toBe(45000);
   });

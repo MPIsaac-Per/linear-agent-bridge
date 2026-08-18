@@ -1,8 +1,8 @@
 // Core domain types for the Linear <-> agent-runtime bridge.
 
-/** Subset of Linear's AgentSessionEvent webhook payload we consume. */
-export interface LinearAgentSessionEvent {
-  action: "created" | "prompted";
+interface LinearAgentSessionEventBase {
+  /** Linear's unique delivery id, used for durable receipt deduplication. */
+  webhookId: string;
   agentSession: {
     id: string;
     issue?: { id: string; identifier: string; title: string } | undefined;
@@ -10,21 +10,30 @@ export interface LinearAgentSessionEvent {
   };
   /** Formatted context string on `created` (issue details, comments, guidance). */
   promptContext?: string | undefined;
-  /**
-   * Follow-up user prompt on `prompted`. Verified against live payloads
-   * 2026-08-12: the text lives in the typed content union at
-   * `agentActivity.content.body`; a bare `body` is kept as fallback.
-   */
-  agentActivity?:
-    | {
-        body?: string | undefined;
-        content?: { type?: string; body?: string; signal?: string } | undefined;
-        signal?: string | undefined;
-      }
-    | undefined;
   previousComments?: unknown;
   guidance?: string | undefined;
 }
+
+/** Subset of Linear's AgentSessionEvent webhook payload we consume. */
+export type LinearAgentSessionEvent =
+  | (LinearAgentSessionEventBase & {
+      action: "created";
+      agentActivity?: undefined;
+    })
+  | (LinearAgentSessionEventBase & {
+      action: "prompted";
+      /**
+       * Linear's activity id is the prompted turn's semantic execution id.
+       * User text lives in the typed content union; a bare body remains a
+       * compatibility fallback for older payloads.
+       */
+      agentActivity: {
+        id: string;
+        body?: string | undefined;
+        content?: { type?: string; body?: string; signal?: string } | undefined;
+        signal?: string | undefined;
+      };
+    });
 
 /** Activity types Linear renders in the agent session thread. */
 export type AgentActivityContent =

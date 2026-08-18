@@ -128,9 +128,8 @@ export class LinearOAuthTokenManager {
       body: body.toString(),
     });
     if (!response.ok) {
-      const text = await response.text();
       throw new Error(
-        `Linear OAuth token refresh failed: ${response.status} ${response.statusText} — ${text}`,
+        `Linear OAuth token refresh failed: ${response.status} ${response.statusText}`,
       );
     }
 

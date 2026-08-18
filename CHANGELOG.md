@@ -7,6 +7,18 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Persist bounded webhook receipts, semantic execution claims, and
+  caller-generated Linear activity UUIDs before acknowledging valid agent
+  events. Delivery retries deduplicate by `webhookId`; created and prompted
+  turns claim `created:<agentSession.id>` and `agentActivity.id` respectively.
+  Terminal entries expire after seven days and are capped at 10,000 while
+  active claims are preserved.
+- Mark dispatch durably before any external or runtime side effect. A replacement
+  process safely reclaims a claim when dispatch never began; retries after the
+  marker persist an `AmbiguousDispatch` outcome and remain undispatched.
+
 ### Changed
 
 - Rename the project from `linear-claude-bridge` to `linear-agent-bridge` to
@@ -26,6 +38,15 @@ Changes awaiting a tagged release remain under Unreleased.
   one bounded warning whenever present, with the new variable taking precedence.
 - Log bounded turn lifecycle records with session id, terminal reason, and
   queue size without including prompt or issue content.
+- Return a non-200 response when ingress state cannot be persisted, retain
+  durable received/claimed/completed/failed/superseded lifecycle metadata, and
+  leave ambiguous claims from another process undispatched for manual review.
+- Remove prompted activity serialization from empty-body diagnostics so logs
+  contain only bounded identifiers and status metadata.
+- Persist bounded HTTP status, result, disposition, and error-class outcome
+  metadata for valid receipts. Invalid JSON and invalid agent events emit only
+  static diagnostics, ingress failures log only static classes, and Linear
+  response bodies are no longer echoed into errors.
 
 ### Fixed
 

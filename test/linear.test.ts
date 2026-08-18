@@ -124,7 +124,10 @@ describe("LinearAgentClient.createActivity", () => {
     const client = new LinearAgentClient("test-token", fetchFn);
     const content: AgentActivityContent = { type: "thought", body: "thinking..." };
 
-    await client.createActivity("session-1", content, { ephemeral: true });
+    await client.createActivity("session-1", content, {
+      activityId: "f15c2bc6-9aac-42f7-862c-6fe926b13527",
+      ephemeral: true,
+    });
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
@@ -139,6 +142,7 @@ describe("LinearAgentClient.createActivity", () => {
       query: string;
       variables: {
         input: {
+          id: string;
           agentSessionId: string;
           content: AgentActivityContent;
           ephemeral?: boolean;
@@ -148,8 +152,65 @@ describe("LinearAgentClient.createActivity", () => {
     expect(parsedBody.query).toContain("agentActivityCreate");
     expect(parsedBody.query).toContain("AgentActivityCreateInput");
     expect(parsedBody.variables).toEqual({
-      input: { agentSessionId: "session-1", content, ephemeral: true },
+      input: {
+        id: "f15c2bc6-9aac-42f7-862c-6fe926b13527",
+        agentSessionId: "session-1",
+        content,
+        ephemeral: true,
+      },
     });
+  });
+
+  it("reuses the caller UUID when OAuth refresh retries an activity", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-id-"));
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { errors: [{ message: "Authentication required" }] },
+          { ok: false, status: 401, statusText: "Unauthorized" },
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          access_token: "fresh-access",
+          refresh_token: "fresh-refresh",
+          expires_in: 86399,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ data: { agentActivityCreate: { success: true } } }),
+      );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "expired-access",
+      storePath: path.join(tmpDir, "tokens.json"),
+      fetchFn,
+    });
+    await oauth.install({
+      access_token: "expired-access",
+      refresh_token: "initial-refresh",
+      expires_in: 0,
+    });
+    const client = new LinearAgentClient(oauth, fetchFn);
+
+    try {
+      await client.createActivity(
+        "session-idempotent",
+        { type: "response", body: "done" },
+        { activityId: "e9523ef5-53cc-477f-8c5b-cf8b33ce16b9" },
+      );
+
+      const firstInput = JSON.parse(fetchFn.mock.calls[0]?.[1]?.body as string)
+        .variables.input;
+      const retriedInput = JSON.parse(fetchFn.mock.calls[2]?.[1]?.body as string)
+        .variables.input;
+      expect(firstInput.id).toBe("e9523ef5-53cc-477f-8c5b-cf8b33ce16b9");
+      expect(retriedInput.id).toBe(firstInput.id);
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 
   it("POSTs a response activity with the correct content shape", async () => {
@@ -184,26 +245,32 @@ describe("LinearAgentClient.createActivity", () => {
   it("throws on a non-2xx HTTP response", async () => {
     const fetchFn = vi.fn().mockResolvedValue(
       jsonResponse(
-        { error: "server exploded" },
+        { error: "raw-linear-response-body" },
         { ok: false, status: 500, statusText: "Internal Server Error" },
       ),
     );
     const client = new LinearAgentClient("test-token", fetchFn);
 
-    await expect(
-      client.createActivity("session-3", { type: "thought", body: "x" }),
-    ).rejects.toThrow(/500/);
+    const error = await client
+      .createActivity("session-3", { type: "thought", body: "x" })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("500");
+    expect(String(error)).not.toContain("raw-linear-response-body");
   });
 
-  it("throws with the GraphQL error text when the response carries errors", async () => {
+  it("does not echo GraphQL response error text", async () => {
     const fetchFn = vi
       .fn()
       .mockResolvedValue(jsonResponse({ errors: [{ message: "agentSessionId not found" }] }));
     const client = new LinearAgentClient("test-token", fetchFn);
 
-    await expect(
-      client.createActivity("session-4", { type: "thought", body: "x" }),
-    ).rejects.toThrow(/agentSessionId not found/);
+    const error = await client
+      .createActivity("session-4", { type: "thought", body: "x" })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("GraphQL error");
+    expect(String(error)).not.toContain("agentSessionId not found");
   });
 
   it("throws when the mutation reports success: false", async () => {

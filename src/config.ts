@@ -7,6 +7,7 @@ export interface Config {
   runtime: "claude" | "codex";
   kbPath: string;
   sessionStorePath: string;
+  bridgeStateStorePath: string;
   oauthTokenStorePath: string;
   runInactivityTimeoutMs: number;
 }
@@ -14,6 +15,7 @@ export interface Config {
 const DEFAULT_PORT = "3979";
 const DEFAULT_RUNTIME = "claude";
 const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
+const DEFAULT_BRIDGE_STATE_STORE_PATH = "./data/bridge-state.json";
 const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
 const DEFAULT_RUN_INACTIVITY_TIMEOUT_MS = "300000";
 let warnedAboutDeprecatedRunTimeout = false;
@@ -82,6 +84,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // service's own working directory; point it at your knowledge base.
     kbPath: env.KB_PATH ?? process.cwd(),
     sessionStorePath: env.SESSION_STORE_PATH ?? DEFAULT_SESSION_STORE_PATH,
+    bridgeStateStorePath:
+      env.BRIDGE_STATE_STORE_PATH ?? DEFAULT_BRIDGE_STATE_STORE_PATH,
     oauthTokenStorePath:
       env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
     runInactivityTimeoutMs,

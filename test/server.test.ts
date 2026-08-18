@@ -8,6 +8,7 @@ import type { Config } from "../src/config.js";
 import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
+import { JsonBridgeStateStore } from "../src/state/store.js";
 import { SerialQueue } from "../src/queue.js";
 import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
 import type {
@@ -29,6 +30,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     runtime: "claude",
     kbPath: "/tmp/kb-unused",
     sessionStorePath: "unused-see-store-field",
+    bridgeStateStorePath: "unused-see-bridge-state-field",
     oauthTokenStorePath: "unused-see-oauth-field",
     runInactivityTimeoutMs: 300000,
     ...overrides,
@@ -76,11 +78,12 @@ interface LinearCall {
 }
 
 /** Fakes the Linear GraphQL endpoint: records every agentActivityCreate call. */
-function fakeLinearFetch(calls: LinearCall[]): FetchFn {
+function fakeLinearFetch(calls: LinearCall[], activityIds: string[]): FetchFn {
   return (async (_url: RequestInfo | URL, init?: RequestInit) => {
     const parsed = JSON.parse(init?.body as string) as {
       variables: {
         input: {
+          id?: string;
           agentSessionId: string;
           content: AgentActivityContent;
           ephemeral?: boolean;
@@ -94,6 +97,9 @@ function fakeLinearFetch(calls: LinearCall[]): FetchFn {
         ? { ephemeral: parsed.variables.input.ephemeral }
         : {}),
     });
+    if (parsed.variables.input.id !== undefined) {
+      activityIds.push(parsed.variables.input.id);
+    }
     return jsonResponse({ data: { agentActivityCreate: { success: true } } });
   }) as FetchFn;
 }
@@ -132,6 +138,8 @@ interface Harness {
   close: () => Promise<void>;
   calls: LinearCall[];
   store: JsonSessionStore;
+  bridgeState: JsonBridgeStateStore;
+  activityIds: string[];
   tokenFetch: ReturnType<typeof vi.fn>;
   oauthTokenStorePath: string;
   authorizationUrl: Promise<string>;
@@ -143,16 +151,30 @@ async function startTestServer(
     tokenFetchImpl?: FetchFn;
     linearFetchImpl?: (calls: LinearCall[]) => FetchFn;
     configOverrides?: Partial<Config>;
+    makeBridgeStatePathDirectory?: boolean;
+    bridgeStateOwnerId?: string;
+    prepareBridgeState?: (storePath: string) => Promise<void>;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
+  const activityIds: string[] = [];
   const linear = new LinearAgentClient(
     "test-linear-token",
-    options.linearFetchImpl?.(calls) ?? fakeLinearFetch(calls),
+    options.linearFetchImpl?.(calls) ?? fakeLinearFetch(calls, activityIds),
   );
 
   const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "server-test-"));
   const store = new JsonSessionStore(path.join(tmpDir, "sessions.json"));
+  const bridgeStatePath = path.join(tmpDir, "bridge-state.json");
+  if (options.makeBridgeStatePathDirectory === true) {
+    await fsPromises.mkdir(bridgeStatePath);
+  }
+  await options.prepareBridgeState?.(bridgeStatePath);
+  const bridgeState = new JsonBridgeStateStore(bridgeStatePath, {
+    ...(options.bridgeStateOwnerId !== undefined
+      ? { ownerId: options.bridgeStateOwnerId }
+      : {}),
+  });
   const oauthTokenStorePath = path.join(tmpDir, "oauth-tokens.json");
 
   const tokenFetch = vi.fn(
@@ -182,6 +204,7 @@ async function startTestServer(
     linear,
     oauth,
     store,
+    bridgeState,
     queue,
     tokenFetch: tokenFetch as unknown as FetchFn,
     onListening: resolveListening,
@@ -202,6 +225,8 @@ async function startTestServer(
     },
     calls,
     store,
+    bridgeState,
+    activityIds,
     tokenFetch,
     oauthTokenStorePath,
     authorizationUrl,
@@ -228,6 +253,7 @@ describe("startServer", () => {
     const harness = activeHarness;
 
     const payload = {
+      webhookId: "webhook-created-1",
       type: "AgentSessionEvent",
       action: "created",
       agentSession: {
@@ -279,6 +305,319 @@ describe("startServer", () => {
       issueIdentifier: "MPI-1",
       updatedAt: expect.any(String),
     });
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt("webhook-created-1"))?.status ===
+      "completed",
+    );
+    await expect(
+      harness.bridgeState.getClaim("created:agent-session-1"),
+    ).resolves.toMatchObject({
+      webhookId: "webhook-created-1",
+      status: "completed",
+      activityIds: expect.any(Object),
+    });
+    expect(harness.activityIds).toHaveLength(3);
+    expect(new Set(harness.activityIds).size).toBe(3);
+  });
+
+  it("does not acknowledge a valid event when durable receipt persistence fails", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        makeBridgeStatePathDirectory: true,
+      });
+      const harness = activeHarness;
+      const payload = {
+        webhookId: "webhook-persistence-failure",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-persistence-failure" },
+        promptContext: "raw-persistence-prompt-body",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+
+      const response = await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+
+      expect(response.status).toBe(503);
+      expect(runtime.requests).toHaveLength(0);
+      expect(harness.calls).toHaveLength(0);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain("error=FilesystemError");
+      expect(logged).not.toContain("raw-persistence-prompt-body");
+      expect(logged).not.toContain("EISDIR");
+      expect(logged).not.toContain("bridge-state.json");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("deduplicates webhook retries and supersedes a second receipt for the same created execution", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "activity", activity: { type: "response", body: "once" } };
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const basePayload = {
+      webhookId: "webhook-dedupe-original",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "agent-session-dedupe" },
+      promptContext: "run exactly once",
+      webhookTimestamp: Date.now(),
+    };
+    const send = async (payload: typeof basePayload): Promise<Response> => {
+      const body = JSON.stringify(payload);
+      return fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+    };
+
+    expect((await send(basePayload)).status).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    expect((await send(basePayload)).status).toBe(200);
+    expect(
+      (
+        await send({
+          ...basePayload,
+          webhookId: "webhook-dedupe-crossed-runtime",
+          webhookTimestamp: Date.now(),
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(runtime.requests).toHaveLength(1);
+    await expect(
+      harness.bridgeState.getReceipt("webhook-dedupe-crossed-runtime"),
+    ).resolves.toMatchObject({
+      status: "superseded",
+      supersededByWebhookId: "webhook-dedupe-original",
+    });
+  });
+
+  it("reclaims and executes a prior-process claim that never started dispatch", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "activity", activity: { type: "response", body: "recovered" } };
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime, {
+      bridgeStateOwnerId: "runtime-after-restart",
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, {
+          ownerId: "runtime-before-crash",
+        });
+        await prior.claimEvent({
+          webhookId: "webhook-reclaim-before-dispatch",
+          executionId: "created:agent-session-reclaim-before-dispatch",
+          linearSessionId: "agent-session-reclaim-before-dispatch",
+          action: "created",
+        });
+      },
+    });
+    const harness = activeHarness;
+    const payload = {
+      webhookId: "webhook-reclaim-before-dispatch",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "agent-session-reclaim-before-dispatch" },
+      promptContext: "safe to retry",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    await waitFor(async () =>
+      (
+        await harness.bridgeState.getReceipt(
+          "webhook-reclaim-before-dispatch",
+        )
+      )?.status === "completed",
+    );
+    await expect(
+      harness.bridgeState.getClaim(
+        "created:agent-session-reclaim-before-dispatch",
+      ),
+    ).resolves.toMatchObject({
+      ownerId: "runtime-after-restart",
+      dispatchStartedAt: expect.any(String),
+    });
+  });
+
+  it("surfaces a post-dispatch retry as ambiguous without running it again", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime, {
+      bridgeStateOwnerId: "runtime-after-restart",
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, {
+          ownerId: "runtime-before-crash",
+        });
+        await prior.claimEvent({
+          webhookId: "webhook-ambiguous-after-dispatch",
+          executionId: "created:agent-session-ambiguous-after-dispatch",
+          linearSessionId: "agent-session-ambiguous-after-dispatch",
+          action: "created",
+        });
+        await prior.markDispatchStarted("webhook-ambiguous-after-dispatch");
+      },
+    });
+    const harness = activeHarness;
+    const payload = {
+      webhookId: "webhook-ambiguous-after-dispatch",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "agent-session-ambiguous-after-dispatch" },
+      promptContext: "must not run again",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(runtime.requests).toHaveLength(0);
+    expect(harness.calls).toHaveLength(0);
+    await expect(
+      harness.bridgeState.getReceipt("webhook-ambiguous-after-dispatch"),
+    ).resolves.toMatchObject({
+      status: "claimed",
+      outcome: {
+        httpStatus: 200,
+        result: "not_dispatched",
+        disposition: "ambiguous",
+        errorClass: "AmbiguousDispatch",
+      },
+    });
+  });
+
+  it("rejects agent events without the required durable identities", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const payloads = [
+      {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-missing-webhook" },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-missing-activity",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-missing-activity" },
+        agentActivity: { content: { type: "prompt", body: "hello" } },
+        webhookTimestamp: Date.now(),
+      },
+    ];
+
+    for (const payload of payloads) {
+      const body = JSON.stringify(payload);
+      const response = await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+        },
+        body,
+      });
+      expect(response.status).toBe(400);
+    }
+    expect(runtime.requests).toHaveLength(0);
+  });
+
+  it("logs bounded static diagnostics for invalid JSON and invalid agent events", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      activeHarness = await startTestServer(runtime);
+      const harness = activeHarness;
+      const invalidJson = '{"secret":"raw-invalid-json-body"';
+      const invalidJsonResponse = await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(invalidJson, WEBHOOK_SECRET),
+        },
+        body: invalidJson,
+      });
+      expect(invalidJsonResponse.status).toBe(400);
+
+      const invalidEvent = JSON.stringify({
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-invalid-event" },
+        agentActivity: {
+          content: { type: "prompt", body: "raw-invalid-agent-body" },
+        },
+        webhookTimestamp: Date.now(),
+      });
+      const invalidEventResponse = await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(invalidEvent, WEBHOOK_SECRET),
+        },
+        body: invalidEvent,
+      });
+      expect(invalidEventResponse.status).toBe(400);
+
+      expect(errorSpy.mock.calls.map((call) => call.join(" "))).toEqual([
+        "[linear-agent-bridge] webhook rejected: error=InvalidJson",
+        "[linear-agent-bridge] webhook rejected: error=InvalidAgentSessionEvent",
+      ]);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("raw-invalid-json-body");
+      expect(logged).not.toContain("raw-invalid-agent-body");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("logs turn lifecycle with bounded session, reason, and queue fields", async () => {
@@ -291,6 +630,7 @@ describe("startServer", () => {
       activeHarness = await startTestServer(runtime);
       const harness = activeHarness;
       const payload = {
+        webhookId: "webhook-created-log",
         type: "AgentSessionEvent",
         action: "created",
         agentSession: { id: "agent-session-log", issue: { title: "secret issue title" } },
@@ -322,6 +662,9 @@ describe("startServer", () => {
         "[linear-agent-bridge] turn start: session=agent-session-log queue=1",
         "[linear-agent-bridge] turn terminal: session=agent-session-log reason=completed queue=0",
       ]);
+      const logged = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("secret issue title");
+      expect(logged).not.toContain("secret prompt contents");
     } finally {
       logSpy.mockRestore();
     }
@@ -346,11 +689,15 @@ describe("startServer", () => {
     });
 
     const payload = {
+      webhookId: "webhook-prompted-2",
       type: "AgentSessionEvent",
       action: "prompted",
       agentSession: { id: "agent-session-2" },
       // Live payload shape (2026-08-12): text rides the content union.
-      agentActivity: { content: { type: "prompt", body: "please continue" } },
+      agentActivity: {
+        id: "activity-prompted-2",
+        content: { type: "prompt", body: "please continue" },
+      },
       webhookTimestamp: Date.now(),
     };
     const body = JSON.stringify(payload);
@@ -372,6 +719,55 @@ describe("startServer", () => {
       resumeSessionId: "prior-runtime-session",
       abortController: expect.any(AbortController),
     });
+    await waitFor(async () =>
+      (await harness.bridgeState.getClaim("activity-prompted-2"))?.status ===
+      "completed",
+    );
+  });
+
+  it("never serializes a prompted activity or body into logs", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      activeHarness = await startTestServer(runtime);
+      const harness = activeHarness;
+      const payload = {
+        webhookId: "webhook-empty-prompt",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-empty-prompt" },
+        agentActivity: {
+          id: "activity-empty-prompt",
+          content: { type: "prompt", body: "" },
+          privateMarker: "secret-activity-marker",
+        },
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+
+      const logged = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("secret-activity-marker");
+      expect(logged).not.toContain('"body"');
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("a stop signal aborts the active turn and closes the Linear session", async () => {
@@ -396,6 +792,7 @@ describe("startServer", () => {
 
     try {
       const createdPayload = {
+        webhookId: "webhook-stop-created",
         type: "AgentSessionEvent",
         action: "created",
         agentSession: {
@@ -417,10 +814,12 @@ describe("startServer", () => {
       await waitFor(() => runtime.requests.length === 1);
 
       const stopPayload = {
+        webhookId: "webhook-stop-prompted",
         type: "AgentSessionEvent",
         action: "prompted",
         agentSession: { id: "agent-session-stop" },
         agentActivity: {
+          id: "activity-stop-prompted",
           content: { type: "prompt", body: "cancel this run", signal: "stop" },
         },
         webhookTimestamp: Date.now(),
@@ -443,6 +842,10 @@ describe("startServer", () => {
       );
       expect(runtime.requests).toHaveLength(1);
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt("webhook-stop-prompted"))?.status ===
+        "completed",
+      );
     } finally {
       release.resolve();
     }
@@ -485,10 +888,14 @@ describe("startServer", () => {
     });
 
     const promptedPayload = {
+      webhookId: "webhook-setup-prompted",
       type: "AgentSessionEvent",
       action: "prompted",
       agentSession: { id: "agent-session-setup-race" },
-      agentActivity: { content: { type: "prompt", body: "continue the work" } },
+      agentActivity: {
+        id: "activity-setup-prompted",
+        content: { type: "prompt", body: "continue the work" },
+      },
       webhookTimestamp: Date.now(),
     };
     const promptedBody = JSON.stringify(promptedPayload);
@@ -503,10 +910,12 @@ describe("startServer", () => {
     await thoughtStarted.promise;
 
     const stopPayload = {
+      webhookId: "webhook-setup-stop",
       type: "AgentSessionEvent",
       action: "prompted",
       agentSession: { id: "agent-session-setup-race" },
       agentActivity: {
+        id: "activity-setup-stop",
         content: { type: "prompt", body: "cancel this run", signal: "stop" },
       },
       webhookTimestamp: Date.now(),
@@ -556,6 +965,7 @@ describe("startServer", () => {
 
     try {
       const payload = {
+        webhookId: "webhook-timeout",
         type: "AgentSessionEvent",
         action: "created",
         agentSession: {
@@ -584,6 +994,20 @@ describe("startServer", () => {
         ),
       );
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt("webhook-timeout"))?.status ===
+        "failed",
+      );
+      await expect(
+        harness.bridgeState.getReceipt("webhook-timeout"),
+      ).resolves.toMatchObject({
+        outcome: {
+          httpStatus: 200,
+          result: "processing_failed",
+          disposition: "claimed",
+          errorClass: "RuntimeTimeout",
+        },
+      });
     } finally {
       release.resolve();
     }
@@ -614,6 +1038,7 @@ describe("startServer", () => {
 
     for (const sessionId of ["agent-session-active-long", "agent-session-waiting"]) {
       const payload = {
+        webhookId: `webhook-${sessionId}`,
         type: "AgentSessionEvent",
         action: "created",
         agentSession: { id: sessionId, issue: { title: "Active long request" } },
@@ -699,6 +1124,7 @@ describe("startServer", () => {
 
     for (const sessionId of ["agent-session-done", "agent-session-after-done"]) {
       const payload = {
+        webhookId: `webhook-${sessionId}`,
         type: "AgentSessionEvent",
         action: "created",
         agentSession: { id: sessionId, issue: { title: "Done is terminal" } },
@@ -790,6 +1216,7 @@ describe("startServer", () => {
     });
     const harness = activeHarness;
     const payload = {
+      webhookId: "webhook-activity-timeout",
       type: "AgentSessionEvent",
       action: "created",
       agentSession: { id: "agent-session-activity-timeout", issue: { title: "Hang" } },
@@ -875,6 +1302,7 @@ describe("startServer", () => {
     try {
       for (const sessionId of ["agent-session-hard-timeout", "agent-session-queued"]) {
         const payload = {
+          webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
           action: "created",
           agentSession: { id: sessionId, issue: { title: "Bounded request" } },
@@ -963,6 +1391,7 @@ describe("startServer", () => {
     try {
       for (const sessionId of ["agent-session-close-first", "agent-session-close-next"]) {
         const payload = {
+          webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
           action: "created",
           agentSession: { id: sessionId, issue: { title: "Force close ordering" } },
@@ -1020,6 +1449,7 @@ describe("startServer", () => {
     try {
       for (const sessionId of ["claude-close-first", "claude-close-next"]) {
         const payload = {
+          webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
           action: "created",
           agentSession: { id: sessionId, issue: { title: "Claude close ordering" } },
@@ -1061,6 +1491,7 @@ describe("startServer", () => {
     const harness = activeHarness;
 
     const payload = {
+      webhookId: "webhook-bad-signature",
       type: "AgentSessionEvent",
       action: "created",
       agentSession: { id: "agent-session-bad-sig", issue: { id: "i", identifier: "MPI-3", title: "t" } },
@@ -1095,6 +1526,7 @@ describe("startServer", () => {
     const harness = activeHarness;
 
     const payload = {
+      webhookId: "webhook-runtime-error",
       type: "AgentSessionEvent",
       action: "created",
       agentSession: { id: "agent-session-err", issue: { id: "i", identifier: "MPI-4", title: "t" } },
@@ -1123,10 +1555,73 @@ describe("startServer", () => {
       agentSessionId: "agent-session-err",
       content: { type: "error", body: "kaboom" },
     });
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt("webhook-runtime-error"))?.status ===
+      "failed",
+    );
+    await expect(
+      harness.bridgeState.getReceipt("webhook-runtime-error"),
+    ).resolves.toMatchObject({
+      outcome: {
+        httpStatus: 200,
+        result: "processing_failed",
+        disposition: "claimed",
+        errorClass: "RuntimeExecutionError",
+      },
+    });
 
     const health = await fetch(serverUrl(harness.port, "/healthz"));
     expect(health.status).toBe(200);
     expect(await health.text()).toBe("ok");
+  });
+
+  it("logs only a bounded error class when processing fails", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      throw new Error("raw-runtime-error-body");
+      // eslint-disable-next-line no-unreachable
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      activeHarness = await startTestServer(runtime);
+      const harness = activeHarness;
+      const payload = {
+        webhookId: "webhook-bounded-processing-error",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-bounded-processing-error" },
+        promptContext: "raw-secret-prompt-body",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(async () =>
+        (
+          await harness.bridgeState.getReceipt(
+            "webhook-bounded-processing-error",
+          )
+        )?.status === "failed",
+      );
+
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain("error=RuntimeExecutionError");
+      expect(logged).not.toContain("raw-runtime-error-body");
+      expect(logged).not.toContain("raw-secret-prompt-body");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("oauth callback: exchanges the code and persists the rotating token pair", async () => {

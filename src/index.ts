@@ -3,6 +3,7 @@ import { startServer } from "./server.js";
 import { LinearAgentClient } from "./linear/client.js";
 import { LinearOAuthTokenManager } from "./linear/oauth.js";
 import { JsonSessionStore } from "./sessions/store.js";
+import { JsonBridgeStateStore } from "./state/store.js";
 import { SerialQueue } from "./queue.js";
 import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
@@ -26,6 +27,7 @@ startServer({
   linear: new LinearAgentClient(oauth),
   oauth,
   store: new JsonSessionStore(config.sessionStorePath),
+  bridgeState: new JsonBridgeStateStore(config.bridgeStateStorePath),
   queue: new SerialQueue(),
 });
 console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);

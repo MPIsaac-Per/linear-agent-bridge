@@ -24,6 +24,14 @@ interface AgentActivityCreateResponse {
   errors?: GraphQLError[];
 }
 
+/** Static, body-free failure surfaced to ingress orchestration and logs. */
+export class LinearActivityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LinearActivityError";
+  }
+}
+
 /** Signature-compatible subset of the global `fetch` used for injection. */
 export type FetchFn = typeof fetch;
 
@@ -49,7 +57,11 @@ export class LinearAgentClient {
   async createActivity(
     agentSessionId: string,
     content: AgentActivityContent,
-    options: { ephemeral?: boolean; signal?: AbortSignal } = {},
+    options: {
+      activityId?: string;
+      ephemeral?: boolean;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<void> {
     const accessToken = await this.getAccessToken();
     let response = await this.postActivity(
@@ -71,24 +83,19 @@ export class LinearAgentClient {
     }
 
     if (!response.ok) {
-      const bodyText = await response.text();
-      throw new Error(
-        `Linear agentActivityCreate failed: ${response.status} ${response.statusText} — ${bodyText}`,
+      throw new LinearActivityError(
+        `Linear agentActivityCreate failed: ${response.status} ${response.statusText}`,
       );
     }
 
     const json = (await response.json()) as AgentActivityCreateResponse;
 
     if (json.errors && json.errors.length > 0) {
-      throw new Error(
-        `Linear agentActivityCreate GraphQL error: ${json.errors
-          .map((e) => e.message)
-          .join("; ")}`,
-      );
+      throw new LinearActivityError("Linear agentActivityCreate GraphQL error");
     }
 
     if (json.data?.agentActivityCreate?.success !== true) {
-      throw new Error(
+      throw new LinearActivityError(
         "Linear agentActivityCreate returned success: false with no GraphQL errors",
       );
     }
@@ -104,7 +111,11 @@ export class LinearAgentClient {
     accessToken: string,
     agentSessionId: string,
     content: AgentActivityContent,
-    options: { ephemeral?: boolean; signal?: AbortSignal },
+    options: {
+      activityId?: string;
+      ephemeral?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<Response> {
     return this.fetchFn(LINEAR_GRAPHQL_URL, {
       method: "POST",
@@ -116,6 +127,7 @@ export class LinearAgentClient {
         query: AGENT_ACTIVITY_CREATE_MUTATION,
         variables: {
           input: {
+            ...(options.activityId !== undefined ? { id: options.activityId } : {}),
             agentSessionId,
             content,
             ...(options.ephemeral !== undefined
