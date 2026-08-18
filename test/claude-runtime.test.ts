@@ -119,7 +119,9 @@ function resultError(sessionId: string, errors: string[]): SDKMessage {
 async function collect(request: SessionRequest, runtime: ClaudeRuntime): Promise<RuntimeEvent[]> {
   const events: RuntimeEvent[] = [];
   for await (const event of runtime.runSession(request)) {
-    events.push(event);
+    if (event.kind !== "progress") {
+      events.push(event);
+    }
   }
   return events;
 }
@@ -131,6 +133,48 @@ describe("ClaudeRuntime", () => {
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
     expect(runtime.name).toBe("claude");
+  });
+
+  it("emits non-rendering progress before mapping every raw SDK message", async () => {
+    const sessionId = "sdk-session-progress";
+    async function* stub(): AsyncGenerator<SDKMessage> {
+      yield systemInit(sessionId);
+      yield assistantToolUse(sessionId, "Read", { file_path: "/tmp/x.md" }, "tool-progress");
+      yield userToolResult(sessionId, "tool-progress", "contents");
+      yield resultSuccess(sessionId, "done");
+    }
+    const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
+    const events: RuntimeEvent[] = [];
+
+    for await (const event of runtime.runSession({
+      linearSessionId: "linear-progress",
+      prompt: "inspect it",
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { kind: "progress" },
+      { kind: "session-started", runtimeSessionId: sessionId },
+      { kind: "progress" },
+      {
+        kind: "activity",
+        activity: { type: "action", action: "Read", parameter: '{"file_path":"/tmp/x.md"}' },
+      },
+      { kind: "progress" },
+      {
+        kind: "activity",
+        activity: {
+          type: "action",
+          action: "Read",
+          parameter: '{"file_path":"/tmp/x.md"}',
+          result: "Completed.",
+        },
+      },
+      { kind: "progress" },
+      { kind: "activity", activity: { type: "response", body: "done" } },
+      { kind: "done" },
+    ]);
   });
 
   it("yields session-started, thought, action, response, done in order (happy path)", async () => {
@@ -206,7 +250,9 @@ describe("ClaudeRuntime", () => {
         linearSessionId: "linear-end-turn",
         prompt: "hello",
       })) {
-        events.push(event);
+        if (event.kind !== "progress") {
+          events.push(event);
+        }
       }
     })();
 
@@ -667,7 +713,9 @@ describe("ClaudeRuntime", () => {
 
     await expect(async () => {
       for await (const event of runtime.runSession({ linearSessionId: "l5", prompt: "hi" })) {
-        events.push(event);
+        if (event.kind !== "progress") {
+          events.push(event);
+        }
       }
     }).rejects.toThrow("stream exploded");
 

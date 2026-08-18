@@ -42,12 +42,13 @@ export interface SessionRequest {
   prompt: string;
   /** Runtime session id from a prior turn, when resuming. */
   resumeSessionId?: string | undefined;
-  /** Cancels the active runtime turn for a Linear stop signal or deadline. */
+  /** Cancels the active runtime turn for a Linear stop signal or inactivity. */
   abortController?: AbortController | undefined;
 }
 
-/** Events a runtime yields while working a session. */
+/** Events a runtime yields while working a session. Progress never renders. */
 export type RuntimeEvent =
+  | { kind: "progress" }
   | { kind: "session-started"; runtimeSessionId: string }
   | { kind: "activity"; activity: AgentActivityContent }
   | { kind: "done" };

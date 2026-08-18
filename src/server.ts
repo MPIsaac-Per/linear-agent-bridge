@@ -32,7 +32,7 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
-type TurnTerminalReason = "completed" | "timed_out" | "stopped" | "failed";
+type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 
 interface InternalServerDeps extends ServerDeps {
   activeRuns: Map<string, Set<AbortController>>;
@@ -467,12 +467,52 @@ async function runSessionTask(
 ): Promise<TurnTerminalReason> {
   const controller = request.abortController;
   let acceptEvents = true;
+  let inactivityTriggered = false;
+  let inactivityTimer: ReturnType<typeof setTimeout>;
+  let resolveWatchdog!: (outcome: "inactive" | "stopped") => void;
+  const watchdog = new Promise<"inactive" | "stopped">((resolve) => {
+    resolveWatchdog = resolve;
+  });
+  const forceCloseRuntime = (): void => {
+    try {
+      deps.runtime.forceCloseSession?.(request);
+    } catch (error) {
+      console.error(
+        `[linear-agent-bridge] runtime force-close failed for ${request.linearSessionId}:`,
+        error,
+      );
+    }
+  };
+  const armWatchdog = (): void => {
+    clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      acceptEvents = false;
+      if (controller?.signal.aborted === true) {
+        forceCloseRuntime();
+        resolveWatchdog("stopped");
+        return;
+      }
+      inactivityTriggered = true;
+      controller?.abort(new Error("Session inactivity limit exceeded"));
+      forceCloseRuntime();
+      resolveWatchdog("inactive");
+    }, deps.config.runInactivityTimeoutMs);
+  };
+  // Queue and webhook time do not count. The first watchdog window begins
+  // only now, once this serial task is actually executing.
+  armWatchdog();
   const consumeRuntime = async (): Promise<{ error?: unknown }> => {
     try {
       for await (const event of deps.runtime.runSession(request)) {
         if (!acceptEvents || controller?.signal.aborted === true) {
           break;
         }
+        if (event.kind === "done") {
+          return {};
+        }
+        // Reset before persistence or outbound Linear delivery. Those
+        // operations and any retries they perform are not runtime progress.
+        armWatchdog();
         await handleRuntimeEvent(deps, request, issueIdentifier, event);
       }
       return {};
@@ -481,43 +521,33 @@ async function runSessionTask(
     }
   };
 
-  let timeout: ReturnType<typeof setTimeout>;
-  const deadline = new Promise<{ timedOut: true }>((resolve) => {
-    timeout = setTimeout(() => {
-      acceptEvents = false;
-      controller?.abort(new Error("Session deadline exceeded"));
-      try {
-        deps.runtime.forceCloseSession?.(request);
-      } catch (error) {
-        console.error(
-          `[linear-agent-bridge] runtime force-close failed for ${request.linearSessionId}:`,
-          error,
-        );
-      }
-      resolve({ timedOut: true });
-    }, deps.config.runTimeoutMs);
-  });
   const outcome = await Promise.race([
-    consumeRuntime().then((result) => ({ timedOut: false as const, ...result })),
-    deadline,
+    consumeRuntime().then((result) => ({ source: "runtime" as const, ...result })),
+    watchdog.then((reason) => ({ source: "watchdog" as const, reason })),
   ]);
+  clearTimeout(inactivityTimer!);
 
-  if (outcome.timedOut) {
+  if (
+    inactivityTriggered ||
+    (outcome.source === "watchdog" && outcome.reason === "inactive")
+  ) {
     void deps.linear
       .createActivity(request.linearSessionId, {
         type: "error",
-        body: `This request timed out after ${formatDuration(deps.config.runTimeoutMs)}.`,
+        body: `This request was inactive for ${formatDuration(deps.config.runInactivityTimeoutMs)} and was stopped.`,
       })
       .catch((activityErr: unknown) => {
         console.error(
-          `[linear-agent-bridge] failed to emit timeout activity for ${request.linearSessionId}:`,
+          `[linear-agent-bridge] failed to emit inactivity activity for ${request.linearSessionId}:`,
           activityErr,
         );
       });
-    return "timed_out";
+    return "inactive";
   }
 
-  clearTimeout(timeout!);
+  if (outcome.source === "watchdog") {
+    return "stopped";
+  }
   if (outcome.error !== undefined) {
     if (controller?.signal.aborted === true) {
       return "stopped";

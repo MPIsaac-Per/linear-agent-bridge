@@ -30,7 +30,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     kbPath: "/tmp/kb-unused",
     sessionStorePath: "unused-see-store-field",
     oauthTokenStorePath: "unused-see-oauth-field",
-    runTimeoutMs: 300000,
+    runInactivityTimeoutMs: 300000,
     ...overrides,
   };
 }
@@ -532,7 +532,7 @@ describe("startServer", () => {
     expect(runtime.requests).toHaveLength(0);
   });
 
-  it("aborts a turn at the configured deadline and reports the timeout", async () => {
+  it("aborts a turn after the configured inactivity period and reports it", async () => {
     const release = createDeferred<void>();
     const runtime = new FakeRuntime(async function* (
       request: SessionRequest,
@@ -550,7 +550,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runTimeoutMs: 25 },
+      configOverrides: { runInactivityTimeoutMs: 25 },
     });
     const harness = activeHarness;
 
@@ -580,7 +580,7 @@ describe("startServer", () => {
         harness.calls.some(
           (call) =>
             call.content.type === "error" &&
-            call.content.body === "This request timed out after 25 ms.",
+            call.content.body === "This request was inactive for 25 ms and was stopped.",
         ),
       );
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
@@ -589,7 +589,158 @@ describe("startServer", () => {
     }
   });
 
-  it("aborts an in-flight turn activity delivery at the hard deadline", async () => {
+  it("allows a long turn with runtime activity and starts a queued turn's watchdog only when it executes", async () => {
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      if (request.linearSessionId === "agent-session-active-long") {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        yield { kind: "progress" };
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        yield { kind: "session-started", runtimeSessionId: "runtime-active-long" };
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: `completed ${request.linearSessionId}` },
+      };
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runInactivityTimeoutMs: 75 },
+    });
+    const harness = activeHarness;
+
+    for (const sessionId of ["agent-session-active-long", "agent-session-waiting"]) {
+      const payload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: sessionId, issue: { title: "Active long request" } },
+        promptContext: sessionId,
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+    }
+
+    await waitFor(
+      () =>
+        harness.calls.some(
+          (call) =>
+            call.content.type === "response" &&
+            call.content.body === "completed agent-session-waiting",
+        ),
+      500,
+    );
+    expect(
+      harness.calls.some(
+        (call) =>
+          call.content.type === "error" &&
+          call.content.body.includes("was inactive"),
+      ),
+    ).toBe(false);
+    expect(
+      harness.calls.filter(
+        (call) => call.agentSessionId === "agent-session-active-long",
+      ),
+    ).toEqual([
+      {
+        agentSessionId: "agent-session-active-long",
+        content: { type: "thought", body: "Reading the issue and gathering context…" },
+        ephemeral: true,
+      },
+      {
+        agentSessionId: "agent-session-active-long",
+        content: {
+          type: "response",
+          body: "completed agent-session-active-long",
+        },
+      },
+    ]);
+  });
+
+  it("ends a turn immediately on done without resetting the watchdog or accepting later events", async () => {
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      if (request.linearSessionId === "agent-session-done") {
+        yield { kind: "progress" };
+        yield { kind: "done" };
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "late after done" },
+        };
+        return;
+      }
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "queued after done" },
+      };
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { runInactivityTimeoutMs: 50 },
+    });
+    const harness = activeHarness;
+
+    for (const sessionId of ["agent-session-done", "agent-session-after-done"]) {
+      const payload = {
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: sessionId, issue: { title: "Done is terminal" } },
+        promptContext: "finish",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+    }
+
+    await waitFor(() =>
+      harness.calls.some(
+        (call) =>
+          call.content.type === "response" && call.content.body === "queued after done",
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(
+      harness.calls.some(
+        (call) =>
+          call.content.type === "response" && call.content.body === "late after done",
+      ),
+    ).toBe(false);
+    expect(
+      harness.calls.some(
+        (call) => call.content.type === "error" && call.content.body.includes("was inactive"),
+      ),
+    ).toBe(false);
+  });
+
+  it("aborts an in-flight turn activity delivery after inactivity", async () => {
     const activityStarted = createDeferred<void>();
     let activitySignal: AbortSignal | null | undefined;
     let activityCompleted = false;
@@ -602,7 +753,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 30 },
       linearFetchImpl: (calls) =>
         (async (_url: RequestInfo | URL, init?: RequestInit) => {
           const parsed = JSON.parse(init?.body as string) as {
@@ -665,7 +816,7 @@ describe("startServer", () => {
         (call) =>
           call.agentSessionId === "agent-session-activity-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request timed out after 30 ms.",
+          call.content.body === "This request was inactive for 30 ms and was stopped.",
       ),
     );
 
@@ -673,7 +824,7 @@ describe("startServer", () => {
     expect(activityCompleted).toBe(false);
   });
 
-  it("hard timeout releases the serial queue and ignores late runtime events", async () => {
+  it("inactivity releases the serial queue and ignores late runtime events", async () => {
     const releaseFirst = createDeferred<void>();
     const runtime = new FakeRuntime(async function* (
       request: SessionRequest,
@@ -698,7 +849,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 30 },
       linearFetchImpl: (calls) =>
         (async (_url: RequestInfo | URL, init?: RequestInit) => {
           const parsed = JSON.parse(init?.body as string) as {
@@ -712,7 +863,7 @@ describe("startServer", () => {
           });
           if (
             input.content.type === "error" &&
-            input.content.body === "This request timed out after 30 ms."
+            input.content.body === "This request was inactive for 30 ms and was stopped."
           ) {
             return await new Promise<Response>(() => {});
           }
@@ -761,7 +912,7 @@ describe("startServer", () => {
         (call) =>
           call.agentSessionId === "agent-session-hard-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request timed out after 30 ms.",
+          call.content.body === "This request was inactive for 30 ms and was stopped.",
       );
       expect(timeoutCalls).toHaveLength(1);
 
@@ -779,7 +930,7 @@ describe("startServer", () => {
           (call) =>
             call.agentSessionId === "agent-session-hard-timeout" &&
             call.content.type === "error" &&
-            call.content.body === "This request timed out after 30 ms.",
+            call.content.body === "This request was inactive for 30 ms and was stopped.",
         ),
       ).toHaveLength(1);
     } finally {
@@ -787,7 +938,7 @@ describe("startServer", () => {
     }
   });
 
-  it("force-closes a timed-out runtime before the next queued turn starts", async () => {
+  it("force-closes an inactive runtime before the next queued turn starts", async () => {
     const releaseFirst = createDeferred<void>();
     const order: string[] = [];
     const runtime: AgentRuntime = {
@@ -805,7 +956,7 @@ describe("startServer", () => {
       },
     };
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 30 },
     });
     const harness = activeHarness;
 
@@ -862,7 +1013,7 @@ describe("startServer", () => {
     };
     const runtime = new ClaudeRuntime("/tmp/kb-unused", queryFn);
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 30 },
     });
     const harness = activeHarness;
 

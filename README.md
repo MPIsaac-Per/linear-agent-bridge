@@ -31,7 +31,8 @@ conversation and access refreshes without another browser authorization.
 
 In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
-for that session, and `RUN_TIMEOUT_MS` bounds each turn (5 minutes by default).
+for that session, and `RUN_INACTIVITY_TIMEOUT_MS` stops a run only when its
+runtime has been silent for the configured interval (5 minutes by default).
 Completed assistant text is posted as a durable response as soon as Claude
 marks the turn `end_turn`; an identical trailing SDK result is suppressed,
 while a differing result is forwarded.
@@ -133,13 +134,21 @@ session takes.
   `tool_result` blocks. Pair them to the preceding `tool_use` ID so Linear
   receives a completed action instead of a permanent spinner.
 - Forward Linear's `stop` signal through an `AbortController`. A plain `stop`
-  prompt is accepted as a fallback. Each turn also has the hard deadline set
-  by `RUN_TIMEOUT_MS` (default: `300000`). Cancellation closes the SDK query
-  process handle exactly once. Before a deadline releases the global serial
-  queue, it invokes the runtime's synchronous force-close control; an
-  uncooperative iterator still cannot retain the queue. Turn-scoped Linear
-  activity requests receive the same abort signal, late events are ignored,
-  and the timeout is reported once on a best-effort basis.
+  prompt is accepted as a fallback. `RUN_INACTIVITY_TIMEOUT_MS` (default:
+  `300000`) starts when a queued run begins executing and resets on raw runtime
+  progress, session start, or activity output. Queue wait, webhook handling,
+  and Linear delivery do not extend it. The runtime `done` marker ends the turn
+  immediately without resetting the watchdog, and later iterator events are
+  ignored. There is no total wall-clock cap while the runtime remains active.
+  Cancellation closes the SDK query process handle exactly once. Before
+  inactivity releases the global serial queue, the server invokes the
+  runtime's synchronous force-close control; an uncooperative iterator still
+  cannot retain the queue.
+  Turn-scoped Linear activity requests receive the same abort signal, late
+  events are ignored, and inactivity is reported once on a best-effort basis.
+- `RUN_TIMEOUT_MS` remains a deprecated fallback for one release. The bridge
+  logs one bounded warning whenever the legacy variable is present;
+  `RUN_INACTIVITY_TIMEOUT_MS` takes precedence when both are present.
 - Turn lifecycle logs contain bounded operational fields: session id and queue
   size at start, then session id, terminal reason, and remaining queue size at
   completion. Prompt and issue contents are not included.
