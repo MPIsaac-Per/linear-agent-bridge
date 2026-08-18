@@ -620,15 +620,23 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     webhookId: string,
   ): Promise<DispatchStartDisposition> {
     validateIdentifier(webhookId, "webhookId");
+    let runtimeIntentPersisted = false;
 
     return this.mutate(async (deadline) => {
       const state = await this.readState(deadline);
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
       if (claim.dispatchStartedAt !== undefined) {
         if (this.locallyUnconfirmedDispatchMarkers.has(webhookId)) {
-          await this.writeState(state, deadline);
+          try {
+            await this.writeState(state, deadline);
+          } catch (error) {
+            throw new DispatchMarkerDurabilityError(
+              deferredMutationSettlement(error),
+            );
+          }
           this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
         }
+        runtimeIntentPersisted = true;
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return "dispatch_started";
       }
@@ -693,7 +701,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
       this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
       this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+      runtimeIntentPersisted = true;
       return "dispatch_started";
+    }).catch((error: unknown) => {
+      if (
+        runtimeIntentPersisted &&
+        !(error instanceof DispatchMarkerDurabilityError)
+      ) {
+        this.locallyUnconfirmedDispatchMarkers.add(webhookId);
+        throw new DispatchMarkerDurabilityError(
+          deferredMutationSettlement(error),
+        );
+      }
+      throw error;
     });
   }
 

@@ -6,6 +6,7 @@ import {
   buildDarwinLockProcessIdentity,
   buildLinuxLockProcessIdentity,
   darwinProcessRealUidArgs,
+  DispatchMarkerDurabilityError,
   JsonBridgeStateStore,
   LegacyIngressRecoveryMismatchError,
   LegacyIngressRecoveryUnavailableError,
@@ -2508,6 +2509,57 @@ describe("JsonBridgeStateStore", () => {
     expect(terminal).not.toHaveProperty("recoverySequence");
     expect(terminal).not.toHaveProperty("recoveryEnvelope");
     expect(await fs.readFile(storePath, "utf8")).not.toContain(prompt);
+  });
+
+  it("keeps repeated visible dispatch-marker confirmation failures retryable", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-repeated-marker-confirmation.json");
+    const directory = path.dirname(storePath);
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+    });
+    await store.claimEvent(event());
+    const originalOpen = fs.open.bind(fs);
+    const originalRename = fs.rename.bind(fs);
+    let markerRenameVisible = false;
+    let failedMarkerSyncs = 0;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      await originalRename(from, to);
+      if (String(to) === storePath) {
+        markerRenameVisible = true;
+      }
+    });
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === directory) {
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          if (markerRenameVisible && failedMarkerSyncs < 2) {
+            markerRenameVisible = false;
+            failedMarkerSyncs += 1;
+            throw new Error(`synthetic marker confirmation failure ${failedMarkerSyncs}`);
+          }
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+
+    try {
+      await expect(store.markDispatchStarted("webhook-1")).rejects.toBeInstanceOf(
+        DispatchMarkerDurabilityError,
+      );
+      await expect(store.markDispatchStarted("webhook-1")).rejects.toBeInstanceOf(
+        DispatchMarkerDurabilityError,
+      );
+      await expect(store.markDispatchStarted("webhook-1")).resolves.toBe(
+        "dispatch_started",
+      );
+      expect(failedMarkerSyncs).toBe(2);
+    } finally {
+      renameSpy.mockRestore();
+      openSpy.mockRestore();
+    }
   });
 
   it("confirms a dispatch marker after its post-rename directory sync exceeds the deadline", async () => {

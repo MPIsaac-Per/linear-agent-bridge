@@ -1121,7 +1121,7 @@ async function persistRuntimeStartIntent(
 ): Promise<"dispatch_started" | "superseded"> {
   let retryDelayMs = 25;
   let markerAttempted = false;
-  while (!deps.closing || markerAttempted) {
+  while (!deps.closing || !markerAttempted) {
     try {
       markerAttempted = true;
       return await deps.bridgeState.markDispatchStarted(identity.webhookId);

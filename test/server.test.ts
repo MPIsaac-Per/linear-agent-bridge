@@ -1402,6 +1402,66 @@ describe("startServer", () => {
     }
   });
 
+  it("stops retrying an uncertain runtime intent after close begins", async () => {
+    const markerEntered = createDeferred<void>();
+    const releaseMarker = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    let markerAttempts = 0;
+    vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
+      async () => {
+        markerAttempts += 1;
+        if (markerAttempts === 1) {
+          markerEntered.resolve();
+          await releaseMarker.promise;
+        }
+        if (markerAttempts > 20) {
+          throw new Error("marker retry guard tripped");
+        }
+        throw new DispatchMarkerDurabilityError();
+      },
+    );
+    const payload = {
+      webhookId: "webhook-marker-retry-close",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-marker-retry-close" },
+      promptContext: "marker retry must stop during close",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await markerEntered.promise;
+
+    const closing = harness.close();
+    releaseMarker.resolve();
+    await expect(
+      Promise.race([
+        closing,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("server close timed out")), 750),
+        ),
+      ]),
+    ).resolves.toBeUndefined();
+    activeHarness = undefined;
+    expect(markerAttempts).toBe(1);
+    expect(runtime.requests).toHaveLength(0);
+  });
+
   it("rolls back a delayed runtime intent when a stop wins before runtime invocation", async () => {
     const markerEntered = createDeferred<void>();
     const releaseMarker = createDeferred<void>();
@@ -2124,6 +2184,90 @@ describe("startServer", () => {
     expect(markSpy).toHaveBeenCalledTimes(2);
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(runtime.requests).toHaveLength(1);
+  });
+
+  it("confirms a durable runtime intent after its lock release fails", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const payload = {
+      webhookId: "webhook-runtime-intent-release-failure",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-runtime-intent-release-failure" },
+      promptContext: "private marker release failure prompt",
+      webhookTimestamp: Date.now(),
+    };
+    const originalRename = fsPromises.rename.bind(fsPromises);
+    const originalRmdir = fsPromises.rmdir.bind(fsPromises);
+    let markerVisible = false;
+    let releaseFailed = false;
+    const renameSpy = vi
+      .spyOn(fsPromises, "rename")
+      .mockImplementation(async (from, to) => {
+        let isMarkerWrite = false;
+        if (String(to) === harness.bridgeStatePath) {
+          const candidate = JSON.parse(
+            await fsPromises.readFile(String(from), "utf8"),
+          ) as {
+            receipts?: Record<string, { dispatchStartedAt?: string }>;
+          };
+          isMarkerWrite =
+            candidate.receipts?.[payload.webhookId]?.dispatchStartedAt !== undefined;
+        }
+        await originalRename(from, to);
+        if (isMarkerWrite) {
+          markerVisible = true;
+        }
+      });
+    const rmdirSpy = vi
+      .spyOn(fsPromises, "rmdir")
+      .mockImplementation(async (...args) => {
+        if (
+          !releaseFailed &&
+          markerVisible &&
+          String(args[0]) === `${harness.bridgeStatePath}.lock`
+        ) {
+          releaseFailed = true;
+          throw Object.assign(new Error("synthetic marker lock release failure"), {
+            code: "EIO",
+          });
+        }
+        return originalRmdir(...args);
+      });
+    const releaseSpy = vi.spyOn(
+      harness.bridgeState,
+      "releasePreDispatchClaim",
+    );
+
+    try {
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => releaseFailed);
+      await waitFor(() => runtime.requests.length === 1, 1_500);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(releaseSpy).not.toHaveBeenCalled();
+      expect(runtime.requests).toHaveLength(1);
+    } finally {
+      rmdirSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
   });
 
   it("retries terminal-state confirmation without invoking the runtime again", async () => {
