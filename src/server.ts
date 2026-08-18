@@ -30,6 +30,7 @@ import type {
   ReceiptErrorClass,
 } from "./state/store.js";
 import {
+  BridgeStateIntegrityError,
   BridgeStateLockTimeoutError,
   ClaimOwnershipError,
   DispatchMarkerDurabilityError,
@@ -59,7 +60,12 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
+const ACTIVITY_RECONCILIATION_ATTEMPTS = 4;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
+type TerminalTransition =
+  | { kind: "completed_without_runtime" }
+  | { kind: "runtime_completed" }
+  | { kind: "runtime_failed"; errorClass: ReceiptErrorClass };
 
 interface InternalServerDeps extends ServerDeps {
   activeRuns: Map<string, Set<ActiveRun>>;
@@ -260,7 +266,10 @@ export function startServer(deps: ServerDeps): {
             internalDeps.recoveryAwaitingRedelivery = true;
             return;
           }
-          if (error instanceof IngressRecoveryEnvelopeError) {
+          if (
+            error instanceof IngressRecoveryEnvelopeError ||
+            error instanceof BridgeStateIntegrityError
+          ) {
             internalDeps.recoveryAwaitingRedelivery = false;
             internalDeps.recoveryBlocked = true;
             rejectReady(error);
@@ -602,6 +611,7 @@ async function runAcceptedIngressRecovery(
     } catch (error) {
       if (
         error instanceof IngressRecoveryEnvelopeError ||
+        error instanceof BridgeStateIntegrityError ||
         error instanceof LegacyIngressRecoveryUnavailableError
       ) {
         throw error;
@@ -911,7 +921,9 @@ async function processClaimedWebhook(
         { signal: deps.shutdownController.signal },
       );
       if (!deps.closing) {
-        await persistTerminalState(deps, identity, "completed", true);
+        await persistTerminalState(deps, identity, {
+          kind: "completed_without_runtime",
+        });
       }
       return;
     }
@@ -1079,12 +1091,14 @@ function enqueueSessionRun(
               deps,
               identity,
               terminalReason === "failed" || terminalReason === "inactive"
-                ? "failed"
-                : "completed",
-              false,
-              terminalReason === "inactive"
-                ? "RuntimeTimeout"
-                : "RuntimeExecutionError",
+                ? {
+                    kind: "runtime_failed",
+                    errorClass:
+                      terminalReason === "inactive"
+                        ? "RuntimeTimeout"
+                        : "RuntimeExecutionError",
+                  }
+                : { kind: "runtime_completed" },
             );
           }
         } finally {
@@ -1192,19 +1206,24 @@ async function settlePreIntentAbort(
 async function persistTerminalState(
   deps: InternalServerDeps,
   identity: IngressEventIdentity,
-  status: "completed" | "failed",
-  withoutRuntime: boolean,
-  errorClass: ReceiptErrorClass = "RuntimeExecutionError",
+  transition: TerminalTransition,
 ): Promise<void> {
   let retryDelayMs = 25;
   while (!deps.closing) {
     try {
-      if (withoutRuntime) {
-        await deps.bridgeState.completeEventWithoutRuntime(identity.webhookId);
-      } else if (status === "failed") {
-        await deps.bridgeState.failEvent(identity.webhookId, errorClass);
-      } else {
-        await deps.bridgeState.completeEvent(identity.webhookId);
+      switch (transition.kind) {
+        case "completed_without_runtime":
+          await deps.bridgeState.completeEventWithoutRuntime(identity.webhookId);
+          break;
+        case "runtime_failed":
+          await deps.bridgeState.failEvent(
+            identity.webhookId,
+            transition.errorClass,
+          );
+          break;
+        case "runtime_completed":
+          await deps.bridgeState.completeEvent(identity.webhookId);
+          break;
       }
       return;
     } catch (error) {
@@ -1588,14 +1607,23 @@ async function emitPreIntentActivity(
       ? deps.shutdownController.signal
       : AbortSignal.any([options.signal, deps.shutdownController.signal]);
   if (outbox.attempts > 0) {
-    const exists = await deps.linear.activityExists(
-      agentSessionId,
-      outbox.activityId,
-      signal,
-    );
-    if (exists) {
-      await deps.bridgeState.markActivityDelivered(executionId, activityKey);
-      return;
+    for (
+      let attempt = 0;
+      attempt < ACTIVITY_RECONCILIATION_ATTEMPTS;
+      attempt += 1
+    ) {
+      const exists = await deps.linear.activityExists(
+        agentSessionId,
+        outbox.activityId,
+        signal,
+      );
+      if (exists) {
+        await deps.bridgeState.markActivityDelivered(executionId, activityKey);
+        return;
+      }
+      if (attempt + 1 < ACTIVITY_RECONCILIATION_ATTEMPTS) {
+        await delay(25 * 2 ** attempt, signal);
+      }
     }
   }
   outbox = await deps.bridgeState.markActivityAttempted(
@@ -1647,6 +1675,9 @@ function boundedLogValue(value: unknown): string {
 function boundedErrorClass(error: unknown): string {
   if (error instanceof BridgeStateLockTimeoutError) {
     return "BridgeStateLockTimeoutError";
+  }
+  if (error instanceof BridgeStateIntegrityError) {
+    return "BridgeStateIntegrityError";
   }
   if (error instanceof PreRuntimeClaimReleasedError) {
     return "PreRuntimeClaimReleasedError";

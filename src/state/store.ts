@@ -248,16 +248,23 @@ export class BridgeStateIntegrityError extends Error {
 }
 
 export class DispatchMarkerDurabilityError extends Error {
-  constructor() {
+  constructor(readonly settlement?: Promise<void>) {
     super("Dispatch marker durability was not confirmed");
     this.name = "DispatchMarkerDurabilityError";
   }
 }
 
 export class TerminalStateDurabilityError extends Error {
-  constructor() {
+  constructor(readonly settlement?: Promise<void>) {
     super("Terminal state durability was not confirmed");
     this.name = "TerminalStateDurabilityError";
+  }
+}
+
+class RuntimeIntentRollbackDurabilityError extends Error {
+  constructor(readonly settlement?: Promise<void>) {
+    super("Runtime intent rollback durability was not confirmed");
+    this.name = "RuntimeIntentRollbackDurabilityError";
   }
 }
 
@@ -270,7 +277,12 @@ class DeferredBridgeStateLockTimeoutError extends BridgeStateLockTimeoutError {
 
 class StateTargetDurabilityError extends Error {
   constructor(cause: unknown) {
-    super("Bridge state target durability was not confirmed", { cause });
+    super(
+      cause instanceof Error
+        ? cause.message
+        : "Bridge state target durability was not confirmed",
+      { cause },
+    );
     this.name = "StateTargetDurabilityError";
   }
 }
@@ -644,8 +656,6 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       claim.updatedAt = timestamp;
       receipt.dispatchStartedAt = timestamp;
       receipt.updatedAt = timestamp;
-      delete receipt.recoverySequence;
-      delete receipt.recoveryEnvelope;
       receipt.outcome = {
         httpStatus: 200,
         result: "dispatch_started",
@@ -654,6 +664,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       try {
         await this.writeState(state, deadline);
       } catch (error) {
+        if (error instanceof DeferredBridgeStateLockTimeoutError) {
+          this.locallyUnconfirmedDispatchMarkers.add(webhookId);
+          throw new DispatchMarkerDurabilityError(error.settlement);
+        }
         if (error instanceof StateTargetDurabilityError) {
           this.locallyUnconfirmedDispatchMarkers.add(webhookId);
           throw new DispatchMarkerDurabilityError();
@@ -677,6 +691,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         }
         throw error;
       }
+      this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
       this.locallyAcceptedPreDispatchClaims.delete(webhookId);
       return "dispatch_started";
     });
@@ -716,15 +731,15 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         }
         return;
       }
-      const recovery = this.createRecoveryEnvelope(
-        state,
-        receiptIdentity(receipt),
-        recoveryPayload,
-        false,
-      );
+      const recovery = this.decodeRecoverableReceipt(receipt);
+      if (
+        !recovery.available ||
+        JSON.stringify(recovery.payload) !== JSON.stringify(recoveryPayload)
+      ) {
+        throw new IngressRecoveryEnvelopeError();
+      }
       delete claim.dispatchStartedAt;
       delete receipt.dispatchStartedAt;
-      Object.assign(receipt, recovery);
       const timestamp = this.timestamp();
       claim.updatedAt = timestamp;
       receipt.updatedAt = timestamp;
@@ -732,11 +747,16 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       try {
         await this.writeState(state, deadline);
       } catch (error) {
+        if (error instanceof DeferredBridgeStateLockTimeoutError) {
+          this.locallyUnconfirmedRuntimeRollbacks.add(webhookId);
+          throw new RuntimeIntentRollbackDurabilityError(error.settlement);
+        }
         if (error instanceof StateTargetDurabilityError) {
           this.locallyUnconfirmedRuntimeRollbacks.add(webhookId);
         }
         throw error;
       }
+      this.locallyUnconfirmedRuntimeRollbacks.delete(webhookId);
       this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
     });
   }
@@ -903,9 +923,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         throw new IngressRecoveryEnvelopeError();
       }
     }
-    if (
-      activeRecoverableReceipts(state).length > this.maxRecoverableEvents
-    ) {
+    if (retainedRecoveryReceipts(state).length > this.maxRecoverableEvents) {
       throw new IngressRecoveryEnvelopeError();
     }
   }
@@ -922,7 +940,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (this.recoveryKeyring === undefined) {
       throw new IngressRecoveryEnvelopeError();
     }
-    let activeRecoveryCount = activeRecoverableReceipts(state).length;
+    let activeRecoveryCount = retainedRecoveryReceipts(state).length;
     if (
       admittingNewEvent &&
       activeRecoveryCount >= this.maxRecoverableEvents &&
@@ -966,7 +984,11 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
     }
     if (
-      (admittingNewEvent && activeRecoveryCount >= this.maxRecoverableEvents) ||
+      (admittingNewEvent &&
+        activeRecoveryCount >=
+          (payload.action === "prompted" && payload.stop
+            ? this.maxRecoverableEvents
+            : Math.max(1, this.maxRecoverableEvents - 1))) ||
       (!admittingNewEvent && activeRecoveryCount > this.maxRecoverableEvents)
     ) {
       throw new IngressRecoveryEnvelopeError();
@@ -1307,6 +1329,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       try {
         await this.writeState(state, deadline);
       } catch (error) {
+        if (error instanceof DeferredBridgeStateLockTimeoutError) {
+          this.locallyUnconfirmedTerminalWrites.add(webhookId);
+          throw new TerminalStateDurabilityError(error.settlement);
+        }
         if (error instanceof StateTargetDurabilityError) {
           this.locallyUnconfirmedTerminalWrites.add(webhookId);
           throw new TerminalStateDurabilityError();
@@ -1334,6 +1360,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         }
         throw error;
       }
+      this.locallyUnconfirmedTerminalWrites.delete(webhookId);
     });
   }
 
@@ -1511,6 +1538,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
     let acquired = false;
     let deferredRelease: Promise<void> | undefined;
+    let primaryError: unknown;
     try {
       const candidateMkdir = fs.mkdir(candidatePath, { mode: 0o700 });
       try {
@@ -1569,26 +1597,40 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
 
       try {
-        return await resolveBeforeLockDeadline(operation(), deadline);
+        // Every asynchronous state/lock operation below this boundary receives
+        // the same absolute deadline. Avoid racing the composed operation with
+        // a second timer: that outer timer can mask the more precise result of
+        // a target rename whose directory durability remains unconfirmed.
+        const result = await operation();
+        assertBeforeLockDeadline(deadline);
+        return result;
       } catch (error) {
-        if (error instanceof DeferredBridgeStateLockTimeoutError) {
-          deferredRelease = error.settlement;
-        }
+        primaryError = error;
+        deferredRelease = deferredMutationSettlement(error);
         throw error;
       }
     } finally {
       if (acquired) {
         if (deferredRelease !== undefined) {
-          this.rememberStrandedOwnedLock(lockPath, lockToken);
           void deferredRelease
-            .then(() =>
-              this.releaseOwnedLock(
+            .then(async () => {
+              try {
+                await this.releaseOwnedLock(
+                  lockPath,
+                  lockToken,
+                  Date.now() + this.lockTimeoutMs,
+                );
+                this.forgetStrandedOwnedLock(lockPath, lockToken);
+              } catch {
+                this.rememberStrandedOwnedLock(lockPath, lockToken);
+              }
+            })
+            .catch(() =>
+              this.rememberStrandedOwnedLock(
                 lockPath,
                 lockToken,
-                Date.now() + this.lockTimeoutMs,
               ),
-            )
-            .catch(() => undefined);
+            );
         } else {
           const release = this.releaseOwnedLock(
             lockPath,
@@ -1602,7 +1644,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
             void release
               .then(() => this.forgetStrandedOwnedLock(lockPath, lockToken))
               .catch(() => undefined);
-            throw error;
+            if (primaryError === undefined) {
+              throw error;
+            }
           }
         }
       }
@@ -1611,7 +1655,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         await resolveBeforeLockDeadline(cleanup, deadline);
       } catch (error) {
         void cleanup.catch(() => undefined);
-        if (!(error instanceof BridgeStateLockTimeoutError)) {
+        if (
+          primaryError === undefined &&
+          !(error instanceof BridgeStateLockTimeoutError)
+        ) {
           throw error;
         }
       }
@@ -2236,6 +2283,18 @@ function activeRecoverableReceipts(
   );
 }
 
+function retainedRecoveryReceipts(
+  state: PersistedBridgeState,
+): IngressReceipt[] {
+  return Object.values(state.receipts).filter(
+    (receipt) =>
+      (receipt.status === "received" || receipt.status === "claimed") &&
+      (receipt.dispatchStartedAt === undefined ||
+        receipt.recoverySequence !== undefined ||
+        receipt.recoveryEnvelope !== undefined),
+  );
+}
+
 function compareRecoveryOrder(
   occurredAt: string,
   sequence: number,
@@ -2728,6 +2787,18 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) {
     throw signal.reason;
   }
+}
+
+function deferredMutationSettlement(error: unknown): Promise<void> | undefined {
+  if (
+    error instanceof DeferredBridgeStateLockTimeoutError ||
+    error instanceof DispatchMarkerDurabilityError ||
+    error instanceof TerminalStateDurabilityError ||
+    error instanceof RuntimeIntentRollbackDurabilityError
+  ) {
+    return error.settlement;
+  }
+  return undefined;
 }
 
 async function resolveBeforeLockDeadline<T>(

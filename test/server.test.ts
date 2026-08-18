@@ -10,6 +10,7 @@ import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
 import {
+  BridgeStateIntegrityError,
   DispatchMarkerDurabilityError,
   JsonBridgeStateStore,
   type JsonBridgeStateStoreOptions,
@@ -493,6 +494,64 @@ describe("startServer", () => {
       expect(logged).not.toContain("raw-persistence-prompt-body");
       expect(logged).not.toContain("EISDIR");
       expect(logged).not.toContain("bridge-state.json");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("fails closed when persisted bridge state fails integrity validation", async () => {
+    const secret = "private-corrupt-state-value";
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        awaitReady: false,
+        prepareBridgeState: async (storePath) => {
+          await fsPromises.writeFile(
+            storePath,
+            JSON.stringify({ version: 1, receipts: secret }),
+            { mode: 0o600 },
+          );
+        },
+      });
+      const harness = activeHarness;
+      await expect(harness.ready).rejects.toBeInstanceOf(
+        BridgeStateIntegrityError,
+      );
+      expect(
+        (await fetch(serverUrl(harness.port, "/healthz"))).status,
+      ).toBe(503);
+      const payload = {
+        webhookId: "webhook-corrupt-state",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-corrupt-state" },
+        promptContext: "private-corrupt-state-webhook-body",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(503);
+      expect(runtime.requests).toHaveLength(0);
+      expect(await fsPromises.readFile(harness.bridgeStatePath, "utf8")).toContain(
+        secret,
+      );
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain("error=BridgeStateIntegrityError");
+      expect(logged).not.toContain(secret);
+      expect(logged).not.toContain(payload.promptContext);
     } finally {
       errorSpy.mockRestore();
     }
@@ -1925,6 +1984,7 @@ describe("startServer", () => {
     let createdActivityId: string | undefined;
     let createAttempts = 0;
     let queryAttempts = 0;
+    const queriedActivityIds: string[] = [];
     activeHarness = await startTestServer(runtime, {
       linearFetchImpl: (calls) =>
         (async (_url: RequestInfo | URL, init?: RequestInit) => {
@@ -1936,10 +1996,12 @@ describe("startServer", () => {
           };
           if (parsed.variables.id !== undefined) {
             queryAttempts += 1;
+            queriedActivityIds.push(parsed.variables.id);
             return jsonResponse({
               data: {
                 agentActivities: {
                   nodes:
+                    queryAttempts >= 4 &&
                     createdActivityId === parsed.variables.id
                       ? [
                           {
@@ -2004,7 +2066,10 @@ describe("startServer", () => {
       "completed",
     );
     expect(createAttempts).toBe(1);
-    expect(queryAttempts).toBe(1);
+    expect(queryAttempts).toBe(4);
+    expect(new Set(queriedActivityIds)).toEqual(
+      new Set([createdActivityId]),
+    );
   });
 
   it("confirms a locally visible runtime intent before starting the runtime once", async () => {

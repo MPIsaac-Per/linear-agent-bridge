@@ -459,15 +459,142 @@ describe("JsonBridgeStateStore", () => {
       await expect(secondClaim).resolves.toMatchObject({
         disposition: "claimed",
       });
-      await expect(second.getReceipt("webhook-1")).resolves.toMatchObject({
-        status: "received",
-      });
       await expect(
         second.getReceipt("webhook-after-late-state-rename"),
       ).resolves.toMatchObject({ status: "claimed" });
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      await expect(
+        second.getReceipt("webhook-after-late-state-rename"),
+      ).resolves.toMatchObject({ status: "claimed", ownerId: "runtime-b" });
     } finally {
       releaseRename.resolve();
       renameSpy.mockRestore();
+    }
+  });
+
+  it("bounds a stalled lock-directory read without reclaiming or mutating later", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "live-owner-stalled-directory-read";
+    await writeLockOwner(lockPath, token, {
+      pid: process.pid,
+      hostname: os.hostname(),
+      processIdentity: CURRENT_PROCESS_IDENTITY,
+      uid: TEST_UID,
+    });
+    const releaseRead = deferred();
+    const originalReaddir = fs.readdir.bind(fs);
+    const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (String(args[0]) === lockPath) {
+        await releaseRead.promise;
+      }
+      return originalReaddir(...args);
+    });
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-b",
+      lockTimeoutMs: 40,
+      lockRetryMs: 1,
+    });
+
+    try {
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      await expect(fs.stat(path.join(lockPath, `${token}.json`))).resolves.toBeDefined();
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+      releaseRead.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(fs.stat(path.join(lockPath, `${token}.json`))).resolves.toBeDefined();
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseRead.resolve();
+      readdirSpy.mockRestore();
+    }
+  });
+
+  it("removes a candidate directory that is created after its deadline", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const releaseMkdir = deferred();
+    const originalMkdir = fs.mkdir.bind(fs);
+    let stalledCandidatePath: string | undefined;
+    const mkdirSpy = vi.spyOn(fs, "mkdir").mockImplementation(async (...args) => {
+      const target = String(args[0]);
+      if (target.endsWith(".candidate") && stalledCandidatePath === undefined) {
+        stalledCandidatePath = target;
+        await releaseMkdir.promise;
+      }
+      return originalMkdir(...args);
+    });
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 40,
+    });
+
+    try {
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      expect(stalledCandidatePath).toBeDefined();
+      releaseMkdir.resolve();
+      await waitFor(async () => {
+        try {
+          await fs.stat(stalledCandidatePath!);
+          return false;
+        } catch (error) {
+          return (
+            error instanceof Error &&
+            "code" in error &&
+            error.code === "ENOENT"
+          );
+        }
+      });
+      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseMkdir.resolve();
+      mkdirSpy.mockRestore();
+    }
+  });
+
+  it("bounds stalled recovery reads and retries without late side effects", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 250,
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await store.claimEvent(event(), {
+      action: "created",
+      prompt: "bounded recovery read",
+      occurredAt: "2026-08-18T12:00:00.000Z",
+    });
+    const releaseRead = deferred();
+    const originalReadFile = fs.readFile.bind(fs);
+    let stalled = true;
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      if (stalled && String(args[0]) === storePath) {
+        await releaseRead.promise;
+      }
+      return originalReadFile(...args);
+    });
+
+    try {
+      await expect(store.assertRecoverableEventsAvailable()).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      stalled = false;
+      releaseRead.resolve();
+      await expect(store.assertRecoverableEventsAvailable()).resolves.toBeUndefined();
+      await expect(store.getReceipt("webhook-1")).resolves.toMatchObject({
+        status: "claimed",
+      });
+    } finally {
+      stalled = false;
+      releaseRead.resolve();
+      readSpy.mockRestore();
     }
   });
 
@@ -1196,7 +1323,7 @@ describe("JsonBridgeStateStore", () => {
       const inspectedUidPids: number[] = [];
       const store = new JsonBridgeStateStore(storePath, {
         ownerId: "runtime-unqueryable-owner",
-        lockTimeoutMs: 50,
+        lockTimeoutMs: 250,
         lockProcessIdentity: async (pid) => {
           inspectedBirthPids.push(pid);
           return pid === process.pid ? CURRENT_PROCESS_IDENTITY : undefined;
@@ -1604,7 +1731,7 @@ describe("JsonBridgeStateStore", () => {
     });
   });
 
-  it("persists only encrypted recovery content and removes the envelope at dispatch", async () => {
+  it("persists only encrypted recovery content and removes the envelope at terminalization", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
     const store = new JsonBridgeStateStore(storePath, {
@@ -1639,10 +1766,19 @@ describe("JsonBridgeStateStore", () => {
     const persisted = JSON.parse(
       await fs.readFile(storePath, "utf8"),
     ) as { receipts: Record<string, Record<string, unknown>> };
-    expect(persisted.receipts["webhook-1"]).not.toHaveProperty(
+    expect(persisted.receipts["webhook-1"]).toMatchObject({
+      recoveryEnvelope: expect.any(Object),
+      recoverySequence: 1,
+    });
+    await expect(store.listRecoverableEvents()).resolves.toEqual([]);
+    await store.completeEvent("webhook-1");
+    const terminal = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+      receipts: Record<string, Record<string, unknown>>;
+    };
+    expect(terminal.receipts["webhook-1"]).not.toHaveProperty(
       "recoveryEnvelope",
     );
-    expect(persisted.receipts["webhook-1"]).not.toHaveProperty(
+    expect(terminal.receipts["webhook-1"]).not.toHaveProperty(
       "recoverySequence",
     );
 
@@ -1944,7 +2080,7 @@ describe("JsonBridgeStateStore", () => {
       ...TEST_LOCK_OPTIONS,
       ownerId: "runtime-a",
       recoveryKeyring: keyring,
-      maxRecoverableEvents: 2,
+      maxRecoverableEvents: 3,
     });
     for (let index = 0; index < 2; index += 1) {
       await capped.claimEvent(
@@ -2234,8 +2370,10 @@ describe("JsonBridgeStateStore", () => {
       dispatchStartedAt: expect.any(String),
     });
     const visible = await store.getReceipt("webhook-1");
-    expect(visible).not.toHaveProperty("recoverySequence");
-    expect(visible).not.toHaveProperty("recoveryEnvelope");
+    expect(visible).toMatchObject({
+      recoverySequence: 1,
+      recoveryEnvelope: expect.any(Object),
+    });
     await expect(store.releasePreDispatchClaim("webhook-1")).resolves.toBe(false);
     await expect(store.listRecoverableEvents()).resolves.toEqual([]);
 
@@ -2250,8 +2388,14 @@ describe("JsonBridgeStateStore", () => {
       "dispatch_started",
     );
     const confirmed = await store.getReceipt("webhook-1");
-    expect(confirmed).not.toHaveProperty("recoverySequence");
-    expect(confirmed).not.toHaveProperty("recoveryEnvelope");
+    expect(confirmed).toMatchObject({
+      recoverySequence: 1,
+      recoveryEnvelope: expect.any(Object),
+    });
+    await store.completeEvent("webhook-1");
+    const terminal = await store.getReceipt("webhook-1");
+    expect(terminal).not.toHaveProperty("recoverySequence");
+    expect(terminal).not.toHaveProperty("recoveryEnvelope");
     expect(await fs.readFile(storePath, "utf8")).not.toContain(prompt);
   });
 
@@ -2300,6 +2444,192 @@ describe("JsonBridgeStateStore", () => {
       stalledSync.resolve();
       openSpy.mockRestore();
     }
+  });
+
+  it("retains the lock and confirms a dispatch marker whose target rename settles late", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-late-marker-rename.json");
+    const lockPath = `${storePath}.lock`;
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 500,
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await store.claimEvent(event(), {
+      action: "created",
+      prompt: "late marker rename prompt",
+      occurredAt: "2026-08-18T12:00:00.000Z",
+    });
+    (
+      store as unknown as {
+        lockTimeoutMs: number;
+      }
+    ).lockTimeoutMs = 50;
+    const markerRenameStarted = deferred();
+    const releaseRename = deferred();
+    const originalRename = fs.rename.bind(fs);
+    const originalUnlink = fs.unlink.bind(fs);
+    let stalledMarkerRename = false;
+    let stalledMarkerTempPath: string | undefined;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(to) === storePath && !stalledMarkerRename) {
+        stalledMarkerRename = true;
+        stalledMarkerTempPath = String(from);
+        markerRenameStarted.resolve();
+        await releaseRename.promise;
+        await originalRename(from, to);
+        return;
+      }
+      await originalRename(from, to);
+    });
+    const unlinkSpy = vi.spyOn(fs, "unlink").mockImplementation(async (...args) => {
+      if (String(args[0]) === stalledMarkerTempPath) {
+        await releaseRename.promise;
+      }
+      return originalUnlink(...args);
+    });
+
+    try {
+      const firstMarker = store.markDispatchStarted("webhook-1");
+      await markerRenameStarted.promise;
+      await expect(firstMarker).rejects.toThrow(
+        "Dispatch marker durability was not confirmed",
+      );
+      await expect(fs.stat(lockPath)).resolves.toBeDefined();
+      (
+        store as unknown as {
+          lockTimeoutMs: number;
+        }
+      ).lockTimeoutMs = 500;
+      let laterMutationSettled = false;
+      const laterMutation = store
+        .claimEvent(
+          event({
+            webhookId: "webhook-after-late-marker-rename",
+            executionId: "created:session-after-late-marker-rename",
+            linearSessionId: "session-after-late-marker-rename",
+          }),
+          {
+            action: "created",
+            prompt: "later mutation must survive",
+            occurredAt: "2026-08-18T12:00:01.000Z",
+          },
+        )
+        .finally(() => {
+          laterMutationSettled = true;
+        });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(laterMutationSettled).toBe(false);
+
+      releaseRename.resolve();
+      await expect(laterMutation).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      await expect(store.markDispatchStarted("webhook-1")).resolves.toBe(
+        "dispatch_started",
+      );
+      await expect(store.getReceipt("webhook-1")).resolves.toMatchObject({
+        status: "claimed",
+        dispatchStartedAt: expect.any(String),
+      });
+      await expect(
+        store.getReceipt("webhook-after-late-marker-rename"),
+      ).resolves.toMatchObject({ status: "claimed" });
+    } finally {
+      releaseRename.resolve();
+      unlinkSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("restores the original recovery order when runtime intent is rolled back behind a same-time stop", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-rollback-order.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    const occurredAt = "2026-08-18T12:00:00.000Z";
+    const promptIdentity = event({
+      webhookId: "webhook-prompt-before-stop",
+      executionId: "activity-prompt-before-stop",
+      linearSessionId: "session-rollback-order",
+      action: "prompted",
+    });
+    const promptPayload = {
+      action: "prompted" as const,
+      prompt: "continue before stop",
+      stop: false,
+      occurredAt,
+    };
+    await store.claimEvent(promptIdentity, promptPayload);
+    await store.markDispatchStarted(promptIdentity.webhookId);
+    await store.claimEvent(
+      event({
+        webhookId: "webhook-stop-after-prompt",
+        executionId: "activity-stop-after-prompt",
+        linearSessionId: "session-rollback-order",
+        action: "prompted",
+      }),
+      {
+        action: "prompted",
+        prompt: "stop",
+        signal: "stop",
+        stop: true,
+        occurredAt,
+      },
+    );
+
+    await store.rollbackRuntimeStartIntent(
+      promptIdentity.webhookId,
+      promptPayload,
+    );
+    await expect(store.getReceipt(promptIdentity.webhookId)).resolves.toMatchObject({
+      recoverySequence: 1,
+    });
+    await expect(
+      store.checkDispatchEligibility(promptIdentity.webhookId),
+    ).resolves.toBe("superseded");
+    await expect(
+      store.markDispatchStarted(promptIdentity.webhookId),
+    ).resolves.toBe("superseded");
+  });
+
+  it("keeps runtime-intent recovery capacity reserved until terminalization", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-rollback-cap.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+      maxRecoverableEvents: 1,
+    });
+    const payload = {
+      action: "created" as const,
+      prompt: "reserved recovery payload",
+      occurredAt: "2026-08-18T12:00:00.000Z",
+    };
+    await store.claimEvent(event(), payload);
+    await store.markDispatchStarted("webhook-1");
+
+    await expect(
+      store.claimEvent(
+        event({
+          webhookId: "webhook-capacity-cannot-fill",
+          executionId: "created:session-capacity-cannot-fill",
+          linearSessionId: "session-capacity-cannot-fill",
+        }),
+        {
+          action: "created",
+          prompt: "must not consume reserved capacity",
+          occurredAt: "2026-08-18T12:00:01.000Z",
+        },
+      ),
+    ).rejects.toBeInstanceOf(IngressRecoveryEnvelopeError);
+
+    await store.rollbackRuntimeStartIntent("webhook-1", payload);
+    await expect(store.listRecoverableEvents()).resolves.toEqual([
+      expect.objectContaining({ sequence: 1, available: true }),
+    ]);
   });
 
   it("reclaims when marker and release fail before either state write", async () => {
