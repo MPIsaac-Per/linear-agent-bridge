@@ -66,6 +66,17 @@ describe("JsonSessionStore", () => {
     await expect(reader.get(rec.linearSessionId)).resolves.toEqual(rec);
   });
 
+  it("lists every locally known Linear session deterministically", async () => {
+    const store = new JsonSessionStore(path.join(tmpDir, "sessions.json"));
+    await store.put(record({ linearSessionId: "linear-z" }));
+    await store.put(record({ linearSessionId: "linear-a" }));
+
+    await expect(store.listSessionIds()).resolves.toEqual([
+      "linear-a",
+      "linear-z",
+    ]);
+  });
+
   it("creates the parent directory on first write", async () => {
     const storePath = path.join(tmpDir, "nested", "deeper", "sessions.json");
     const store = new JsonSessionStore(storePath);

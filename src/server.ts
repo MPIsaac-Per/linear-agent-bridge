@@ -15,8 +15,11 @@ import {
 import {
   discardResponseBody,
   LinearActivityError,
+  LinearQueryError,
   type LinearAgentClient,
   type FetchFn,
+  type LinearAgentSessionActivities,
+  type ReconciledAgentActivity,
 } from "./linear/client.js";
 import type {
   LinearOAuthTokenManager,
@@ -27,6 +30,7 @@ import type {
   BridgeStateStore,
   IngressEventIdentity,
   RecoverableIngressEvent,
+  ReconciliationCursor,
   ReceiptErrorClass,
 } from "./state/store.js";
 import {
@@ -34,6 +38,7 @@ import {
   ClaimOwnershipError,
   LegacyIngressRecoveryMismatchError,
   LegacyIngressRecoveryUnavailableError,
+  compareCursors,
 } from "./state/store.js";
 import {
   isStopPrompt,
@@ -58,6 +63,8 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
+const RECONCILIATION_ACTIVITY_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const STALLED_WARNING_INTERVAL_MS = 15 * 60 * 1000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 
 interface InternalServerDeps extends ServerDeps {
@@ -71,6 +78,9 @@ interface InternalServerDeps extends ServerDeps {
   recoveryAwaitingRedelivery: boolean;
   dispatchReady: boolean;
   requestStartupRecovery: () => void;
+  reconciliationTimer?: ReturnType<typeof setInterval> | undefined;
+  reconciliationInFlight?: Promise<void> | undefined;
+  reconciliationController?: AbortController | undefined;
 }
 
 interface RecoveryOrder {
@@ -108,6 +118,8 @@ export interface ServerDeps {
   onOAuthAuthorizationUrl?: (url: string) => void;
   /** Test seam for work that begins only after the HTTP acknowledgement. */
   schedulePostResponseWork?: (work: () => void) => void;
+  /** Time boundary used by reconciliation; tests may inject a fixed clock. */
+  now?: () => number;
 }
 
 class OAuthStateStore {
@@ -250,6 +262,11 @@ export function startServer(deps: ServerDeps): {
         }
         internalDeps.recoveryAwaitingRedelivery = false;
         internalDeps.dispatchReady = true;
+        scheduleReconciliation(internalDeps);
+        internalDeps.reconciliationTimer ??= setInterval(
+          () => scheduleReconciliation(internalDeps),
+          deps.config.reconcileIntervalMs,
+        );
         resolveReady();
       } catch (error) {
         if (error instanceof LegacyIngressRecoveryUnavailableError) {
@@ -291,6 +308,12 @@ export function startServer(deps: ServerDeps): {
       internalDeps.closing = true;
       rejectReady(new Error("Server shutting down"));
       internalDeps.shutdownController.abort(new Error("Server shutting down"));
+      if (internalDeps.reconciliationTimer !== undefined) {
+        clearInterval(internalDeps.reconciliationTimer);
+      }
+      internalDeps.reconciliationController?.abort(
+        new Error("Server shutting down"),
+      );
       for (const runs of internalDeps.activeRuns.values()) {
         for (const run of runs) {
           run.controller.abort(new Error("Server shutting down"));
@@ -299,6 +322,7 @@ export function startServer(deps: ServerDeps): {
       await Promise.allSettled([...internalDeps.processingInFlight]);
       await internalDeps.recoveryInFlight?.catch(() => undefined);
       await startupAttempt?.catch(() => undefined);
+      await internalDeps.reconciliationInFlight?.catch(() => undefined);
       await internalDeps.queue.enqueue(async () => {});
       await listenOutcome;
       if (!server.listening) {
@@ -318,6 +342,281 @@ export function startServer(deps: ServerDeps): {
       });
     },
   };
+}
+
+function scheduleReconciliation(deps: InternalServerDeps): void {
+  if (deps.closing || deps.reconciliationInFlight !== undefined) {
+    return;
+  }
+  const controller = new AbortController();
+  deps.reconciliationController = controller;
+  const reconciliation = reconcileAgentSessions(deps)
+    .catch((error: unknown) => {
+      if (isExpectedReconciliationShutdown(deps, error)) {
+        return;
+      }
+      console.error(
+        `[linear-agent-bridge] reconciliation failed: scope=run error=${boundedErrorClass(error)}`,
+      );
+    })
+    .finally(() => {
+      if (deps.reconciliationInFlight === reconciliation) {
+        deps.reconciliationInFlight = undefined;
+        deps.reconciliationController = undefined;
+      }
+    });
+  deps.reconciliationInFlight = reconciliation;
+}
+
+async function reconcileAgentSessions(deps: InternalServerDeps): Promise<void> {
+  const now = deps.now?.() ?? Date.now();
+  const sessionIds = new Set([
+    ...(await deps.bridgeState.listKnownSessionIds()),
+    ...(await deps.store.listSessionIds()),
+  ]);
+
+  try {
+    const recent = await deps.linear.listRecentAppOwnedSessions({
+      updatedAfter: new Date(now - deps.config.reconcileLookbackMs).toISOString(),
+      maxSessions: deps.config.reconcileMaxSessions,
+      signal: deps.reconciliationController?.signal,
+    });
+    for (const session of recent) {
+      sessionIds.add(session.id);
+    }
+  } catch (error) {
+    if (isExpectedReconciliationShutdown(deps, error)) {
+      return;
+    }
+    console.error(
+      `[linear-agent-bridge] reconciliation failed: scope=discovery error=${boundedErrorClass(error)}`,
+    );
+  }
+
+  for (const sessionId of [...sessionIds].sort()) {
+    if (deps.closing) {
+      return;
+    }
+    try {
+      await reconcileAgentSession(deps, sessionId, now);
+    } catch (error) {
+      if (isExpectedReconciliationShutdown(deps, error)) {
+        return;
+      }
+      console.error(
+        `[linear-agent-bridge] reconciliation failed: scope=session session=${boundedLogValue(sessionId)} error=${boundedErrorClass(error)}`,
+      );
+    }
+  }
+}
+
+async function reconcileAgentSession(
+  deps: InternalServerDeps,
+  sessionId: string,
+  now: number,
+): Promise<void> {
+  const reconciliationState =
+    await deps.bridgeState.getReconciliationState(sessionId);
+  const snapshot = await deps.linear.listAgentSessionActivities(sessionId, {
+    lookbackAfter: new Date(
+      now - RECONCILIATION_ACTIVITY_LOOKBACK_MS,
+    ).toISOString(),
+    ...(reconciliationState.processedThrough !== undefined
+      ? { processedThrough: reconciliationState.processedThrough }
+      : {}),
+    signal: deps.reconciliationController?.signal,
+  });
+  if (reconciliationCancelled(deps)) {
+    return;
+  }
+  const humanPrompts = snapshot.activities.filter(
+    (activity) =>
+      activity.type === "prompt" && activity.userId !== snapshot.appUserId,
+  );
+  const stopActivities = humanPrompts.filter(isStopActivity);
+  const newestStop = stopActivities.at(-1);
+  let newestStopClaim:
+    | Awaited<ReturnType<BridgeStateStore["claimStopEvent"]>>
+    | undefined;
+
+  // Establish the newest stop fence before dispatching anything else from
+  // this fetched set. claimStopEvent writes the semantic claim and fence while
+  // holding the same inter-process lock.
+  if (newestStop !== undefined) {
+    const newestStopEvent = reconciledPromptEvent(sessionId, newestStop);
+    newestStopClaim = await deps.bridgeState.claimStopEvent(
+      reconciliationIdentity(sessionId, newestStop.id),
+      activityCursor(newestStop),
+      recoveryPayload(newestStopEvent),
+    );
+  }
+
+  if (reconciliationCancelled(deps)) {
+    return;
+  }
+
+  await warnIfSessionStalled(deps, snapshot, now);
+
+  for (const activity of snapshot.activities) {
+    if (reconciliationCancelled(deps)) {
+      return;
+    }
+    if (
+      activity.type !== "prompt" ||
+      activity.userId === snapshot.appUserId
+    ) {
+      await deps.bridgeState.markActivityProcessed(
+        sessionId,
+        activityCursor(activity),
+      );
+      continue;
+    }
+
+    const event = reconciledPromptEvent(sessionId, activity);
+    const identity = reconciliationIdentity(sessionId, activity.id);
+    const recoverablePayload = recoveryPayload(event);
+    const claim =
+      newestStop?.id === activity.id
+        ? newestStopClaim!
+        : isStopActivity(activity)
+          ? await deps.bridgeState.claimStopEvent(
+              identity,
+              activityCursor(activity),
+              recoverablePayload,
+            )
+          : await deps.bridgeState.claimEvent(identity, recoverablePayload);
+
+    if (claim.disposition === "claimed") {
+      if (reconciliationCancelled(deps)) {
+        return;
+      }
+      const outcome = await processClaimedEvent(
+        event,
+        identity,
+        recoveryOrderFromReceipt(
+          claim.receipt.recoverySequence,
+          recoverablePayload,
+        ),
+        deps,
+        "reconciliation",
+        deps.reconciliationController?.signal,
+      );
+      if (outcome === "retryable") {
+        return;
+      }
+    }
+    // A shutdown-aborted dispatch settles without finishing the turn, so the
+    // checkpoint must not move past it.
+    if (reconciliationCancelled(deps)) {
+      return;
+    }
+    // The checkpoint advances only after the prompt has a durable semantic
+    // claim (or durable duplicate/superseded disposition) and any claimed
+    // dispatch setup has completed.
+    await deps.bridgeState.markActivityProcessed(
+      sessionId,
+      activityCursor(activity),
+    );
+  }
+}
+
+function reconciliationCancelled(deps: InternalServerDeps): boolean {
+  return deps.closing || deps.reconciliationController?.signal.aborted === true;
+}
+
+function isExpectedReconciliationShutdown(
+  deps: InternalServerDeps,
+  error: unknown,
+): boolean {
+  return (
+    deps.closing &&
+    (deps.reconciliationController?.signal.aborted === true ||
+      (error instanceof Error && error.name === "AbortError"))
+  );
+}
+
+async function warnIfSessionStalled(
+  deps: InternalServerDeps,
+  snapshot: LinearAgentSessionActivities,
+  now: number,
+): Promise<void> {
+  const fence = (
+    await deps.bridgeState.getReconciliationState(snapshot.id)
+  ).stopFence;
+  const graceCutoff = now - deps.config.agentSessionAckGraceMs;
+  let stalled: ReconciledAgentActivity | undefined;
+  for (const activity of [...snapshot.activities].reverse()) {
+    if (
+      activity.type !== "prompt" ||
+      activity.userId === snapshot.appUserId ||
+      isStopActivity(activity) ||
+      Date.parse(activity.createdAt) > graceCutoff ||
+      (fence !== undefined && compareCursors(activityCursor(activity), fence) <= 0)
+    ) {
+      continue;
+    }
+    if ((await deps.bridgeState.getClaim(activity.id)) === undefined) {
+      stalled = activity;
+      break;
+    }
+  }
+  if (
+    stalled !== undefined &&
+    (await deps.bridgeState.claimStalledSessionWarning(
+      snapshot.id,
+      stalled.id,
+      STALLED_WARNING_INTERVAL_MS,
+    ))
+  ) {
+    const ageMs = Math.max(0, now - Date.parse(stalled.createdAt));
+    console.warn(
+      `[linear-agent-bridge] stalled_agent_session session=${boundedLogValue(snapshot.id)} activity=${boundedLogValue(stalled.id)} age_ms=${ageMs}`,
+    );
+  }
+}
+
+function reconciliationIdentity(
+  sessionId: string,
+  activityId: string,
+): IngressEventIdentity {
+  return {
+    webhookId: `reconcile:${activityId}`,
+    executionId: activityId,
+    linearSessionId: sessionId,
+    action: "prompted",
+  };
+}
+
+function reconciledPromptEvent(
+  sessionId: string,
+  activity: ReconciledAgentActivity,
+): LinearAgentSessionEvent {
+  return {
+    webhookId: `reconcile:${activity.id}`,
+    action: "prompted",
+    agentSession: { id: sessionId },
+    webhookTimestamp: Date.parse(activity.createdAt),
+    agentActivity: {
+      id: activity.id,
+      createdAt: activity.createdAt,
+      content: {
+        type: "prompt",
+        body: activity.body ?? "",
+        ...(activity.signal !== undefined ? { signal: activity.signal } : {}),
+      },
+      ...(activity.signal !== undefined ? { signal: activity.signal } : {}),
+    },
+  };
+}
+
+function activityCursor(activity: ReconciledAgentActivity): ReconciliationCursor {
+  return { createdAt: activity.createdAt, id: activity.id };
+}
+
+function isStopActivity(activity: ReconciledAgentActivity): boolean {
+  return (
+    activity.signal === "stop" || /^stop[.!]?$/i.test((activity.body ?? "").trim())
+  );
 }
 
 async function handleRequest(
@@ -462,11 +761,17 @@ async function handleWebhook(
   let claimResult;
   let recoveryOrder: RecoveryOrder | undefined;
   try {
-    claimResult = await deps.bridgeState.claimEvent(
-      identity,
-      recoverablePayload,
-      repairingLegacyReceipt ? { repairLegacyOnly: true } : undefined,
-    );
+    claimResult = repairingLegacyReceipt
+      ? await deps.bridgeState.claimEvent(identity, recoverablePayload, {
+          repairLegacyOnly: true,
+        })
+      : isStopEvent(event)
+        ? await deps.bridgeState.claimStopEvent(
+            identity,
+            eventActivityCursor(event),
+            recoverablePayload,
+          )
+        : await deps.bridgeState.claimEvent(identity, recoverablePayload);
     if (claimResult.disposition === "claimed") {
       recoveryOrder = recoveryOrderFromReceipt(
         claimResult.receipt.recoverySequence,
@@ -631,10 +936,18 @@ async function processClaimedEvent(
   identity: IngressEventIdentity,
   recoveryOrder: RecoveryOrder,
   deps: InternalServerDeps,
-  scope: "webhook" | "recovery",
+  scope: "webhook" | "recovery" | "reconciliation",
+  dispatchSignal?: AbortSignal,
 ): Promise<"settled" | "retryable"> {
   try {
-    await processClaimedWebhook(event, identity, recoveryOrder, deps);
+    await processClaimedWebhook(
+      event,
+      identity,
+      recoveryOrder,
+      deps,
+      scope,
+      dispatchSignal,
+    );
     return "settled";
   } catch (error) {
     if (deps.closing && deps.shutdownController.signal.aborted) {
@@ -744,9 +1057,27 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
     const agentActivity = asRecord(obj.agentActivity);
     if (
       !isBoundedIdentifier(agentActivity?.id) ||
-      (agentActivity.createdAt !== undefined &&
-        (typeof agentActivity.createdAt !== "string" ||
-          !Number.isFinite(Date.parse(agentActivity.createdAt))))
+      typeof agentActivity?.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(agentActivity.createdAt))
+    ) {
+      return undefined;
+    }
+    const content =
+      agentActivity.content === undefined
+        ? undefined
+        : asRecord(agentActivity.content);
+    if (
+      (agentActivity.content !== undefined && content === undefined) ||
+      (content?.type !== undefined && content.type !== "prompt") ||
+      (content?.body !== undefined && typeof content.body !== "string") ||
+      (content?.signal !== undefined &&
+        content.signal !== null &&
+        typeof content.signal !== "string") ||
+      (agentActivity.body !== undefined &&
+        typeof agentActivity.body !== "string") ||
+      (agentActivity.signal !== undefined &&
+        agentActivity.signal !== null &&
+        typeof agentActivity.signal !== "string")
     ) {
       return undefined;
     }
@@ -786,8 +1117,11 @@ function recoveryPayload(
   }
   const prompt =
     event.agentActivity.content?.body ?? event.agentActivity.body ?? "";
+  // Linear sends `null` for an absent signal; the persisted envelope is
+  // null-free, so normalize at the boundary.
   const signal =
-    event.agentActivity.content?.signal ?? event.agentActivity.signal;
+    (event.agentActivity.content?.signal ?? event.agentActivity.signal) ??
+    undefined;
   return {
     action: "prompted",
     occurredAt,
@@ -797,11 +1131,40 @@ function recoveryPayload(
   };
 }
 
+function isStopEvent(event: LinearAgentSessionEvent): boolean {
+  if (event.action !== "prompted") {
+    return false;
+  }
+  const prompt =
+    event.agentActivity.content?.body ?? event.agentActivity.body ?? "";
+  return (
+    event.agentActivity.content?.signal === "stop" ||
+    event.agentActivity.signal === "stop" ||
+    /^stop[.!]?$/i.test(prompt.trim())
+  );
+}
+
+function eventActivityCursor(
+  event: LinearAgentSessionEvent,
+): ReconciliationCursor {
+  if (event.action !== "prompted") {
+    throw new Error("Only prompted events have activity cursors");
+  }
+  return {
+    createdAt:
+      event.agentActivity.createdAt ??
+      new Date(event.webhookTimestamp).toISOString(),
+    id: event.agentActivity.id,
+  };
+}
+
 async function processClaimedWebhook(
   event: LinearAgentSessionEvent,
   identity: IngressEventIdentity,
   recoveryOrder: RecoveryOrder,
   deps: InternalServerDeps,
+  scope: "webhook" | "recovery" | "reconciliation",
+  dispatchSignal?: AbortSignal,
 ): Promise<void> {
   const sessionId = event.agentSession.id;
   const issueIdentifier = event.agentSession.issue?.identifier;
@@ -813,16 +1176,26 @@ async function processClaimedWebhook(
     event.action === "prompted" &&
     isStopPrompt(
       prompt,
-      event.agentActivity.content?.signal ?? event.agentActivity.signal,
+      (event.agentActivity.content?.signal ?? event.agentActivity.signal) ??
+        undefined,
     );
+  // Register before crossing the durable dispatch boundary. A concurrent stop
+  // therefore either wins the state lock and fences this prompt, or sees and
+  // aborts its controller after dispatch has begun.
   const controller = isStop
     ? undefined
     : registerSessionRun(deps, sessionId, recoveryOrder);
+  const dispatchCursor =
+    scope === "reconciliation" && event.action === "prompted" && !isStop
+      ? eventActivityCursor(event)
+      : undefined;
   let enqueued = false;
   try {
+    dispatchSignal?.throwIfAborted();
     try {
-      const dispatch = await deps.bridgeState.markDispatchStarted(
+      const dispatch = await deps.bridgeState.beginEventDispatch(
         identity.webhookId,
+        dispatchCursor,
       );
       if (dispatch === "superseded") {
         return;
@@ -843,19 +1216,28 @@ async function processClaimedWebhook(
       if (released || releaseFailed) {
         throw new PreDispatchClaimReleasedError();
       }
-      const dispatch = await deps.bridgeState.markDispatchStarted(
+      const dispatch = await deps.bridgeState.beginEventDispatch(
         identity.webhookId,
+        dispatchCursor,
       );
       if (dispatch === "superseded") {
         return;
       }
     }
+    dispatchSignal?.throwIfAborted();
+    if (controller?.signal.aborted === true) {
+      if (!deps.closing) {
+        await deps.bridgeState.completeEvent(identity.webhookId);
+      }
+      return;
+    }
     console.log(
-      `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
+      `[linear-agent-bridge] agent session event: action=${event.action} session=${sessionId} webhook=${identity.webhookId}`,
     );
 
     if (event.action === "created") {
       // 10s liveness rule: emit a thought before doing anything else.
+      dispatchSignal?.throwIfAborted();
       await emitActivity(
         deps,
         identity.executionId,
@@ -865,14 +1247,23 @@ async function processClaimedWebhook(
           type: "thought",
           body: CREATED_THOUGHT_BODY,
         },
-        { ephemeral: true, signal: controller!.signal },
+        {
+          ephemeral: true,
+          signal:
+            dispatchSignal === undefined
+              ? controller!.signal
+              : AbortSignal.any([controller!.signal, dispatchSignal]),
+        },
       );
+      dispatchSignal?.throwIfAborted();
       if (controller!.signal.aborted) {
         if (!deps.closing) {
           await deps.bridgeState.completeEvent(identity.webhookId);
         }
         return;
       }
+
+      dispatchSignal?.throwIfAborted();
       enqueueSessionRun(
         deps,
         { linearSessionId: sessionId, prompt },
@@ -885,14 +1276,24 @@ async function processClaimedWebhook(
     }
 
     if (isStop) {
+      dispatchSignal?.throwIfAborted();
       abortSessionRuns(deps, sessionId, recoveryOrder);
+      dispatchSignal?.throwIfAborted();
       await emitActivity(
         deps,
         identity.executionId,
         "stop-response",
         sessionId,
         { type: "response", body: STOPPED_RESPONSE_BODY },
-        { signal: deps.shutdownController.signal },
+        {
+          signal:
+            dispatchSignal === undefined
+              ? deps.shutdownController.signal
+              : AbortSignal.any([
+                  deps.shutdownController.signal,
+                  dispatchSignal,
+                ]),
+        },
       );
       if (!deps.closing) {
         await deps.bridgeState.completeEvent(identity.webhookId);
@@ -900,6 +1301,7 @@ async function processClaimedWebhook(
       return;
     }
 
+    dispatchSignal?.throwIfAborted();
     if (controller!.signal.aborted) {
       if (!deps.closing) {
         await deps.bridgeState.completeEvent(identity.webhookId);
@@ -911,6 +1313,7 @@ async function processClaimedWebhook(
         `[linear-agent-bridge] prompted with empty body: session=${sessionId} activity=${event.agentActivity.id}`,
       );
     }
+    dispatchSignal?.throwIfAborted();
     await emitActivity(
       deps,
       identity.executionId,
@@ -920,14 +1323,22 @@ async function processClaimedWebhook(
         type: "thought",
         body: PROMPTED_THOUGHT_BODY,
       },
-      { ephemeral: true, signal: controller!.signal },
+      {
+        ephemeral: true,
+        signal:
+          dispatchSignal === undefined
+            ? controller!.signal
+            : AbortSignal.any([controller!.signal, dispatchSignal]),
+      },
     );
+    dispatchSignal?.throwIfAborted();
     if (controller!.signal.aborted) {
       if (!deps.closing) {
         await deps.bridgeState.completeEvent(identity.webhookId);
       }
       return;
     }
+    dispatchSignal?.throwIfAborted();
     enqueueSessionRun(
       deps,
       { linearSessionId: sessionId, prompt },
@@ -1371,6 +1782,9 @@ function boundedErrorClass(error: unknown): string {
   }
   if (error instanceof LinearActivityError) {
     return "LinearActivityError";
+  }
+  if (error instanceof LinearQueryError) {
+    return "LinearQueryError";
   }
   if (
     error instanceof Error &&

@@ -1352,7 +1352,10 @@ describe("JsonBridgeStateStore", () => {
       }),
     });
 
-    const reloaded = new JsonBridgeStateStore(storePath, { ownerId: "runtime-b" });
+    const reloaded = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-b",
+      now: () => now,
+    });
     await expect(reloaded.getReceipt("webhook-1")).resolves.toMatchObject({
       status: "claimed",
       ownerId: "runtime-a",
@@ -2234,5 +2237,221 @@ describe("JsonBridgeStateStore", () => {
     const persisted = await fs.readFile(storePath, "utf8");
     expect(persisted).not.toContain("prompt");
     expect(persisted).not.toContain("body");
+  });
+
+  it("persists reconciliation cursors, stop fences, and every known session without prompt content", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, { ownerId: "runtime-a" });
+    await store.claimEvent(event());
+    await store.recordStopFence("session-2", {
+      createdAt: "2026-08-18T12:02:00.000Z",
+      id: "stop-2",
+    });
+    await store.recordStopFence("session-2", {
+      createdAt: "2026-08-18T12:01:00.000Z",
+      id: "stop-1",
+    });
+    await store.markActivityProcessed("session-2", {
+      createdAt: "2026-08-18T12:03:00.000Z",
+      id: "prompt-3",
+    });
+
+    const reloaded = new JsonBridgeStateStore(storePath, { ownerId: "runtime-b" });
+    await expect(reloaded.listKnownSessionIds()).resolves.toEqual([
+      "session-1",
+      "session-2",
+    ]);
+    await expect(reloaded.getReconciliationState("session-2")).resolves.toEqual({
+      processedThrough: {
+        createdAt: "2026-08-18T12:03:00.000Z",
+        id: "prompt-3",
+      },
+      stopFence: {
+        createdAt: "2026-08-18T12:02:00.000Z",
+        id: "stop-2",
+      },
+    });
+    expect(await fs.readFile(storePath, "utf8")).not.toContain("secret prompt");
+  });
+
+  it("durably supersedes a claimed unseen prompt without crossing the dispatch boundary", async () => {
+    const store = new JsonBridgeStateStore(path.join(tmpDir, "bridge-state.json"), {
+      ownerId: "runtime-a",
+    });
+    await store.claimEvent(
+      event({
+        webhookId: "reconcile:prompt-1",
+        executionId: "prompt-1",
+        action: "prompted",
+      }),
+    );
+
+    await store.supersedeEvent("reconcile:prompt-1", "reconcile:stop-2");
+
+    const receipt = await store.getReceipt("reconcile:prompt-1");
+    expect(receipt).toMatchObject({
+      status: "superseded",
+      supersededByWebhookId: "reconcile:stop-2",
+    });
+    expect(receipt?.dispatchStartedAt).toBeUndefined();
+    await expect(store.markDispatchStarted("reconcile:prompt-1")).rejects.toThrow(
+      /ownership/i,
+    );
+  });
+
+  it("atomically applies the stop fence or starts prompt dispatch under interleaving", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const promptStore = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-a",
+    });
+    const stopStore = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-a",
+    });
+    await promptStore.claimEvent(
+      event({
+        webhookId: "reconcile:prompt-1",
+        executionId: "prompt-1",
+        action: "prompted",
+      }),
+    );
+
+    const [dispatch] = await Promise.all([
+      promptStore.beginEventDispatch("reconcile:prompt-1", {
+        createdAt: "2026-08-18T12:01:00.000Z",
+        id: "prompt-1",
+      }),
+      stopStore.claimStopEvent(
+        event({
+          webhookId: "reconcile:stop-2",
+          executionId: "stop-2",
+          action: "prompted",
+        }),
+        { createdAt: "2026-08-18T12:02:00.000Z", id: "stop-2" },
+      ),
+    ]);
+
+    const receipt = await promptStore.getReceipt("reconcile:prompt-1");
+    expect(dispatch).toMatch(/^(dispatch_started|superseded)$/);
+    if (dispatch === "dispatch_started") {
+      expect(receipt).toMatchObject({
+        status: "claimed",
+        dispatchStartedAt: expect.any(String),
+      });
+    } else {
+      expect(receipt).toMatchObject({
+        status: "superseded",
+        supersededByWebhookId: "reconcile:stop-2",
+      });
+      expect(receipt?.dispatchStartedAt).toBeUndefined();
+    }
+    await expect(
+      promptStore.getReconciliationState("session-1"),
+    ).resolves.toMatchObject({
+      stopFence: { createdAt: "2026-08-18T12:02:00.000Z", id: "stop-2" },
+    });
+  });
+
+  it("suppresses a delayed old stop without aborting dispatch newer than the fence", async () => {
+    const store = new JsonBridgeStateStore(path.join(tmpDir, "bridge-state.json"), {
+      ownerId: "runtime-a",
+    });
+    await store.claimStopEvent(
+      event({
+        webhookId: "reconcile:stop-2",
+        executionId: "stop-2",
+        action: "prompted",
+      }),
+      { createdAt: "2026-08-18T12:02:00.000Z", id: "stop-2" },
+    );
+    await store.claimEvent(
+      event({
+        webhookId: "reconcile:prompt-3",
+        executionId: "prompt-3",
+        action: "prompted",
+      }),
+    );
+    await expect(
+      store.beginEventDispatch("reconcile:prompt-3", {
+        createdAt: "2026-08-18T12:03:00.000Z",
+        id: "prompt-3",
+      }),
+    ).resolves.toBe("dispatch_started");
+
+    await expect(
+      store.claimStopEvent(
+        event({
+          webhookId: "reconcile:stop-1",
+          executionId: "stop-1",
+          action: "prompted",
+        }),
+        { createdAt: "2026-08-18T12:01:00.000Z", id: "stop-1" },
+      ),
+    ).resolves.toMatchObject({ disposition: "superseded" });
+
+    await expect(store.getReceipt("reconcile:stop-1")).resolves.toMatchObject({
+      status: "superseded",
+      supersededByWebhookId: "reconcile:stop-2",
+    });
+    await expect(store.getClaim("prompt-3")).resolves.toMatchObject({
+      status: "claimed",
+      dispatchStartedAt: expect.any(String),
+    });
+  });
+
+  it("claims a stop and advances its fence in one persisted operation", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, { ownerId: "runtime-a" });
+
+    await expect(
+      store.claimStopEvent(
+        event({
+          webhookId: "reconcile:stop-2",
+          executionId: "stop-2",
+          action: "prompted",
+        }),
+        { createdAt: "2026-08-18T12:02:00.000Z", id: "stop-2" },
+      ),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+
+    const reloaded = new JsonBridgeStateStore(storePath, { ownerId: "runtime-b" });
+    await expect(reloaded.getClaim("stop-2")).resolves.toMatchObject({
+      webhookId: "reconcile:stop-2",
+    });
+    await expect(reloaded.getReconciliationState("session-1")).resolves.toEqual({
+      stopFence: { createdAt: "2026-08-18T12:02:00.000Z", id: "stop-2" },
+    });
+  });
+
+  it("claims one durable stalled-session warning and rate-limits repeats", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    let now = Date.parse("2026-08-18T12:00:00.000Z");
+    const store = new JsonBridgeStateStore(storePath, {
+      now: () => now,
+      ownerId: "runtime-a",
+    });
+
+    await expect(
+      store.claimStalledSessionWarning("session-1", "prompt-1", 15 * 60_000),
+    ).resolves.toBe(true);
+    now += 14 * 60_000;
+    await expect(
+      store.claimStalledSessionWarning("session-1", "prompt-1", 15 * 60_000),
+    ).resolves.toBe(false);
+    now += 60_000;
+    await expect(
+      store.claimStalledSessionWarning("session-1", "prompt-1", 15 * 60_000),
+    ).resolves.toBe(true);
+
+    const reloaded = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-b",
+      now: () => now,
+    });
+    await expect(
+      reloaded.claimStalledSessionWarning(
+        "session-1",
+        "prompt-2",
+        15 * 60_000,
+      ),
+    ).resolves.toBe(false);
   });
 });

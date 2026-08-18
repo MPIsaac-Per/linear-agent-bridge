@@ -30,6 +30,10 @@ describe("loadConfig", () => {
       runInactivityTimeoutMs: 300000,
       ingressRecoveryKey: "A".repeat(43),
       ingressRecoveryPreviousKeys: [],
+      reconcileIntervalMs: 60000,
+      reconcileLookbackMs: 86400000,
+      reconcileMaxSessions: 250,
+      agentSessionAckGraceMs: 120000,
     });
   });
 
@@ -43,6 +47,10 @@ describe("loadConfig", () => {
       BRIDGE_STATE_STORE_PATH: "/tmp/bridge-state.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
       RUN_INACTIVITY_TIMEOUT_MS: "45000",
+      RECONCILE_INTERVAL_MS: "31000",
+      RECONCILE_LOOKBACK_MS: "7200000",
+      RECONCILE_MAX_SESSIONS: "125",
+      AGENT_SESSION_ACK_GRACE_MS: "90000",
     });
 
     expect(config.port).toBe(8080);
@@ -52,6 +60,10 @@ describe("loadConfig", () => {
     expect(config.bridgeStateStorePath).toBe("/tmp/bridge-state.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
     expect(config.runInactivityTimeoutMs).toBe(45000);
+    expect(config.reconcileIntervalMs).toBe(31000);
+    expect(config.reconcileLookbackMs).toBe(7200000);
+    expect(config.reconcileMaxSessions).toBe(125);
+    expect(config.agentSessionAckGraceMs).toBe(90000);
   });
 
   it.each([
@@ -87,6 +99,25 @@ describe("loadConfig", () => {
       expect(() => loadConfig({ ...validEnv, PORT: badPort })).toThrow(/PORT/);
     },
   );
+
+  it.each([
+    "RECONCILE_INTERVAL_MS",
+    "RECONCILE_LOOKBACK_MS",
+    "RECONCILE_MAX_SESSIONS",
+    "AGENT_SESSION_ACK_GRACE_MS",
+  ])("throws for an invalid %s value", (key) => {
+    expect(() => loadConfig({ ...validEnv, [key]: "0" })).toThrow(key);
+  });
+
+  it("rejects a reconciliation session cap above Linear's hard scan limit", () => {
+    expect(() =>
+      loadConfig({ ...validEnv, RECONCILE_MAX_SESSIONS: "251" }),
+    ).toThrow(/RECONCILE_MAX_SESSIONS/);
+    expect(
+      loadConfig({ ...validEnv, RECONCILE_MAX_SESSIONS: "250" })
+        .reconcileMaxSessions,
+    ).toBe(250);
+  });
 
   it.each(["not-a-number", "0", "-1", "3.5"])(
     "throws for an invalid RUN_INACTIVITY_TIMEOUT_MS value %s",
