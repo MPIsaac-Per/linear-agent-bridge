@@ -1402,26 +1402,28 @@ describe("startServer", () => {
     }
   });
 
-  it("stops retrying an uncertain runtime intent after close begins", async () => {
+  it("confirms and rolls back an uncertain runtime intent after close begins", async () => {
     const markerEntered = createDeferred<void>();
     const releaseMarker = createDeferred<void>();
     const runtime = new FakeRuntime(async function* () {
       yield { kind: "done" } as RuntimeEvent;
     });
-    activeHarness = await startTestServer(runtime);
+    activeHarness = await startTestServer(runtime, { removeTmpDirOnClose: false });
     const harness = activeHarness;
+    const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      harness.bridgeState,
+    );
     let markerAttempts = 0;
     vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
-      async () => {
+      async (webhookId) => {
         markerAttempts += 1;
+        const result = await originalMark(webhookId);
         if (markerAttempts === 1) {
           markerEntered.resolve();
           await releaseMarker.promise;
+          throw new DispatchMarkerDurabilityError();
         }
-        if (markerAttempts > 20) {
-          throw new Error("marker retry guard tripped");
-        }
-        throw new DispatchMarkerDurabilityError();
+        return result;
       },
     );
     const payload = {
@@ -1458,8 +1460,166 @@ describe("startServer", () => {
       ]),
     ).resolves.toBeUndefined();
     activeHarness = undefined;
-    expect(markerAttempts).toBe(1);
+    expect(markerAttempts).toBe(2);
     expect(runtime.requests).toHaveLength(0);
+    const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
+    expect(receipt).toMatchObject({
+      status: "claimed",
+      recoveryEnvelope: expect.any(Object),
+    });
+    expect(receipt).not.toHaveProperty("dispatchStartedAt");
+    const restarted = new JsonBridgeStateStore(harness.bridgeStatePath, {
+      ownerId: "runtime-after-marker-close",
+      recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
+    });
+    await expect(restarted.listRecoverableEvents()).resolves.toEqual([
+      expect.objectContaining({
+        identity: expect.objectContaining({ webhookId: payload.webhookId }),
+        available: true,
+      }),
+    ]);
+    await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+  });
+
+  it("confirms and rolls back when close aborts marker retry backoff", async () => {
+    const firstMarkerFailed = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, { removeTmpDirOnClose: false });
+    const harness = activeHarness;
+    const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      harness.bridgeState,
+    );
+    let markerAttempts = 0;
+    vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
+      async (webhookId) => {
+        markerAttempts += 1;
+        const result = await originalMark(webhookId);
+        if (markerAttempts === 1) {
+          firstMarkerFailed.resolve();
+          throw new DispatchMarkerDurabilityError();
+        }
+        return result;
+      },
+    );
+    const payload = {
+      webhookId: "webhook-marker-backoff-close",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-marker-backoff-close" },
+      promptContext: "marker backoff must confirm during close",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await firstMarkerFailed.promise;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+
+    await expect(
+      Promise.race([
+        harness.close(),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("server close timed out")), 750),
+        ),
+      ]),
+    ).resolves.toBeUndefined();
+    activeHarness = undefined;
+    expect(markerAttempts).toBe(2);
+    expect(runtime.requests).toHaveLength(0);
+    const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
+    expect(receipt).toMatchObject({
+      status: "claimed",
+      recoveryEnvelope: expect.any(Object),
+    });
+    expect(receipt).not.toHaveProperty("dispatchStartedAt");
+    await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+  });
+
+  it("bounds close when final runtime-intent confirmation remains uncertain", async () => {
+    const markerEntered = createDeferred<void>();
+    const releaseMarker = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, { removeTmpDirOnClose: false });
+    const harness = activeHarness;
+    const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      harness.bridgeState,
+    );
+    let markerAttempts = 0;
+    vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
+      async (webhookId) => {
+        markerAttempts += 1;
+        if (markerAttempts > 2) {
+          throw new Error("marker retry guard tripped");
+        }
+        await originalMark(webhookId);
+        if (markerAttempts === 1) {
+          markerEntered.resolve();
+          await releaseMarker.promise;
+        }
+        throw new DispatchMarkerDurabilityError();
+      },
+    );
+    const payload = {
+      webhookId: "webhook-marker-final-confirmation-close",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-marker-final-confirmation-close" },
+      promptContext: "final marker confirmation remains uncertain",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await markerEntered.promise;
+
+    const closing = harness.close();
+    releaseMarker.resolve();
+    await expect(
+      Promise.race([
+        closing,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("server close timed out")), 750),
+        ),
+      ]),
+    ).resolves.toBeUndefined();
+    activeHarness = undefined;
+    expect(markerAttempts).toBe(2);
+    expect(runtime.requests).toHaveLength(0);
+    await expect(harness.bridgeState.getReceipt(payload.webhookId)).resolves.toMatchObject({
+      status: "claimed",
+      dispatchStartedAt: expect.any(String),
+      recoveryEnvelope: expect.any(Object),
+    });
+    const restarted = new JsonBridgeStateStore(harness.bridgeStatePath, {
+      ownerId: "runtime-after-uncertain-marker-close",
+      recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
+    });
+    await expect(restarted.listRecoverableEvents()).resolves.toEqual([]);
+    await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
   });
 
   it("rolls back a delayed runtime intent when a stop wins before runtime invocation", async () => {

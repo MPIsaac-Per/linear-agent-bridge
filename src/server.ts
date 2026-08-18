@@ -1120,17 +1120,25 @@ async function persistRuntimeStartIntent(
   identity: IngressEventIdentity,
 ): Promise<"dispatch_started" | "superseded"> {
   let retryDelayMs = 25;
-  let markerAttempted = false;
-  while (!deps.closing || !markerAttempted) {
+  let closingAttempted = false;
+  while (!deps.closing || !closingAttempted) {
+    if (deps.closing) {
+      closingAttempted = true;
+    }
     try {
-      markerAttempted = true;
       return await deps.bridgeState.markDispatchStarted(identity.webhookId);
     } catch (error) {
       if (!(error instanceof DispatchMarkerDurabilityError)) {
         throw error;
       }
       if (!deps.closing) {
-        await delay(retryDelayMs, deps.shutdownController.signal);
+        try {
+          await delay(retryDelayMs, deps.shutdownController.signal);
+        } catch (delayError) {
+          if (!deps.closing) {
+            throw delayError;
+          }
+        }
       }
       retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
     }
