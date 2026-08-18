@@ -109,11 +109,11 @@ export interface ServerDeps {
    */
   tokenFetch?: FetchFn;
   /**
-   * Test hook: called once with the actual bound port right after the
-   * server starts listening. Lets tests set config.port = 0 (ephemeral)
-   * and discover the real port to send requests to.
+   * Test hook: called once with the actual bound port and address right after
+   * the server starts listening. Lets tests set config.port = 0 (ephemeral)
+   * and verify the listener boundary without reaching into the HTTP server.
    */
-  onListening?: (port: number) => void;
+  onListening?: (port: number, address: string) => void;
   /** Test hook for the state-bearing URL printed during initial setup. */
   onOAuthAuthorizationUrl?: (url: string) => void;
   /** Test seam for work that begins only after the HTTP acknowledgement. */
@@ -289,7 +289,7 @@ export function startServer(deps: ServerDeps): {
   };
   internalDeps.requestStartupRecovery = requestStartupRecovery;
 
-  server.listen(deps.config.port, () => {
+  server.listen(deps.config.port, "127.0.0.1", () => {
     resolveListenOutcome();
     const address = server.address();
     if (
@@ -297,7 +297,7 @@ export function startServer(deps: ServerDeps): {
       address !== null &&
       typeof address === "object"
     ) {
-      deps.onListening(address.port);
+      deps.onListening(address.port, address.address);
     }
     requestStartupRecovery();
   });
