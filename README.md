@@ -122,8 +122,10 @@ boot ID with `/proc/<pid>/stat` start ticks. macOS combines the boot-session
 UUID with the microsecond process start time returned by a locally compiled
 libproc helper at `dist/native/process_identity`. The helper receives only a
 numeric PID, emits only `seconds:microseconds`, and runs within the same
-one-second lock budget. An exited process's lock can be reclaimed without
-allowing the prior owner to unlink a replacement lock.
+one-second lock budget. On the same boot, the recorded numeric user ID is
+checked before process birth so an inaccessible PID recycled across users can
+be reclaimed safely. An exited process's lock can be reclaimed without allowing
+the prior owner to unlink a replacement lock.
 
 #### Upgrading an existing installation
 

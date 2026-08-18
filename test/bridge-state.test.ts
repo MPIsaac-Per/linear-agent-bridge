@@ -7,13 +7,21 @@ import {
   buildLinuxLockProcessIdentity,
   JsonBridgeStateStore,
   parseBootSessionUuid,
+  parseDarwinProcessUid,
   parseDarwinProcessStartTime,
+  parseLinuxProcessRealUid,
   parseLinuxProcessStartTicks,
+  parseLockProcessIdentityBoot,
   type IngressEventIdentity,
   type JsonBridgeStateStoreOptions,
 } from "../src/state/store.js";
 
 let tmpDir: string;
+
+const BOOT_A = "24f0c7a0-3dd9-4b33-869c-8f07d374ebd8";
+const BOOT_B = "79326562-1a4c-42a2-ac6d-00478b65895d";
+const TEST_UID = process.getuid?.() ?? 501;
+const CURRENT_PROCESS_IDENTITY = `linux-boot:${BOOT_A}:proc-start:100`;
 
 beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "bridge-state-test-"));
@@ -64,6 +72,12 @@ async function writeLockOwner(
 type LockProcessIdentity = NonNullable<
   JsonBridgeStateStoreOptions["lockProcessIdentity"]
 >;
+type LockBootIdentity = NonNullable<
+  JsonBridgeStateStoreOptions["lockBootIdentity"]
+>;
+type LockProcessUid = NonNullable<
+  JsonBridgeStateStoreOptions["lockProcessUid"]
+>;
 
 describe("JsonBridgeStateStore", () => {
   it("retries current-process identity lookup after a transient unavailable result", async () => {
@@ -71,7 +85,7 @@ describe("JsonBridgeStateStore", () => {
     let currentLookups = 0;
     const lockProcessIdentity: LockProcessIdentity = async () => {
       currentLookups += 1;
-      return currentLookups === 1 ? undefined : "current-process-start";
+      return currentLookups === 1 ? undefined : CURRENT_PROCESS_IDENTITY;
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-a",
@@ -98,7 +112,7 @@ describe("JsonBridgeStateStore", () => {
       currentLookups += 1;
       return currentLookups === 1
         ? stalledIdentity.promise
-        : "current-process-start";
+        : CURRENT_PROCESS_IDENTITY;
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-a",
@@ -130,15 +144,18 @@ describe("JsonBridgeStateStore", () => {
     await writeLockOwner(lockPath, token, {
       pid: liveOwnerPid,
       hostname: os.hostname(),
-      processIdentity: "owner-before-recycle",
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+      uid: TEST_UID,
     });
     const stalledIdentity = deferred<string | undefined>();
     const lockProcessIdentity: LockProcessIdentity = async (pid) =>
-      pid === process.pid ? "current-process-start" : stalledIdentity.promise;
+      pid === process.pid ? CURRENT_PROCESS_IDENTITY : stalledIdentity.promise;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-b",
       lockTimeoutMs: 40,
       lockProcessIdentity,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async () => TEST_UID,
     });
     const startedAt = Date.now();
 
@@ -150,7 +167,119 @@ describe("JsonBridgeStateStore", () => {
     expect(await fs.readdir(tmpDir)).toEqual(["bridge-state.json.lock"]);
     expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
 
-    stalledIdentity.resolve("owner-after-recycle");
+    stalledIdentity.resolve(`linux-boot:${BOOT_A}:proc-start:201`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+    await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
+  });
+
+  it("bounds a stalled boot lookup, ignores its late result, and retries it on the next mutation", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "previous-boot-stalled-lookup";
+    const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+    await writeLockOwner(lockPath, token, {
+      pid: liveOwnerPid,
+      hostname: os.hostname(),
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+    });
+    const stalledBoot = deferred<string | undefined>();
+    let bootLookups = 0;
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-after-reboot",
+      lockTimeoutMs: 40,
+      lockProcessIdentity: async (pid) => {
+        if (pid !== process.pid) {
+          throw new Error("stalled boot lookup inspected process birth");
+        }
+        return `linux-boot:${BOOT_B}:proc-start:300`;
+      },
+      lockBootIdentity: async () => {
+        bootLookups += 1;
+        return bootLookups === 1 ? stalledBoot.promise : BOOT_B;
+      },
+      lockProcessUid: async () => {
+        throw new Error("stalled boot lookup inspected process uid");
+      },
+    });
+
+    await expect(store.claimEvent(event())).rejects.toThrow(
+      /Timed out acquiring bridge state lock/,
+    );
+    await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+
+    stalledBoot.resolve(BOOT_B);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+    await expect(store.claimEvent(event())).resolves.toMatchObject({
+      disposition: "claimed",
+    });
+    expect(bootLookups).toBe(2);
+  });
+
+  it("retries a malformed current boot identity instead of caching it", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+    await writeLockOwner(lockPath, "previous-boot-invalid-current", {
+      pid: liveOwnerPid,
+      hostname: os.hostname(),
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+    });
+    let bootLookups = 0;
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-after-reboot",
+      lockTimeoutMs: 250,
+      lockProcessIdentity: async () =>
+        `linux-boot:${BOOT_B}:proc-start:300`,
+      lockBootIdentity: async () => {
+        bootLookups += 1;
+        return bootLookups === 1 ? "not-a-boot-uuid" : BOOT_B;
+      },
+      lockProcessUid: async () => {
+        throw new Error("cross-boot retry inspected process uid");
+      },
+    });
+
+    await expect(store.claimEvent(event())).resolves.toMatchObject({
+      disposition: "claimed",
+    });
+    expect(bootLookups).toBe(2);
+  });
+
+  it("bounds a stalled live-owner uid lookup without later reclaiming its lock", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "same-boot-stalled-uid";
+    const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+    await writeLockOwner(lockPath, token, {
+      pid: liveOwnerPid,
+      hostname: os.hostname(),
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+      uid: 12_345,
+    });
+    const stalledUid = deferred<number | undefined>();
+    const inspectedBirthPids: number[] = [];
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-same-boot",
+      lockTimeoutMs: 40,
+      lockProcessIdentity: async (pid) => {
+        inspectedBirthPids.push(pid);
+        return pid === process.pid ? CURRENT_PROCESS_IDENTITY : undefined;
+      },
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async () => stalledUid.promise,
+    });
+
+    await expect(store.claimEvent(event())).rejects.toThrow(
+      /Timed out acquiring bridge state lock/,
+    );
+    expect(inspectedBirthPids).toEqual([process.pid]);
+    await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+
+    stalledUid.resolve(12_346);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
@@ -172,6 +301,33 @@ describe("JsonBridgeStateStore", () => {
       ),
     ).toBe("424242");
     expect(parseLinuxProcessStartTicks("123 (node) S too-short")).toBeUndefined();
+    expect(
+      parseLockProcessIdentityBoot(
+        `linux-boot:${BOOT_A}:proc-start:424242`,
+      ),
+    ).toBe(BOOT_A);
+    expect(
+      parseLockProcessIdentityBoot(
+        `darwin-boot:${BOOT_B}:proc-start:1724000000:862743`,
+      ),
+    ).toBe(BOOT_B);
+    expect(
+      parseLockProcessIdentityBoot(
+        `darwin-boot:${BOOT_B}:proc-start:1724000000:1000000`,
+      ),
+    ).toBeUndefined();
+    expect(
+      parseLockProcessIdentityBoot(`linux-boot:${BOOT_A}:proc-start:12:secret`),
+    ).toBeUndefined();
+    expect(
+      parseLinuxProcessRealUid(
+        "Name:\tnode\nUid:\t501\t502\t503\t504\nGid:\t20\t20\t20\t20\n",
+      ),
+    ).toBe(501);
+    expect(parseLinuxProcessRealUid("Uid:\t501\t502\tsecret\t504\n")).toBeUndefined();
+    expect(parseDarwinProcessUid("  501\n")).toBe(501);
+    expect(parseDarwinProcessUid("501\nprivate-data\n")).toBeUndefined();
+    expect(parseDarwinProcessUid("4294967296\n")).toBeUndefined();
   });
 
   it("scopes Linux start ticks and Darwin microsecond start times to a boot", () => {
@@ -205,13 +361,15 @@ describe("JsonBridgeStateStore", () => {
     const lockPath = `${storePath}.lock`;
     const originalRename = fs.rename.bind(fs);
     let persistedIdentity: string | undefined;
+    let persistedUid: number | undefined;
     const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
       if (String(to) === lockPath) {
         const [ownerName] = await fs.readdir(String(from));
         const owner = JSON.parse(
           await fs.readFile(path.join(String(from), ownerName!), "utf8"),
-        ) as { processIdentity?: string };
+        ) as { processIdentity?: string; uid?: number };
         persistedIdentity = owner.processIdentity;
+        persistedUid = owner.uid;
       }
       await originalRename(from, to);
     });
@@ -230,6 +388,25 @@ describe("JsonBridgeStateStore", () => {
       expect(persistedIdentity).toMatch(
         /^linux-boot:[0-9a-f-]{36}:proc-start:\d+$/,
       );
+    }
+    expect(persistedUid).toBe(TEST_UID);
+
+    if (process.platform === "darwin" || process.platform === "linux") {
+      await writeLockOwner(lockPath, "same-process-different-uid", {
+        pid: process.pid,
+        hostname: os.hostname(),
+        processIdentity: persistedIdentity,
+        uid: TEST_UID === 0xffff_ffff ? TEST_UID - 1 : TEST_UID + 1,
+      });
+      const contender = new JsonBridgeStateStore(storePath, {
+        ownerId: "runtime-default-uid-provider",
+      });
+      await expect(
+        contender.claimEvent(
+          event({ webhookId: "webhook-2", executionId: "created:session-2" }),
+        ),
+      ).resolves.toMatchObject({ disposition: "claimed" });
+      await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
   });
 
@@ -407,13 +584,17 @@ describe("JsonBridgeStateStore", () => {
     await writeLockOwner(lockPath, token, {
       pid: process.pid,
       hostname: os.hostname(),
-      processIdentity: "process-start-a",
+      processIdentity: CURRENT_PROCESS_IDENTITY,
+      uid: TEST_UID,
     });
-    const lockProcessIdentity: LockProcessIdentity = async () => "process-start-a";
+    const lockProcessIdentity: LockProcessIdentity = async () =>
+      CURRENT_PROCESS_IDENTITY;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-b",
       lockTimeoutMs: 50,
       lockProcessIdentity,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async () => TEST_UID,
     });
 
     await expect(store.claimEvent(event())).rejects.toThrow(
@@ -423,20 +604,147 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
   });
 
+  it("reclaims an intermediate-format lock from a different boot without inspecting the live PID", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+    await writeLockOwner(lockPath, "previous-boot-owner", {
+      pid: liveOwnerPid,
+      hostname: os.hostname(),
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+    });
+    const inspectedPids: number[] = [];
+    const lockProcessIdentity: LockProcessIdentity = async (pid) => {
+      inspectedPids.push(pid);
+      if (pid !== process.pid) {
+        throw new Error("cross-boot reclaim inspected process birth");
+      }
+      return `linux-boot:${BOOT_B}:proc-start:300`;
+    };
+    const lockBootIdentity: LockBootIdentity = async () => BOOT_B;
+    const lockProcessUid: LockProcessUid = async () => {
+      throw new Error("cross-boot reclaim inspected process uid");
+    };
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-after-reboot",
+      lockTimeoutMs: 250,
+      lockProcessIdentity,
+      lockBootIdentity,
+      lockProcessUid,
+    });
+
+    await expect(store.claimEvent(event())).resolves.toMatchObject({
+      disposition: "claimed",
+    });
+    expect(inspectedPids).toEqual([process.pid]);
+    await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reclaims a same-boot lock owned by a different uid without inspecting process birth", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+    await writeLockOwner(lockPath, "different-user-owner", {
+      pid: liveOwnerPid,
+      hostname: os.hostname(),
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+      uid: 12_345,
+    });
+    const inspectedBirthPids: number[] = [];
+    const inspectedUidPids: number[] = [];
+    const lockProcessIdentity: LockProcessIdentity = async (pid) => {
+      inspectedBirthPids.push(pid);
+      if (pid !== process.pid) {
+        throw new Error("different-uid reclaim inspected process birth");
+      }
+      return CURRENT_PROCESS_IDENTITY;
+    };
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-different-user",
+      lockTimeoutMs: 250,
+      lockProcessIdentity,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async (pid) => {
+        inspectedUidPids.push(pid);
+        return 12_346;
+      },
+    });
+
+    await expect(store.claimEvent(event())).resolves.toMatchObject({
+      disposition: "claimed",
+    });
+    expect(inspectedUidPids).toEqual([liveOwnerPid]);
+    expect(inspectedBirthPids).toEqual([process.pid]);
+    await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    ["matching", 12_345],
+    ["unavailable", undefined],
+  ])(
+    "preserves a same-boot lock when the live uid is %s and process birth is unavailable",
+    async (_kind, liveUid) => {
+      const storePath = path.join(tmpDir, "bridge-state.json");
+      const lockPath = `${storePath}.lock`;
+      const token = `unqueryable-birth-${String(_kind)}`;
+      const liveOwnerPid = process.pid === 1 ? process.ppid : 1;
+      await writeLockOwner(lockPath, token, {
+        pid: liveOwnerPid,
+        hostname: os.hostname(),
+        processIdentity: `linux-boot:${BOOT_A}:proc-start:200`,
+        uid: 12_345,
+      });
+      const inspectedBirthPids: number[] = [];
+      const inspectedUidPids: number[] = [];
+      const store = new JsonBridgeStateStore(storePath, {
+        ownerId: "runtime-unqueryable-owner",
+        lockTimeoutMs: 50,
+        lockProcessIdentity: async (pid) => {
+          inspectedBirthPids.push(pid);
+          return pid === process.pid ? CURRENT_PROCESS_IDENTITY : undefined;
+        },
+        lockBootIdentity: async () => BOOT_A,
+        lockProcessUid: async (pid) => {
+          inspectedUidPids.push(pid);
+          return liveUid;
+        },
+      });
+
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      expect(inspectedUidPids.length).toBeGreaterThan(0);
+      expect(inspectedUidPids.every((pid) => pid === liveOwnerPid)).toBe(true);
+      expect(inspectedBirthPids).toContain(process.pid);
+      const inspectedOwnerBirthPids = inspectedBirthPids.filter(
+        (pid) => pid !== process.pid,
+      );
+      expect(inspectedOwnerBirthPids.length).toBeGreaterThan(0);
+      expect(
+        inspectedOwnerBirthPids.every((pid) => pid === liveOwnerPid),
+      ).toBe(true);
+      expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+      await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
+    },
+  );
+
   it("reclaims a same-host lock when the live PID belongs to a recycled process", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const lockPath = `${storePath}.lock`;
     await writeLockOwner(lockPath, "recycled-owner", {
       pid: process.pid,
       hostname: os.hostname(),
-      processIdentity: "process-start-before-recycle",
+      processIdentity: `linux-boot:${BOOT_A}:proc-start:99`,
+      uid: TEST_UID,
     });
     const lockProcessIdentity: LockProcessIdentity = async () =>
-      "process-start-after-recycle";
+      CURRENT_PROCESS_IDENTITY;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-recycle",
       lockTimeoutMs: 250,
       lockProcessIdentity,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async () => TEST_UID,
     });
 
     await expect(store.claimEvent(event())).resolves.toMatchObject({
@@ -457,7 +765,7 @@ describe("JsonBridgeStateStore", () => {
     const inspectedPids: number[] = [];
     const lockProcessIdentity: LockProcessIdentity = async (pid) => {
       inspectedPids.push(pid);
-      return "process-start-current";
+      return CURRENT_PROCESS_IDENTITY;
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-exit",
@@ -475,6 +783,7 @@ describe("JsonBridgeStateStore", () => {
   it.each([
     ["legacy", {}],
     ["malformed", { processIdentity: 42 }],
+    ["boot-scoped without uid", { processIdentity: CURRENT_PROCESS_IDENTITY }],
   ])("preserves a %s same-host owner record for safe migration", async (_kind, extra) => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const lockPath = `${storePath}.lock`;
@@ -485,11 +794,15 @@ describe("JsonBridgeStateStore", () => {
       ...extra,
     });
     const lockProcessIdentity: LockProcessIdentity = async () =>
-      "process-start-current";
+      CURRENT_PROCESS_IDENTITY;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-migration",
       lockTimeoutMs: 50,
       lockProcessIdentity,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async () => {
+        throw new Error("legacy owner unexpectedly inspected process uid");
+      },
     });
 
     await expect(store.claimEvent(event())).rejects.toThrow(

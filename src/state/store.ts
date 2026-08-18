@@ -124,6 +124,11 @@ export interface JsonBridgeStateStoreOptions {
     pid: number,
     deadline: number,
   ) => Promise<string | undefined>;
+  lockBootIdentity?: (deadline: number) => Promise<string | undefined>;
+  lockProcessUid?: (
+    pid: number,
+    deadline: number,
+  ) => Promise<number | undefined>;
 }
 
 interface LegacyLockOwnerRecord {
@@ -132,8 +137,12 @@ interface LegacyLockOwnerRecord {
   hostname: string;
 }
 
-interface LockOwnerRecord extends LegacyLockOwnerRecord {
+interface BootScopedLockOwnerRecord extends LegacyLockOwnerRecord {
   processIdentity: string;
+}
+
+interface LockOwnerRecord extends BootScopedLockOwnerRecord {
+  uid: number;
 }
 
 export class ClaimOwnershipError extends Error {
@@ -178,7 +187,15 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     pid: number,
     deadline: number,
   ) => Promise<string | undefined>;
+  private readonly lockBootIdentity: (
+    deadline: number,
+  ) => Promise<string | undefined>;
+  private readonly lockProcessUid: (
+    pid: number,
+    deadline: number,
+  ) => Promise<number | undefined>;
   private currentProcessIdentityPromise: Promise<string | undefined> | undefined;
+  private currentBootIdentityPromise: Promise<string | undefined> | undefined;
   // This process may reclaim a visible pre-dispatch claim only when the
   // mutation that created it never completed through lock release.
   private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
@@ -196,6 +213,8 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     this.lockTimeoutMs = options.lockTimeoutMs ?? LOCK_TIMEOUT_MS;
     this.lockProcessIdentity =
       options.lockProcessIdentity ?? defaultLockProcessIdentity;
+    this.lockBootIdentity = options.lockBootIdentity ?? defaultLockBootIdentity;
+    this.lockProcessUid = options.lockProcessUid ?? defaultLockProcessUid;
 
     if (!Number.isInteger(this.maxEntries) || this.maxEntries <= 0) {
       throw new Error("maxEntries must be a positive integer");
@@ -686,8 +705,15 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         process.pid,
         deadline,
       );
-      if (!isValidProcessIdentity(processIdentity)) {
+      if (
+        !isValidProcessIdentity(processIdentity) ||
+        parseLockProcessIdentityBoot(processIdentity) === undefined
+      ) {
         throw new Error("Could not determine current process identity for state lock");
+      }
+      const uid = process.getuid?.();
+      if (!isValidUid(uid)) {
+        throw new Error("Could not determine current user identity for state lock");
       }
       assertBeforeLockDeadline(deadline);
       const owner: LockOwnerRecord = {
@@ -695,6 +721,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         pid: process.pid,
         hostname: os.hostname(),
         processIdentity,
+        uid,
       };
       await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
       await handle.chmod(0o600);
@@ -745,14 +772,59 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       return;
     }
 
+    const bootScopedOwner = isBootScopedLockOwnerRecord(owner) ? owner : undefined;
+    const recordedBootIdentity =
+      bootScopedOwner === undefined
+        ? undefined
+        : parseLockProcessIdentityBoot(bootScopedOwner.processIdentity);
+    let currentBootIdentity: string | undefined;
+    if (recordedBootIdentity !== undefined) {
+      try {
+        currentBootIdentity = await this.resolveCurrentBootIdentity(deadline);
+      } catch (error) {
+        if (error instanceof BridgeStateLockTimeoutError) {
+          throw error;
+        }
+      }
+      if (
+        currentBootIdentity !== undefined &&
+        currentBootIdentity !== recordedBootIdentity
+      ) {
+        assertBeforeLockDeadline(deadline);
+        await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+        return;
+      }
+    }
+
     if (!isProcessAlive(owner.pid)) {
       assertBeforeLockDeadline(deadline);
       await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
       return;
     }
+    if (
+      recordedBootIdentity === undefined ||
+      currentBootIdentity === undefined
+    ) {
+      return;
+    }
     if (!isLockOwnerRecord(owner)) {
       return;
     }
+
+    let currentProcessUid: number | undefined;
+    try {
+      currentProcessUid = await this.resolveLockProcessUid(owner.pid, deadline);
+    } catch (error) {
+      if (error instanceof BridgeStateLockTimeoutError) {
+        throw error;
+      }
+    }
+    if (currentProcessUid !== undefined && currentProcessUid !== owner.uid) {
+      assertBeforeLockDeadline(deadline);
+      await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+      return;
+    }
+
     let currentProcessIdentity: string | undefined;
     try {
       currentProcessIdentity = await this.resolveLockProcessIdentity(
@@ -796,14 +868,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
 
     try {
       const identity = await resolveBeforeLockDeadline(lookup, deadline);
+      const validIdentity =
+        isValidProcessIdentity(identity) &&
+        parseLockProcessIdentityBoot(identity) !== undefined
+          ? identity
+          : undefined;
       if (
         isCurrentProcess &&
-        !isValidProcessIdentity(identity) &&
+        validIdentity === undefined &&
         this.currentProcessIdentityPromise === lookup
       ) {
         this.currentProcessIdentityPromise = undefined;
       }
-      return identity;
+      return validIdentity;
     } catch (error) {
       if (
         isCurrentProcess &&
@@ -813,6 +890,47 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
       throw error;
     }
+  }
+
+  private async resolveCurrentBootIdentity(
+    deadline: number,
+  ): Promise<string | undefined> {
+    assertBeforeLockDeadline(deadline);
+    let lookup = this.currentBootIdentityPromise;
+    if (lookup === undefined) {
+      lookup = Promise.resolve().then(() => this.lockBootIdentity(deadline));
+      this.currentBootIdentityPromise = lookup;
+    }
+
+    try {
+      const identity = await resolveBeforeLockDeadline(lookup, deadline);
+      const normalizedIdentity =
+        identity === undefined ? undefined : parseBootSessionUuid(identity);
+      if (
+        normalizedIdentity === undefined &&
+        this.currentBootIdentityPromise === lookup
+      ) {
+        this.currentBootIdentityPromise = undefined;
+      }
+      return normalizedIdentity;
+    } catch (error) {
+      if (this.currentBootIdentityPromise === lookup) {
+        this.currentBootIdentityPromise = undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async resolveLockProcessUid(
+    pid: number,
+    deadline: number,
+  ): Promise<number | undefined> {
+    assertBeforeLockDeadline(deadline);
+    const uid = await resolveBeforeLockDeadline(
+      Promise.resolve().then(() => this.lockProcessUid(pid, deadline)),
+      deadline,
+    );
+    return isValidUid(uid) ? uid : undefined;
   }
 
   private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
@@ -1050,6 +1168,16 @@ function isLegacyLockOwnerRecord(
 }
 
 function isLockOwnerRecord(value: unknown): value is LockOwnerRecord {
+  if (!isBootScopedLockOwnerRecord(value)) {
+    return false;
+  }
+  const record = value as unknown as Record<string, unknown>;
+  return isValidUid(record.uid);
+}
+
+function isBootScopedLockOwnerRecord(
+  value: unknown,
+): value is BootScopedLockOwnerRecord {
   if (!isLegacyLockOwnerRecord(value)) {
     return false;
   }
@@ -1063,6 +1191,90 @@ function isValidProcessIdentity(value: unknown): value is string {
     value.length > 0 &&
     value.length <= MAX_PROCESS_IDENTITY_LENGTH
   );
+}
+
+function isValidUid(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= 0xffff_ffff
+  );
+}
+
+function defaultLockBootIdentity(
+  deadline: number,
+): Promise<string | undefined> {
+  return readBootIdentity(deadline);
+}
+
+async function readBootIdentity(deadline: number): Promise<string | undefined> {
+  assertBeforeLockDeadline(deadline);
+  let output: string;
+  try {
+    if (process.platform === "linux") {
+      output = await fs.readFile(
+        "/proc/sys/kernel/random/boot_id",
+        "utf8",
+      );
+    } else if (process.platform === "darwin") {
+      output = await execFileBeforeLockDeadline(
+        "/usr/sbin/sysctl",
+        ["-n", "kern.bootsessionuuid"],
+        deadline,
+        4 * 1024,
+      );
+    } else {
+      return undefined;
+    }
+  } catch (error) {
+    if (error instanceof BridgeStateLockTimeoutError) {
+      throw error;
+    }
+    return undefined;
+  }
+  assertBeforeLockDeadline(deadline);
+  return parseBootSessionUuid(output);
+}
+
+function defaultLockProcessUid(
+  pid: number,
+  deadline: number,
+): Promise<number | undefined> {
+  return readProcessUid(pid, deadline);
+}
+
+async function readProcessUid(
+  pid: number,
+  deadline: number,
+): Promise<number | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return undefined;
+  }
+  assertBeforeLockDeadline(deadline);
+  let output: string;
+  try {
+    if (process.platform === "linux") {
+      output = await fs.readFile(`/proc/${pid}/status`, "utf8");
+      assertBeforeLockDeadline(deadline);
+      return parseLinuxProcessRealUid(output);
+    }
+    if (process.platform === "darwin") {
+      output = await execFileBeforeLockDeadline(
+        "/bin/ps",
+        ["-o", "uid=", "-p", String(pid)],
+        deadline,
+        128,
+      );
+      return parseDarwinProcessUid(output);
+    }
+    return undefined;
+  } catch (error) {
+    if (error instanceof BridgeStateLockTimeoutError) {
+      throw error;
+    }
+    return undefined;
+  }
 }
 
 function defaultLockProcessIdentity(
@@ -1155,6 +1367,45 @@ export function parseBootSessionUuid(output: string): string | undefined {
   )
     ? value.toLowerCase()
     : undefined;
+}
+
+export function parseLockProcessIdentityBoot(
+  identity: string,
+): string | undefined {
+  const linux = /^linux-boot:([^:]+):proc-start:(\d+)$/.exec(identity);
+  if (linux !== null) {
+    return parseBootSessionUuid(linux[1]!);
+  }
+  const darwin = /^darwin-boot:([^:]+):proc-start:(.+)$/.exec(identity);
+  if (
+    darwin !== null &&
+    parseDarwinProcessStartTime(darwin[2]!) !== undefined
+  ) {
+    return parseBootSessionUuid(darwin[1]!);
+  }
+  return undefined;
+}
+
+export function parseLinuxProcessRealUid(
+  status: string,
+): number | undefined {
+  const matches = status
+    .split(/\r?\n/)
+    .map((line) => /^Uid:\s+(\d+)\s+\d+\s+\d+\s+\d+\s*$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null);
+  return matches.length === 1 ? parseNumericUid(matches[0]![1]!) : undefined;
+}
+
+export function parseDarwinProcessUid(output: string): number | undefined {
+  return parseNumericUid(output.trim());
+}
+
+function parseNumericUid(value: string): number | undefined {
+  if (!/^(0|[1-9]\d{0,9})$/.test(value)) {
+    return undefined;
+  }
+  const uid = Number(value);
+  return isValidUid(uid) ? uid : undefined;
 }
 
 export function parseDarwinProcessStartTime(
