@@ -11,6 +11,19 @@ const AGENT_ACTIVITY_CREATE_MUTATION = `
   }
 `;
 
+const AGENT_ACTIVITY_QUERY = `
+  query AgentActivityById($id: ID!) {
+    agentActivities(first: 2, filter: { id: { eq: $id } }) {
+      nodes {
+        id
+        agentSession {
+          id
+        }
+      }
+    }
+  }
+`;
+
 interface GraphQLError {
   message: string;
 }
@@ -19,6 +32,18 @@ interface AgentActivityCreateResponse {
   data?: {
     agentActivityCreate?: {
       success: boolean;
+    };
+  };
+  errors?: GraphQLError[];
+}
+
+interface AgentActivityQueryResponse {
+  data?: {
+    agentActivities?: {
+      nodes: Array<{
+        id: string;
+        agentSession?: { id: string } | null;
+      }>;
     };
   };
   errors?: GraphQLError[];
@@ -115,6 +140,71 @@ export class LinearAgentClient {
         "Linear agentActivityCreate returned success: false with no GraphQL errors",
       );
     }
+  }
+
+  /**
+   * Reconciles an uncertain caller-supplied activity ID before replay. Linear
+   * does not document create idempotency, so a durable pending outbox must
+   * query the exact ID and verify its session before issuing another create.
+   */
+  async activityExists(
+    agentSessionId: string,
+    activityId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const request = async (accessToken: string): Promise<Response> =>
+      this.fetchFn(LINEAR_GRAPHQL_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          query: AGENT_ACTIVITY_QUERY,
+          variables: { id: activityId },
+        }),
+        ...(signal !== undefined ? { signal } : {}),
+      });
+
+    const accessToken = await abortable(this.getAccessToken(), signal);
+    let response = await request(accessToken);
+    if (response.status === 401 && typeof this.tokenSource !== "string") {
+      await discardResponseBody(response);
+      const refreshedAccessToken = await abortable(
+        this.tokenSource.refreshAfterUnauthorized(accessToken),
+        signal,
+      );
+      response = await request(refreshedAccessToken);
+    }
+    if (!response.ok) {
+      await discardResponseBody(response);
+      throw new LinearActivityError(
+        `Linear agentActivity query failed: ${response.status} ${response.statusText}`,
+      );
+    }
+    const json = (await response.json()) as AgentActivityQueryResponse;
+    if (json.errors && json.errors.length > 0) {
+      throw new LinearActivityError("Linear agentActivity query GraphQL error");
+    }
+    const nodes = json.data?.agentActivities?.nodes;
+    if (!Array.isArray(nodes)) {
+      throw new LinearActivityError(
+        "Linear agentActivities query returned an invalid result",
+      );
+    }
+    if (nodes.length === 0) {
+      return false;
+    }
+    if (
+      nodes.length !== 1 ||
+      nodes[0]?.id !== activityId ||
+      nodes[0].agentSession?.id !== agentSessionId
+    ) {
+      throw new LinearActivityError(
+        "Linear agentActivity query returned mismatched activity identity",
+      );
+    }
+    return true;
   }
 
   private async getAccessToken(): Promise<string> {

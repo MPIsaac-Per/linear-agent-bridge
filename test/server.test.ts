@@ -10,6 +10,7 @@ import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { JsonSessionStore } from "../src/sessions/store.js";
 import {
+  DispatchMarkerDurabilityError,
   JsonBridgeStateStore,
   type JsonBridgeStateStoreOptions,
 } from "../src/state/store.js";
@@ -450,7 +451,21 @@ describe("startServer", () => {
         awaitReady: false,
       });
       const harness = activeHarness;
-      await expect(harness.ready).rejects.toMatchObject({ code: "EISDIR" });
+      let readySettled = false;
+      void harness.ready.then(
+        () => {
+          readySettled = true;
+        },
+        () => {
+          readySettled = true;
+        },
+      );
+      await waitFor(() =>
+        errorSpy.mock.calls.some((call) =>
+          call.join(" ").includes("transient ingress recovery failure"),
+        ),
+      );
+      expect(readySettled).toBe(false);
       const payload = {
         webhookId: "webhook-persistence-failure",
         type: "AgentSessionEvent",
@@ -566,6 +581,77 @@ describe("startServer", () => {
       await activeHarness?.close();
       activeHarness = undefined;
       await fsPromises.rm(sharedTmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a transient startup recovery scan failure without another webhook", async () => {
+    const prompt = "private prompt survives transient startup recovery failure";
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let recoveryAssertSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        awaitReady: false,
+        bridgeStateOwnerId: "runtime-after-transient-recovery-failure",
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, {
+            ownerId: "runtime-before-transient-recovery-failure",
+            recoveryKeyring: createIngressRecoveryKeyring(
+              INGRESS_RECOVERY_KEY,
+            ),
+          });
+          await prior.claimEvent(
+            {
+              webhookId: "webhook-transient-recovery-failure",
+              executionId: "created:session-transient-recovery-failure",
+              linearSessionId: "session-transient-recovery-failure",
+              action: "created",
+            },
+            {
+              action: "created",
+              prompt,
+              occurredAt: "2026-08-18T12:00:00.000Z",
+            },
+          );
+          const original =
+            JsonBridgeStateStore.prototype.assertRecoverableEventsAvailable;
+          let failedOnce = false;
+          recoveryAssertSpy = vi
+            .spyOn(
+              JsonBridgeStateStore.prototype,
+              "assertRecoverableEventsAvailable",
+            )
+            .mockImplementation(async function () {
+              if (!failedOnce) {
+                failedOnce = true;
+                throw new Error("synthetic transient recovery scan failure");
+              }
+              return original.call(this);
+            });
+        },
+      });
+      const harness = activeHarness;
+
+      await harness.ready;
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(
+          "webhook-transient-recovery-failure",
+        ))?.status === "completed",
+      );
+      expect(runtime.requests).toEqual([
+        expect.objectContaining({
+          linearSessionId: "session-transient-recovery-failure",
+          prompt,
+        }),
+      ]);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain(prompt);
+    } finally {
+      recoveryAssertSpy?.mockRestore();
+      errorSpy.mockRestore();
     }
   });
 
@@ -992,11 +1078,11 @@ describe("startServer", () => {
       );
       expect(receiptAfterClose).toMatchObject({
         status: "claimed",
-        dispatchStartedAt: expect.any(String),
       });
+      expect(receiptAfterClose).not.toHaveProperty("dispatchStartedAt");
       expect(receiptAfterClose).not.toHaveProperty("completedAt");
       expect(receiptAfterClose).not.toHaveProperty("failedAt");
-      expect(await fsPromises.readFile(harness.bridgeStatePath, "utf8")).not.toContain(
+      expect(await fsPromises.readFile(harness.bridgeStatePath, "utf8")).toContain(
         "recoveryEnvelope",
       );
       expect(
@@ -1070,8 +1156,9 @@ describe("startServer", () => {
         ).status,
       ).toBe(200);
       await waitFor(async () =>
-        (await harness!.bridgeState.getReceipt(payload.webhookId))
-          ?.dispatchStartedAt !== undefined,
+        (await harness!.bridgeState.getClaim(
+          "created:session-queued-during-close",
+        )) !== undefined,
       );
 
       let closeSettled = false;
@@ -1089,8 +1176,9 @@ describe("startServer", () => {
       const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
       expect(receipt).toMatchObject({
         status: "claimed",
-        dispatchStartedAt: expect.any(String),
       });
+      expect(receipt).not.toHaveProperty("dispatchStartedAt");
+      expect(receipt).toHaveProperty("recoveryEnvelope");
       expect(receipt).not.toHaveProperty("completedAt");
       expect(receipt).not.toHaveProperty("failedAt");
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1643,6 +1731,298 @@ describe("startServer", () => {
       openSpy?.mockRestore();
       errorSpy.mockRestore();
     }
+  });
+
+  it("retries an idempotent liveness failure before runtime start without losing accepted work", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    const livenessActivityIds: string[] = [];
+    let livenessAttempts = 0;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        linearFetchImpl: (calls) =>
+          (async (_url: RequestInfo | URL, init?: RequestInit) => {
+            const parsed = JSON.parse(init?.body as string) as {
+              variables: {
+                input?: {
+                  id?: string;
+                  agentSessionId: string;
+                  content: AgentActivityContent;
+                  ephemeral?: boolean;
+                };
+                id?: string;
+              };
+            };
+            if (parsed.variables.id !== undefined) {
+              return jsonResponse({
+                data: { agentActivities: { nodes: [] } },
+              });
+            }
+            const input = parsed.variables.input;
+            if (input === undefined) {
+              throw new Error("missing activity create input");
+            }
+            calls.push({
+              agentSessionId: input.agentSessionId,
+              content: input.content,
+              ...(input.ephemeral !== undefined
+                ? { ephemeral: input.ephemeral }
+                : {}),
+            });
+            if (
+              input.content.type === "thought" &&
+              input.content.body === "Reading the issue and gathering context…"
+            ) {
+              livenessAttempts += 1;
+              if (input.id !== undefined) {
+                livenessActivityIds.push(input.id);
+              }
+              if (livenessAttempts === 1) {
+                return jsonResponse(
+                  { error: "synthetic transient liveness failure" },
+                  { ok: false, status: 503 },
+                );
+              }
+            }
+            return jsonResponse({
+              data: { agentActivityCreate: { success: true } },
+            });
+          }) as FetchFn,
+      });
+      const harness = activeHarness;
+      const prompt = "private liveness retry prompt";
+      const payload = {
+        webhookId: "webhook-liveness-retry-before-runtime",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-liveness-retry-before-runtime" },
+        promptContext: prompt,
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(livenessAttempts).toBe(2);
+      expect(livenessActivityIds).toHaveLength(2);
+      expect(new Set(livenessActivityIds).size).toBe(1);
+      expect(runtime.requests).toHaveLength(1);
+      expect(await fsPromises.readFile(harness.bridgeStatePath, "utf8")).not.toContain(
+        prompt,
+      );
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain(prompt);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("reconciles a delivered liveness activity before replaying its pending outbox", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let createdActivityId: string | undefined;
+    let createAttempts = 0;
+    let queryAttempts = 0;
+    activeHarness = await startTestServer(runtime, {
+      linearFetchImpl: (calls) =>
+        (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const parsed = JSON.parse(init?.body as string) as {
+            variables: {
+              id?: string;
+              input?: LinearCall & { id?: string };
+            };
+          };
+          if (parsed.variables.id !== undefined) {
+            queryAttempts += 1;
+            return jsonResponse({
+              data: {
+                agentActivities: {
+                  nodes:
+                    createdActivityId === parsed.variables.id
+                      ? [
+                          {
+                            id: createdActivityId,
+                            agentSession: {
+                              id: "session-liveness-outbox-reconcile",
+                            },
+                          },
+                        ]
+                      : [],
+                },
+              },
+            });
+          }
+          const input = parsed.variables.input!;
+          createAttempts += 1;
+          createdActivityId = input.id;
+          calls.push({
+            agentSessionId: input.agentSessionId,
+            content: input.content,
+            ...(input.ephemeral !== undefined
+              ? { ephemeral: input.ephemeral }
+              : {}),
+          });
+          return jsonResponse({
+            data: { agentActivityCreate: { success: true } },
+          });
+        }) as FetchFn,
+    });
+    const harness = activeHarness;
+    const originalDelivered = harness.bridgeState.markActivityDelivered.bind(
+      harness.bridgeState,
+    );
+    vi.spyOn(harness.bridgeState, "markActivityDelivered")
+      .mockRejectedValueOnce(new Error("synthetic delivered-state failure"))
+      .mockImplementation(originalDelivered);
+    const payload = {
+      webhookId: "webhook-liveness-outbox-reconcile",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-liveness-outbox-reconcile" },
+      promptContext: "private activity reconciliation prompt",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+      "completed",
+    );
+    expect(createAttempts).toBe(1);
+    expect(queryAttempts).toBe(1);
+  });
+
+  it("confirms a locally visible runtime intent before starting the runtime once", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      harness.bridgeState,
+    );
+    let first = true;
+    const markSpy = vi
+      .spyOn(harness.bridgeState, "markDispatchStarted")
+      .mockImplementation(async (webhookId) => {
+        const result = await originalMark(webhookId);
+        if (first) {
+          first = false;
+          throw new DispatchMarkerDurabilityError();
+        }
+        return result;
+      });
+    const releaseSpy = vi.spyOn(
+      harness.bridgeState,
+      "releasePreDispatchClaim",
+    );
+    const payload = {
+      webhookId: "webhook-runtime-intent-confirmation",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-runtime-intent-confirmation" },
+      promptContext: "private runtime intent prompt",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+      "completed",
+    );
+    expect(markSpy).toHaveBeenCalledTimes(2);
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(runtime.requests).toHaveLength(1);
+  });
+
+  it("retries terminal-state confirmation without invoking the runtime again", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const originalComplete = harness.bridgeState.completeEvent.bind(
+      harness.bridgeState,
+    );
+    let first = true;
+    const completeSpy = vi
+      .spyOn(harness.bridgeState, "completeEvent")
+      .mockImplementation(async (webhookId) => {
+        await originalComplete(webhookId);
+        if (first) {
+          first = false;
+          throw new Error("synthetic terminal durability uncertainty");
+        }
+      });
+    const payload = {
+      webhookId: "webhook-terminal-confirmation",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-terminal-confirmation" },
+      promptContext: "private terminal confirmation prompt",
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+      "completed",
+    );
+    await waitFor(() => completeSpy.mock.calls.length === 2);
+    expect(runtime.requests).toHaveLength(1);
   });
 
   it("recovers without another webhook after marker and release fail before either state write", async () => {
@@ -2771,7 +3151,7 @@ describe("startServer", () => {
     await thoughtFinished.promise;
     await waitFor(async () =>
       (await harness.bridgeState.getReceipt(promptedPayload.webhookId))?.status ===
-      "completed",
+      "superseded",
     );
     expect(runtime.requests).toHaveLength(0);
   });
@@ -2845,6 +3225,107 @@ describe("startServer", () => {
       });
     } finally {
       release.resolve();
+    }
+  });
+
+  it("drains an in-flight inactivity activity before close and prevents late state mutation", async () => {
+    const releaseRuntime = createDeferred<void>();
+    const inactivityIdStarted = createDeferred<void>();
+    const releaseInactivityId = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      await Promise.race([
+        releaseRuntime.promise,
+        new Promise<void>((resolve) => {
+          request.abortController?.signal.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        }),
+      ]);
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let harness: Harness | undefined;
+    let activityIdSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        configOverrides: { runInactivityTimeoutMs: 25 },
+        removeTmpDirOnClose: false,
+      });
+      harness = activeHarness;
+      const originalGetOrCreate =
+        harness.bridgeState.getOrCreateActivityId.bind(harness.bridgeState);
+      activityIdSpy = vi
+        .spyOn(harness.bridgeState, "getOrCreateActivityId")
+        .mockImplementation(async (executionId, activityKey, signal) => {
+          if (activityKey === "inactivity-error") {
+            inactivityIdStarted.resolve();
+            await releaseInactivityId.promise;
+          }
+          return originalGetOrCreate(executionId, activityKey, signal);
+        });
+      const payload = {
+        webhookId: "webhook-close-during-inactivity-activity",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-close-during-inactivity-activity" },
+        promptContext: "private inactivity close prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await inactivityIdStarted.promise;
+
+      let closeSettled = false;
+      const close = harness.close().then(() => {
+        closeSettled = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeSettled).toBe(false);
+
+      releaseInactivityId.resolve();
+      await close;
+      activeHarness = undefined;
+      const claimAfterClose = await harness.bridgeState.getClaim(
+        "created:session-close-during-inactivity-activity",
+      );
+      expect(claimAfterClose?.activityIds).not.toHaveProperty(
+        "inactivity-error",
+      );
+      const stateAfterClose = await fsPromises.readFile(
+        harness.bridgeStatePath,
+        "utf8",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await expect(
+        fsPromises.readFile(harness.bridgeStatePath, "utf8"),
+      ).resolves.toBe(stateAfterClose);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("private inactivity close prompt");
+      expect(logged).not.toContain("failed to emit inactivity activity");
+    } finally {
+      releaseRuntime.resolve();
+      releaseInactivityId.resolve();
+      await activeHarness?.close().catch(() => undefined);
+      activeHarness = undefined;
+      activityIdSpy?.mockRestore();
+      errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
     }
   });
 

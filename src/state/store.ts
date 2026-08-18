@@ -101,6 +101,16 @@ export interface IngressClaim {
   updatedAt: string;
   dispatchStartedAt?: string | undefined;
   activityIds: Record<string, string>;
+  activityOutbox?: Record<string, ActivityOutboxEntry> | undefined;
+}
+
+export interface ActivityOutboxEntry {
+  activityId: string;
+  agentSessionId: string;
+  contentDigest: string;
+  attempts: number;
+  status: "pending" | "delivered";
+  updatedAt: string;
 }
 
 export type ClaimEventResult =
@@ -124,6 +134,7 @@ export type RecoverableIngressEvent =
     };
 
 export type DispatchStartDisposition = "dispatch_started" | "superseded";
+export type DispatchEligibility = "eligible" | "superseded";
 
 export interface BridgeStateStore {
   claimEvent(
@@ -132,8 +143,10 @@ export interface BridgeStateStore {
     options?: { repairLegacyOnly?: boolean },
   ): Promise<ClaimEventResult>;
   markDispatchStarted(webhookId: string): Promise<DispatchStartDisposition>;
+  checkDispatchEligibility(webhookId: string): Promise<DispatchEligibility>;
   releasePreDispatchClaim(webhookId: string): Promise<boolean>;
   completeEvent(webhookId: string): Promise<void>;
+  completeEventWithoutRuntime(webhookId: string): Promise<void>;
   failEvent(webhookId: string, errorClass?: ReceiptErrorClass): Promise<void>;
   getReceipt(webhookId: string): Promise<IngressReceipt | undefined>;
   getClaim(executionId: string): Promise<IngressClaim | undefined>;
@@ -141,7 +154,22 @@ export interface BridgeStateStore {
   listRecoverableEvents(
     afterSequence?: number,
   ): Promise<RecoverableIngressEvent[]>;
-  getOrCreateActivityId(executionId: string, activityKey: string): Promise<string>;
+  getOrCreateActivityId(
+    executionId: string,
+    activityKey: string,
+    signal?: AbortSignal,
+  ): Promise<string>;
+  prepareActivity(
+    executionId: string,
+    activityKey: string,
+    agentSessionId: string,
+    contentDigest: string,
+  ): Promise<ActivityOutboxEntry>;
+  markActivityAttempted(
+    executionId: string,
+    activityKey: string,
+  ): Promise<ActivityOutboxEntry>;
+  markActivityDelivered(executionId: string, activityKey: string): Promise<void>;
 }
 
 interface PersistedBridgeState {
@@ -208,6 +236,20 @@ export class BridgeStateLockTimeoutError extends Error {
   }
 }
 
+export class DispatchMarkerDurabilityError extends Error {
+  constructor() {
+    super("Dispatch marker durability was not confirmed");
+    this.name = "DispatchMarkerDurabilityError";
+  }
+}
+
+export class TerminalStateDurabilityError extends Error {
+  constructor() {
+    super("Terminal state durability was not confirmed");
+    this.name = "TerminalStateDurabilityError";
+  }
+}
+
 export class LegacyIngressRecoveryUnavailableError extends Error {
   constructor() {
     super("Accepted legacy ingress requires a signed matching redelivery");
@@ -264,6 +306,12 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   // This process may reclaim a visible pre-dispatch claim only when the
   // mutation that created it never completed through lock release.
   private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
+  // A failed release may leave this process's exact owner token visible. Only
+  // that token is eligible for the next mutation to reclaim without process
+  // liveness heuristics; replacement locks remain protected by their token.
+  private readonly strandedOwnedLockTokens = new Map<string, Set<string>>();
+  private readonly locallyUnconfirmedDispatchMarkers = new Set<string>();
+  private readonly locallyUnconfirmedTerminalWrites = new Set<string>();
   private stateDirectoryReady: Promise<void> | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
 
@@ -322,8 +370,8 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       throw new IngressRecoveryEnvelopeError();
     }
 
-    return await this.mutateClaim(async () => {
-      const state = await this.readState();
+    return await this.mutateClaim(async (deadline) => {
+      const state = await this.readState(deadline);
       this.prune(state);
       const existingReceipt = state.receipts[identity.webhookId];
       if (
@@ -372,7 +420,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
             errorClass: "IngressPersistenceError",
           },
         };
-        await this.writeState(state);
+        await this.writeState(state, deadline);
       }
 
       const receipt = state.receipts[identity.webhookId]!;
@@ -398,11 +446,45 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         );
       }
       if (existingReceipt !== undefined && receipt.status !== "received") {
-        return await this.resolveExistingReceipt(state, receipt);
+        return await this.resolveExistingReceipt(state, receipt, deadline);
       }
       const existingClaim = state.claims[identity.executionId];
       const timestamp = this.timestamp();
       if (existingClaim !== undefined) {
+        if (
+          existingClaim.status === "claimed" &&
+          existingClaim.dispatchStartedAt === undefined &&
+          receipt.status === "received" &&
+          !this.locallyAcceptedPreDispatchClaims.has(existingClaim.webhookId)
+        ) {
+          const priorReceipt = state.receipts[existingClaim.webhookId];
+          if (
+            priorReceipt !== undefined &&
+            priorReceipt.webhookId !== receipt.webhookId
+          ) {
+            priorReceipt.status = "superseded";
+            priorReceipt.supersededAt = timestamp;
+            priorReceipt.supersededByWebhookId = receipt.webhookId;
+            priorReceipt.updatedAt = timestamp;
+            clearRecoveryEnvelope(priorReceipt);
+            priorReceipt.outcome = {
+              httpStatus: 200,
+              result: "not_dispatched",
+              disposition: "superseded",
+            };
+          }
+          receipt.status = "claimed";
+          receipt.ownerId = this.ownerId;
+          receipt.claimedAt = timestamp;
+          receipt.updatedAt = timestamp;
+          receipt.outcome = acceptedOutcome();
+          existingClaim.webhookId = receipt.webhookId;
+          existingClaim.ownerId = this.ownerId;
+          existingClaim.claimedAt = timestamp;
+          existingClaim.updatedAt = timestamp;
+          await this.writeState(state, deadline);
+          return { disposition: "claimed", receipt };
+        }
         if (
           existingClaim.status === "claimed" &&
           existingClaim.ownerId !== this.ownerId &&
@@ -435,7 +517,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           existingClaim.claimedAt = timestamp;
           existingClaim.updatedAt = timestamp;
           delete existingClaim.dispatchStartedAt;
-          await this.writeState(state);
+          await this.writeState(state, deadline);
           return { disposition: "claimed", receipt };
         }
 
@@ -455,7 +537,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           receipt.updatedAt = timestamp;
           clearRecoveryEnvelope(receipt);
           receipt.outcome = ambiguousOutcome();
-          await this.writeState(state);
+          await this.writeState(state, deadline);
           return { disposition: "ambiguous", receipt };
         }
 
@@ -470,7 +552,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           disposition: "superseded",
         };
         this.prune(state);
-        await this.writeState(state);
+        await this.writeState(state, deadline);
         return { disposition: "superseded", receipt };
       }
 
@@ -491,7 +573,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         activityIds: {},
       };
       this.prune(state);
-      await this.writeState(state);
+      await this.writeState(state, deadline);
       return { disposition: "claimed", receipt };
     });
   }
@@ -501,10 +583,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   ): Promise<DispatchStartDisposition> {
     validateIdentifier(webhookId, "webhookId");
 
-    return this.mutate(async () => {
-      const state = await this.readState();
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
       if (claim.dispatchStartedAt !== undefined) {
+        if (this.locallyUnconfirmedDispatchMarkers.has(webhookId)) {
+          await this.writeState(state, deadline);
+          this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
+        }
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return "dispatch_started";
       }
@@ -522,7 +608,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           webhookId,
           fence.webhookId,
         );
-        await this.writeState(state);
+        await this.writeState(state, deadline);
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return "superseded";
       }
@@ -539,50 +625,94 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         result: "dispatch_started",
         disposition: "claimed",
       };
-      await this.writeState(state);
+      try {
+        await this.writeState(state, deadline);
+      } catch (error) {
+        try {
+          const visible = await this.readState(deadline);
+          const visibleReceipt = visible.receipts[webhookId];
+          const visibleClaim = visible.claims[receipt.executionId];
+          if (
+            visibleReceipt?.dispatchStartedAt === timestamp &&
+            visibleClaim?.dispatchStartedAt === timestamp &&
+            visibleClaim.webhookId === webhookId
+          ) {
+            this.locallyUnconfirmedDispatchMarkers.add(webhookId);
+            throw new DispatchMarkerDurabilityError();
+          }
+        } catch (verificationError) {
+          if (verificationError instanceof DispatchMarkerDurabilityError) {
+            throw verificationError;
+          }
+        }
+        throw error;
+      }
       this.locallyAcceptedPreDispatchClaims.delete(webhookId);
       return "dispatch_started";
     });
+  }
+
+  async checkDispatchEligibility(
+    webhookId: string,
+  ): Promise<DispatchEligibility> {
+    validateIdentifier(webhookId, "webhookId");
+    const state = await this.readState();
+    const { receipt } = this.ownedActiveClaim(state, webhookId);
+    const fence = state.recoveryStopFences?.[receipt.linearSessionId];
+    if (fence === undefined) {
+      return "eligible";
+    }
+    if (!isValidRecoveryStopFence(fence)) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    return fence.executionId !== receipt.executionId &&
+      this.receiptIsAtOrBeforeFence(receipt, fence)
+      ? "superseded"
+      : "eligible";
   }
 
   releasePreDispatchClaim(webhookId: string): Promise<boolean> {
     validateIdentifier(webhookId, "webhookId");
     this.locallyAcceptedPreDispatchClaims.delete(webhookId);
 
-    return this.mutate(async () => {
-      const state = await this.readState();
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
       if (claim.dispatchStartedAt !== undefined) {
         return false;
       }
 
       const timestamp = this.timestamp();
-      delete state.claims[claim.executionId];
       receipt.status = "received";
       receipt.updatedAt = timestamp;
       delete receipt.ownerId;
       delete receipt.claimedAt;
       delete receipt.dispatchStartedAt;
+      claim.updatedAt = timestamp;
       receipt.outcome = {
         httpStatus: 503,
         result: "retry",
         disposition: "received",
         errorClass: "IngressPersistenceError",
       };
-      await this.writeState(state);
+      await this.writeState(state, deadline);
       return true;
     });
   }
 
   completeEvent(webhookId: string): Promise<void> {
-    return this.terminalize(webhookId, "completed");
+    return this.terminalize(webhookId, "completed", undefined, true);
+  }
+
+  completeEventWithoutRuntime(webhookId: string): Promise<void> {
+    return this.terminalize(webhookId, "completed", undefined, false);
   }
 
   failEvent(
     webhookId: string,
     errorClass: ReceiptErrorClass = "WebhookProcessingError",
   ): Promise<void> {
-    return this.terminalize(webhookId, "failed", errorClass);
+    return this.terminalize(webhookId, "failed", errorClass, true);
   }
 
   async getReceipt(webhookId: string): Promise<IngressReceipt | undefined> {
@@ -718,7 +848,49 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (this.recoveryKeyring === undefined) {
       throw new IngressRecoveryEnvelopeError();
     }
-    const activeRecoveryCount = activeRecoverableReceipts(state).length;
+    let activeRecoveryCount = activeRecoverableReceipts(state).length;
+    if (
+      admittingNewEvent &&
+      activeRecoveryCount >= this.maxRecoverableEvents &&
+      payload.action === "prompted" &&
+      payload.stop
+    ) {
+      const reclaimable = activeRecoverableReceipts(state)
+        .filter(
+          (receipt) =>
+            receipt.linearSessionId === identity.linearSessionId &&
+            receipt.executionId !== identity.executionId &&
+            receipt.dispatchStartedAt === undefined,
+        )
+        .sort(
+          (left, right) =>
+            (left.recoverySequence ?? Number.MAX_SAFE_INTEGER) -
+            (right.recoverySequence ?? Number.MAX_SAFE_INTEGER),
+        );
+      while (
+        activeRecoveryCount >= this.maxRecoverableEvents &&
+        reclaimable.length > 0
+      ) {
+        const receipt = reclaimable.shift()!;
+        const timestamp = this.timestamp();
+        receipt.status = "superseded";
+        receipt.supersededAt = timestamp;
+        receipt.supersededByWebhookId = identity.webhookId;
+        receipt.updatedAt = timestamp;
+        clearRecoveryEnvelope(receipt);
+        receipt.outcome = {
+          httpStatus: 200,
+          result: "not_dispatched",
+          disposition: "superseded",
+        };
+        const claim = state.claims[receipt.executionId];
+        if (claim?.webhookId === receipt.webhookId) {
+          claim.status = "completed";
+          claim.updatedAt = timestamp;
+        }
+        activeRecoveryCount -= 1;
+      }
+    }
     if (
       (admittingNewEvent && activeRecoveryCount >= this.maxRecoverableEvents) ||
       (!admittingNewEvent && activeRecoveryCount > this.maxRecoverableEvents)
@@ -839,21 +1011,26 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   getOrCreateActivityId(
     executionId: string,
     activityKey: string,
+    signal?: AbortSignal,
   ): Promise<string> {
     validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
     validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
 
-    return this.mutate(async () => {
-      const state = await this.readState();
+    try {
+      throwIfAborted(signal);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.mutate(async (deadline) => {
+      throwIfAborted(signal);
+      const state = await this.readState(deadline);
+      throwIfAborted(signal);
       const claim = state.claims[executionId];
       if (claim === undefined) {
         throw new Error(`No ingress claim for executionId "${executionId}"`);
       }
       if (claim.ownerId !== this.ownerId) {
         throw new ClaimOwnershipError(claim.webhookId);
-      }
-      if (claim.dispatchStartedAt === undefined) {
-        throw new Error(`Dispatch has not started for executionId "${executionId}"`);
       }
       const existing = claim.activityIds[activityKey];
       if (existing !== undefined) {
@@ -868,8 +1045,134 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       const activityId = randomUUID();
       claim.activityIds[activityKey] = activityId;
       claim.updatedAt = this.timestamp();
-      await this.writeState(state);
+      throwIfAborted(signal);
+      await this.writeState(state, deadline);
       return activityId;
+    });
+  }
+
+  prepareActivity(
+    executionId: string,
+    activityKey: string,
+    agentSessionId: string,
+    contentDigest: string,
+  ): Promise<ActivityOutboxEntry> {
+    validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
+    validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
+    validateIdentifier(agentSessionId, "agentSessionId");
+    if (!/^[a-f0-9]{64}$/.test(contentDigest)) {
+      throw new Error("contentDigest must be a lowercase SHA-256 digest");
+    }
+
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
+      const claim = state.claims[executionId];
+      if (claim === undefined || claim.status !== "claimed") {
+        throw new Error(`No active ingress claim for executionId "${executionId}"`);
+      }
+      if (claim.ownerId !== this.ownerId) {
+        throw new ClaimOwnershipError(claim.webhookId);
+      }
+      const outbox = (claim.activityOutbox ??= {});
+      const existing = outbox[activityKey];
+      if (existing !== undefined) {
+        if (
+          existing.agentSessionId !== agentSessionId ||
+          existing.contentDigest !== contentDigest
+        ) {
+          throw new Error(
+            `Activity binding changed for executionId "${executionId}"`,
+          );
+        }
+        return { ...existing };
+      }
+      if (Object.keys(claim.activityIds).length >= MAX_ACTIVITY_IDS_PER_CLAIM) {
+        throw new Error(
+          `Too many outbound activity ids for executionId "${executionId}"`,
+        );
+      }
+      const activityId = claim.activityIds[activityKey] ?? randomUUID();
+      claim.activityIds[activityKey] = activityId;
+      const entry: ActivityOutboxEntry = {
+        activityId,
+        agentSessionId,
+        contentDigest,
+        attempts: 0,
+        status: "pending",
+        updatedAt: this.timestamp(),
+      };
+      outbox[activityKey] = entry;
+      claim.updatedAt = entry.updatedAt;
+      await this.writeState(state, deadline);
+      return { ...entry };
+    });
+  }
+
+  markActivityDelivered(
+    executionId: string,
+    activityKey: string,
+  ): Promise<void> {
+    validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
+    validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
+      const claim = state.claims[executionId];
+      if (
+        claim === undefined ||
+        claim.status !== "claimed" ||
+        claim.ownerId !== this.ownerId
+      ) {
+        throw new ClaimOwnershipError(claim?.webhookId ?? executionId);
+      }
+      const entry = claim.activityOutbox?.[activityKey];
+      if (entry === undefined) {
+        throw new Error(
+          `No pending activity for executionId "${executionId}"`,
+        );
+      }
+      if (entry.status === "delivered") {
+        return;
+      }
+      entry.status = "delivered";
+      entry.updatedAt = this.timestamp();
+      claim.updatedAt = entry.updatedAt;
+      await this.writeState(state, deadline);
+    });
+  }
+
+  markActivityAttempted(
+    executionId: string,
+    activityKey: string,
+  ): Promise<ActivityOutboxEntry> {
+    validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
+    validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
+      const claim = state.claims[executionId];
+      if (
+        claim === undefined ||
+        claim.status !== "claimed" ||
+        claim.ownerId !== this.ownerId
+      ) {
+        throw new ClaimOwnershipError(claim?.webhookId ?? executionId);
+      }
+      const entry = claim.activityOutbox?.[activityKey];
+      if (entry === undefined) {
+        throw new Error(
+          `No pending activity for executionId "${executionId}"`,
+        );
+      }
+      if (entry.status === "delivered") {
+        return { ...entry };
+      }
+      if (!Number.isSafeInteger(entry.attempts) || entry.attempts < 0) {
+        throw new Error("Invalid activity outbox attempt count");
+      }
+      entry.attempts += 1;
+      entry.updatedAt = this.timestamp();
+      claim.updatedAt = entry.updatedAt;
+      await this.writeState(state, deadline);
+      return { ...entry };
     });
   }
 
@@ -877,14 +1180,29 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     webhookId: string,
     status: "completed" | "failed",
     errorClass?: ReceiptErrorClass,
+    requireRuntimeIntent = true,
   ): Promise<void> {
     validateIdentifier(webhookId, "webhookId");
 
-    return this.mutate(async () => {
-      const state = await this.readState();
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
+      const currentReceipt = state.receipts[webhookId];
+      if (
+        currentReceipt?.status === status &&
+        state.claims[currentReceipt.executionId]?.status === status
+      ) {
+        if (this.locallyUnconfirmedTerminalWrites.has(webhookId)) {
+          await this.writeState(state, deadline);
+          this.locallyUnconfirmedTerminalWrites.delete(webhookId);
+        }
+        return;
+      }
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
-      if (claim.dispatchStartedAt === undefined) {
+      if (requireRuntimeIntent && claim.dispatchStartedAt === undefined) {
         throw new Error(`Dispatch has not started for webhookId "${webhookId}"`);
+      }
+      if (!requireRuntimeIntent && claim.dispatchStartedAt !== undefined) {
+        throw new Error(`Dispatch already started for webhookId "${webhookId}"`);
       }
 
       const timestamp = this.timestamp();
@@ -892,6 +1210,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       receipt.updatedAt = timestamp;
       claim.status = status;
       claim.updatedAt = timestamp;
+      clearRecoveryEnvelope(receipt);
       if (status === "completed") {
         receipt.completedAt = timestamp;
         delete receipt.failedAt;
@@ -911,7 +1230,32 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         };
       }
       this.prune(state);
-      await this.writeState(state);
+      try {
+        await this.writeState(state, deadline);
+      } catch (error) {
+        try {
+          const visible = await this.readState(deadline);
+          const visibleReceipt = visible.receipts[webhookId];
+          const visibleClaim = visible.claims[receipt.executionId];
+          const terminalTimestamp =
+            status === "completed"
+              ? visibleReceipt?.completedAt
+              : visibleReceipt?.failedAt;
+          if (
+            visibleReceipt?.status === status &&
+            visibleClaim?.status === status &&
+            terminalTimestamp === timestamp
+          ) {
+            this.locallyUnconfirmedTerminalWrites.add(webhookId);
+            throw new TerminalStateDurabilityError();
+          }
+        } catch (verificationError) {
+          if (verificationError instanceof TerminalStateDurabilityError) {
+            throw verificationError;
+          }
+        }
+        throw error;
+      }
     });
   }
 
@@ -942,6 +1286,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   private async resolveExistingReceipt(
     state: PersistedBridgeState,
     receipt: IngressReceipt,
+    deadline: number,
   ): Promise<ClaimEventResult> {
     const claim = state.claims[receipt.executionId];
     const timestamp = this.timestamp();
@@ -959,13 +1304,13 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           receipt.claimedAt = timestamp;
           receipt.updatedAt = timestamp;
           receipt.outcome = acceptedOutcome();
-          await this.writeState(state);
+          await this.writeState(state, deadline);
           return { disposition: "claimed", receipt };
         }
 
         receipt.updatedAt = timestamp;
         receipt.outcome = ambiguousOutcome();
-        await this.writeState(state);
+        await this.writeState(state, deadline);
         return { disposition: "ambiguous", receipt };
       }
 
@@ -978,7 +1323,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         receipt.claimedAt = timestamp;
         receipt.updatedAt = timestamp;
         receipt.outcome = acceptedOutcome();
-        await this.writeState(state);
+        await this.writeState(state, deadline);
         return { disposition: "claimed", receipt };
       }
 
@@ -988,7 +1333,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         result: "not_dispatched",
         disposition: "duplicate",
       };
-      await this.writeState(state);
+      await this.writeState(state, deadline);
       return { disposition: "duplicate", receipt };
     }
 
@@ -1001,7 +1346,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       result: "not_dispatched",
       disposition: receipt.status === "superseded" ? "superseded" : "duplicate",
     };
-    await this.writeState(state);
+    await this.writeState(state, deadline);
     return {
       disposition: receipt.status === "superseded" ? "superseded" : "duplicate",
       receipt,
@@ -1029,7 +1374,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   }
 
   private mutateClaim(
-    operation: () => Promise<ClaimEventResult>,
+    operation: (deadline: number) => Promise<ClaimEventResult>,
   ): Promise<ClaimEventResult> {
     return this.mutate(operation, (result) => {
       if (result.disposition === "claimed") {
@@ -1039,7 +1384,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   }
 
   private mutate<T>(
-    operation: () => Promise<T>,
+    operation: (deadline: number) => Promise<T>,
     onSuccess?: (result: T) => void,
   ): Promise<T> {
     const deadline = Date.now() + this.lockTimeoutMs;
@@ -1053,7 +1398,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       if (timeout !== undefined) {
         clearTimeout(timeout);
       }
-      return this.withFileLock(operation, deadline).then((result) => {
+      return this.withFileLock(() => operation(deadline), deadline).then((result) => {
         onSuccess?.(result);
         return result;
       });
@@ -1086,7 +1431,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     const lockToken = randomUUID();
     const candidatePath = `${lockPath}.${lockToken}.candidate`;
     const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
-    await fs.mkdir(candidatePath, { mode: 0o700 });
+    await resolveBeforeLockDeadline(
+      fs.mkdir(candidatePath, { mode: 0o700 }),
+      deadline,
+    );
     let acquired = false;
     try {
       await this.writeLockOwner(candidateOwnerPath, lockToken, deadline);
@@ -1095,7 +1443,17 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           throw new BridgeStateLockTimeoutError();
         }
         try {
-          await fs.rename(candidatePath, lockPath);
+          const rename = fs.rename(candidatePath, lockPath);
+          try {
+            await resolveBeforeLockDeadline(rename, deadline);
+          } catch (error) {
+            if (error instanceof BridgeStateLockTimeoutError) {
+              void rename
+                .then(() => this.releaseOwnedLock(lockPath, lockToken))
+                .catch(() => undefined);
+            }
+            throw error;
+          }
           acquired = true;
           if (Date.now() >= deadline) {
             throw new BridgeStateLockTimeoutError();
@@ -1111,16 +1469,36 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           if (Date.now() >= deadline) {
             throw new BridgeStateLockTimeoutError();
           }
-          await delay(this.lockRetryMs);
+          await resolveBeforeLockDeadline(
+            delay(Math.min(this.lockRetryMs, Math.max(1, deadline - Date.now()))),
+            deadline,
+          );
         }
       }
 
-      return await operation();
+      return await resolveBeforeLockDeadline(operation(), deadline);
     } finally {
       if (acquired) {
-        await this.releaseOwnedLock(lockPath, lockToken);
+        const release = this.releaseOwnedLock(lockPath, lockToken);
+        try {
+          await resolveBeforeLockDeadline(release, deadline);
+        } catch (error) {
+          this.rememberStrandedOwnedLock(lockPath, lockToken);
+          void release
+            .then(() => this.forgetStrandedOwnedLock(lockPath, lockToken))
+            .catch(() => undefined);
+          throw error;
+        }
       }
-      await fs.rm(candidatePath, { recursive: true, force: true });
+      const cleanup = fs.rm(candidatePath, { recursive: true, force: true });
+      try {
+        await resolveBeforeLockDeadline(cleanup, deadline);
+      } catch (error) {
+        void cleanup.catch(() => undefined);
+        if (!(error instanceof BridgeStateLockTimeoutError)) {
+          throw error;
+        }
+      }
     }
   }
 
@@ -1158,7 +1536,31 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     token: string,
     deadline: number,
   ): Promise<void> {
-    const handle = await fs.open(ownerPath, "wx", 0o600);
+    const open = fs.open(ownerPath, "wx", 0o600);
+    let handle: Awaited<ReturnType<typeof fs.open>>;
+    try {
+      handle = await resolveBeforeLockDeadline(open, deadline);
+    } catch (error) {
+      void open.then((lateHandle) => lateHandle.close()).catch(() => undefined);
+      throw error;
+    }
+    let closeDeferred = false;
+    const run = async (operation: Promise<unknown>): Promise<void> => {
+      try {
+        await resolveBeforeLockDeadline(operation, deadline);
+      } catch (error) {
+        if (error instanceof BridgeStateLockTimeoutError) {
+          closeDeferred = true;
+          void operation
+            .then(
+              () => handle.close(),
+              () => handle.close(),
+            )
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+    };
     try {
       const processIdentity = await this.resolveLockProcessIdentity(
         process.pid,
@@ -1182,11 +1584,13 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         processIdentity,
         uid,
       };
-      await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
-      await handle.chmod(0o600);
-      await handle.sync();
+      await run(handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8"));
+      await run(handle.chmod(0o600));
+      await run(handle.sync());
     } finally {
-      await handle.close();
+      if (!closeDeferred) {
+        await resolveBeforeLockDeadline(handle.close(), deadline);
+      }
     }
   }
 
@@ -1242,6 +1646,16 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       !Number.isSafeInteger(owner.pid) ||
       owner.pid <= 0
     ) {
+      return;
+    }
+
+    if (this.strandedOwnedLockTokens.get(lockPath)?.has(owner.token) === true) {
+      assertBeforeLockDeadline(deadline);
+      await resolveBeforeLockDeadline(
+        this.removeLockDirectoryOwnedBy(lockPath, owner.token),
+        deadline,
+      );
+      this.forgetStrandedOwnedLock(lockPath, owner.token);
       return;
     }
 
@@ -1407,7 +1821,30 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   }
 
   private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
-    await this.removeLockDirectoryOwnedBy(lockPath, token);
+    try {
+      await this.removeLockDirectoryOwnedBy(lockPath, token);
+      this.forgetStrandedOwnedLock(lockPath, token);
+    } catch (error) {
+      this.rememberStrandedOwnedLock(lockPath, token);
+      throw error;
+    }
+  }
+
+  private rememberStrandedOwnedLock(lockPath: string, token: string): void {
+    let tokens = this.strandedOwnedLockTokens.get(lockPath);
+    if (tokens === undefined) {
+      tokens = new Set<string>();
+      this.strandedOwnedLockTokens.set(lockPath, tokens);
+    }
+    tokens.add(token);
+  }
+
+  private forgetStrandedOwnedLock(lockPath: string, token: string): void {
+    const tokens = this.strandedOwnedLockTokens.get(lockPath);
+    tokens?.delete(token);
+    if (tokens?.size === 0) {
+      this.strandedOwnedLockTokens.delete(lockPath);
+    }
   }
 
   private async removeLockDirectoryOwnedBy(
@@ -1433,10 +1870,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
   }
 
-  private async readState(): Promise<PersistedBridgeState> {
+  private async readState(deadline?: number): Promise<PersistedBridgeState> {
     let raw: string;
     try {
-      raw = await fs.readFile(this.statePath, "utf8");
+      const read = fs.readFile(this.statePath, "utf8");
+      raw =
+        deadline === undefined
+          ? await read
+          : await resolveBeforeLockDeadline(read, deadline);
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
         return emptyState();
@@ -1458,36 +1899,111 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     return parsed;
   }
 
-  private async writeState(state: PersistedBridgeState): Promise<void> {
+  private async writeState(
+    state: PersistedBridgeState,
+    deadline: number,
+  ): Promise<void> {
     const directory = path.dirname(this.statePath);
     const tmpPath = path.join(
       directory,
       `.${path.basename(this.statePath)}.${randomUUID()}.tmp`,
     );
     let tmpHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let closeDeferred = false;
+    const runHandleOperation = async (
+      operation: Promise<unknown>,
+    ): Promise<void> => {
+      try {
+        await resolveBeforeLockDeadline(operation, deadline);
+      } catch (error) {
+        if (
+          error instanceof BridgeStateLockTimeoutError &&
+          tmpHandle !== undefined
+        ) {
+          const handle = tmpHandle;
+          closeDeferred = true;
+          void operation
+            .then(
+              () => handle.close(),
+              () => handle.close(),
+            )
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+    };
 
     try {
-      tmpHandle = await fs.open(tmpPath, "wx", 0o600);
-      await tmpHandle.writeFile(JSON.stringify(state, null, 2), "utf8");
-      await tmpHandle.chmod(0o600);
-      await tmpHandle.sync();
-      await tmpHandle.close();
+      const open = fs.open(tmpPath, "wx", 0o600);
+      try {
+        tmpHandle = await resolveBeforeLockDeadline(open, deadline);
+      } catch (error) {
+        void open.then((lateHandle) => lateHandle.close()).catch(() => undefined);
+        throw error;
+      }
+      await runHandleOperation(
+        tmpHandle.writeFile(JSON.stringify(state, null, 2), "utf8"),
+      );
+      await runHandleOperation(tmpHandle.chmod(0o600));
+      await runHandleOperation(tmpHandle.sync());
+      await resolveBeforeLockDeadline(tmpHandle.close(), deadline);
       tmpHandle = undefined;
 
-      await fs.rename(tmpPath, this.statePath);
-      const directoryHandle = await fs.open(directory, "r");
+      await resolveBeforeLockDeadline(fs.rename(tmpPath, this.statePath), deadline);
+      const directoryOpen = fs.open(directory, "r");
+      let directoryHandle: Awaited<ReturnType<typeof fs.open>>;
       try {
-        await directoryHandle.sync();
+        directoryHandle = await resolveBeforeLockDeadline(
+          directoryOpen,
+          deadline,
+        );
+      } catch (error) {
+        void directoryOpen
+          .then((lateHandle) => lateHandle.close())
+          .catch(() => undefined);
+        throw error;
+      }
+      let directoryCloseDeferred = false;
+      try {
+        const sync = directoryHandle.sync();
+        try {
+          await resolveBeforeLockDeadline(sync, deadline);
+        } catch (error) {
+          if (error instanceof BridgeStateLockTimeoutError) {
+            directoryCloseDeferred = true;
+            void sync
+              .then(
+                () => directoryHandle.close(),
+                () => directoryHandle.close(),
+              )
+              .catch(() => undefined);
+          }
+          throw error;
+        }
       } finally {
-        await directoryHandle.close();
+        if (!directoryCloseDeferred) {
+          await resolveBeforeLockDeadline(directoryHandle.close(), deadline);
+        }
       }
     } finally {
-      await tmpHandle?.close().catch(() => undefined);
-      await fs.unlink(tmpPath).catch((error: unknown) => {
+      if (tmpHandle !== undefined && !closeDeferred) {
+        await resolveBeforeLockDeadline(tmpHandle.close(), deadline).catch(
+          () => undefined,
+        );
+      }
+      const cleanup = fs.unlink(tmpPath).catch((error: unknown) => {
         if (!isNodeError(error, "ENOENT")) {
           throw error;
         }
       });
+      try {
+        await resolveBeforeLockDeadline(cleanup, deadline);
+      } catch (error) {
+        void cleanup.catch(() => undefined);
+        if (!(error instanceof BridgeStateLockTimeoutError)) {
+          throw error;
+        }
+      }
     }
   }
 
@@ -2062,6 +2578,12 @@ async function syncDirectoryBeforeLockDeadline(
 function assertBeforeLockDeadline(deadline: number): void {
   if (Date.now() >= deadline) {
     throw new BridgeStateLockTimeoutError();
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw signal.reason;
   }
 }
 
