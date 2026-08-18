@@ -3,7 +3,10 @@ import { promises as fsPromises } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { LinearAgentClient } from "../src/linear/client.js";
+import {
+  LinearActivityError,
+  LinearAgentClient,
+} from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
 import { verifyWebhook } from "../src/linear/webhook-verify.js";
 import type { AgentActivityContent } from "../src/types.js";
@@ -23,6 +26,25 @@ function jsonResponse(
     json: async () => body,
     text: async () => JSON.stringify(body),
   } as unknown as Response;
+}
+
+function observableFailureResponse(
+  status: number,
+  statusText: string,
+  secretBody: string,
+  onCancel: () => void,
+): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(secretBody));
+      },
+      cancel() {
+        onCancel();
+      },
+    }),
+    { status, statusText },
+  );
 }
 
 describe("LinearAgentClient.createActivity", () => {
@@ -62,12 +84,17 @@ describe("LinearAgentClient.createActivity", () => {
   it("refreshes an expired OAuth token, persists the rotated pair, and retries once", async () => {
     const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
     const tokenStorePath = path.join(tmpDir, "tokens.json");
+    let unauthorizedCanceled = false;
     const fetchFn = vi
       .fn()
       .mockResolvedValueOnce(
-        jsonResponse(
-          { errors: [{ message: "Authentication required" }] },
-          { ok: false, status: 401, statusText: "Unauthorized" },
+        observableFailureResponse(
+          401,
+          "Unauthorized",
+          "raw-expired-auth-secret",
+          () => {
+            unauthorizedCanceled = true;
+          },
         ),
       )
       .mockResolvedValueOnce(
@@ -98,6 +125,7 @@ describe("LinearAgentClient.createActivity", () => {
       await client.createActivity("session-refresh", { type: "thought", body: "hello" });
 
       expect(fetchFn).toHaveBeenCalledTimes(3);
+      expect(unauthorizedCanceled).toBe(true);
       expect(fetchFn.mock.calls[0]?.[0]).toBe(GRAPHQL_URL);
       expect(fetchFn.mock.calls[1]?.[0]).toBe("https://api.linear.app/oauth/token");
       const refreshParams = new URLSearchParams(
@@ -112,6 +140,58 @@ describe("LinearAgentClient.createActivity", () => {
         accessToken: "fresh-access",
         refreshToken: "fresh-refresh",
       });
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels every failed OAuth refresh body during repeated rate limits and outages", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const canceled: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        observableFailureResponse(
+          429,
+          "Too Many Requests",
+          "raw-refresh-rate-limit-secret",
+          () => canceled.push(429),
+        ),
+      )
+      .mockResolvedValueOnce(
+        observableFailureResponse(
+          502,
+          "Bad Gateway",
+          "raw-refresh-outage-secret",
+          () => canceled.push(502),
+        ),
+      );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "expired-access",
+      storePath: path.join(tmpDir, "tokens.json"),
+      fetchFn,
+    });
+
+    try {
+      await oauth.install({
+        access_token: "expired-access",
+        refresh_token: "initial-refresh",
+        expires_in: 0,
+      });
+      for (const status of [429, 502]) {
+        const error = await oauth
+          .refreshAfterUnauthorized("expired-access")
+          .catch((caught: unknown) => caught);
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).toContain(
+          `Linear OAuth token refresh failed: ${status}`,
+        );
+        expect(String(error)).not.toContain("raw-refresh-rate-limit-secret");
+        expect(String(error)).not.toContain("raw-refresh-outage-secret");
+      }
+      expect(canceled).toEqual([429, 502]);
     } finally {
       await fsPromises.rm(tmpDir, { recursive: true, force: true });
     }
@@ -257,6 +337,40 @@ describe("LinearAgentClient.createActivity", () => {
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).toContain("500");
     expect(String(error)).not.toContain("raw-linear-response-body");
+  });
+
+  it("cancels every failed HTTP body during repeated rate limits and outages", async () => {
+    const canceled: number[] = [];
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        observableFailureResponse(
+          429,
+          "Too Many Requests",
+          "raw-rate-limit-secret",
+          () => canceled.push(429),
+        ),
+      )
+      .mockResolvedValueOnce(
+        observableFailureResponse(
+          503,
+          "Service Unavailable",
+          "raw-outage-secret",
+          () => canceled.push(503),
+        ),
+      );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    for (const status of [429, 503]) {
+      const error = await client
+        .createActivity(`session-${status}`, { type: "thought", body: "x" })
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(LinearActivityError);
+      expect(String(error)).toContain(String(status));
+      expect(String(error)).not.toContain("raw-rate-limit-secret");
+      expect(String(error)).not.toContain("raw-outage-secret");
+    }
+    expect(canceled).toEqual([429, 503]);
   });
 
   it("does not echo GraphQL response error text", async () => {

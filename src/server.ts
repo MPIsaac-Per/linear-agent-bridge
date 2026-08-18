@@ -13,6 +13,7 @@ import {
   verifyWebhookSignature,
 } from "./linear/webhook-verify.js";
 import {
+  discardResponseBody,
   LinearActivityError,
   type LinearAgentClient,
   type FetchFn,
@@ -910,6 +911,7 @@ async function handleOAuthCallback(
     });
 
     if (!response.ok) {
+      await discardResponseBody(response);
       throw new Error(
         `Linear OAuth token exchange failed: ${response.status} ${response.statusText}`,
       );

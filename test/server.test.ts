@@ -74,6 +74,25 @@ function jsonResponse(
   } as unknown as Response;
 }
 
+function observableFailureResponse(
+  status: number,
+  statusText: string,
+  secretBody: string,
+  onCancel: () => void,
+): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(secretBody));
+      },
+      cancel() {
+        onCancel();
+      },
+    }),
+    { status, statusText },
+  );
+}
+
 interface LinearCall {
   agentSessionId: string;
   content: AgentActivityContent;
@@ -2028,6 +2047,47 @@ describe("startServer", () => {
       });
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it("oauth callback: cancels a failed token response without exposing its body", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    let bodyCanceled = false;
+    activeHarness = await startTestServer(runtime, {
+      tokenFetchImpl: (async () =>
+        observableFailureResponse(
+          503,
+          "Service Unavailable",
+          "raw-token-exchange-secret",
+          () => {
+            bodyCanceled = true;
+          },
+        )) as FetchFn,
+    });
+    const harness = activeHarness;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const state = new URL(await harness.authorizationUrl).searchParams.get(
+        "state",
+      );
+      const response = await fetch(
+        serverUrl(
+          harness.port,
+          `/oauth/callback?code=auth-code-failure&state=${state}`,
+        ),
+      );
+
+      expect(response.status).toBe(500);
+      expect(await response.text()).toBe("OAuth token exchange failed");
+      expect(bodyCanceled).toBe(true);
+      const logged = errorSpy.mock.calls.flat().join("\n");
+      expect(logged).toContain("error=UnknownError");
+      expect(logged).not.toContain("raw-token-exchange-secret");
+    } finally {
+      errorSpy.mockRestore();
     }
   });
 

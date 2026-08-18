@@ -35,6 +35,15 @@ export class LinearActivityError extends Error {
 /** Signature-compatible subset of the global `fetch` used for injection. */
 export type FetchFn = typeof fetch;
 
+/** Release an unused HTTP response without decoding or exposing its body. */
+export async function discardResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Preserve the caller's bounded HTTP error when cleanup itself fails.
+  }
+}
+
 /**
  * Thin Linear GraphQL client for the Agent Interaction API.
  * Emits agent activities via the `agentActivityCreate` mutation:
@@ -72,6 +81,7 @@ export class LinearAgentClient {
     );
 
     if (response.status === 401 && typeof this.tokenSource !== "string") {
+      await discardResponseBody(response);
       const refreshedAccessToken =
         await this.tokenSource.refreshAfterUnauthorized(accessToken);
       response = await this.postActivity(
@@ -83,6 +93,7 @@ export class LinearAgentClient {
     }
 
     if (!response.ok) {
+      await discardResponseBody(response);
       throw new LinearActivityError(
         `Linear agentActivityCreate failed: ${response.status} ${response.statusText}`,
       );
