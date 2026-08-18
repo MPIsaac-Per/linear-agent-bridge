@@ -29,7 +29,8 @@ Linear (mention / delegate / follow-up prompt)
 Session mapping (Linear session id -> SDK session id), bounded webhook state,
 and Linear's rotating OAuth token pair persist in JSON files. Follow-up prompts
 resume the same conversation, webhook retries do not dispatch the same turn
-twice, and access refreshes without another browser authorization.
+twice, accepted work survives a process exit before dispatch, and access
+refreshes without another browser authorization.
 
 For each valid agent event, the bridge durably persists a receipt keyed by
 Linear's `webhookId` and a semantic execution claim before returning 200.
@@ -38,11 +39,18 @@ prompted turns use `agentActivity.id`. A claim left active by a process crash is
 reclaimed by a replacement process only when dispatch never started. The bridge
 persists a dispatch marker as the first processing step; a retry after that
 marker is explicitly recorded as ambiguous and is not run automatically.
-If persisting that marker fails before it is written, the bridge releases the
-pre-dispatch claim so a later delivery can reclaim it without a restart.
-Terminal state is retained for seven days and capped at 10,000 receipts; active
-claims are never evicted. State can exceed the cap only if more than 10,000
-claims are simultaneously active.
+Before acknowledging a new turn, the bridge stores its recovery payload in an
+AES-256-GCM envelope. Startup processes marker-free accepted turns in durable
+order before reporting healthy. If persisting the dispatch marker fails before
+it is written, the bridge releases the pre-dispatch claim and schedules the
+same recovery path without requiring another Linear delivery. The envelope is
+deleted atomically with the dispatch marker; terminal and superseded receipts
+do not retain it.
+Marker-free accepted events are hard-capped at 128; new ingress fails closed
+with 503 when that recovery capacity is full. Separately, terminal state is
+retained for seven days and capped at 10,000 receipts. Active claims are never
+evicted, so the receipt store can exceed 10,000 only when active claims alone
+exceed that limit.
 
 In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
@@ -78,12 +86,22 @@ Linear Settings -> API -> Applications -> new application:
 ### 2. Configure and run
 
 ```bash
-npm install && cp .env.example .env
+umask 077
+npm install
+cp .env.example .env
+chmod 600 .env
+node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))'
 # fill LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET, LINEAR_WEBHOOK_SECRET
 # set LINEAR_ACCESS_TOKEN=pending (placeholder until step 3)
+# paste the generated value into INGRESS_RECOVERY_KEY
 # set KB_PATH to the directory whose context the agent should carry
 npm run dev
 ```
+
+`INGRESS_RECOVERY_KEY` is required and must be canonical, unpadded base64url
+for exactly 32 random bytes. Keep `.env` out of version control. The macOS
+installer repairs its mode to `0600` and refuses a symlink or a file owned by
+another user.
 
 The `dev`, `test`, `build`, and `start` scripts build the macOS helper when its
 source, target architecture, or compile flags change. The native step is
@@ -109,23 +127,63 @@ store on persistent local storage. Its file mode is `0600`, and `data/` is
 excluded from Git.
 
 `BRIDGE_STATE_STORE_PATH` defaults to `data/bridge-state.json`. Keep it on
-persistent local storage as well. It contains only bounded identifiers, status
+persistent local storage as well. It contains bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
-and caller-generated activity UUIDs, never prompt or activity bodies. Writes
-set an owner-only mode and sync the temporary file before a same-directory
-atomic rename, then sync the containing directory. A process-owned lock bounds
-contention to one second so the webhook can still return 503 before Linear's
-five-second deadline. An old lock is retained while its recorded local process
-is alive. Lock ownership includes a boot-scoped process birth identity, so a
-recycled PID cannot preserve or steal an old lock. Linux combines the kernel
-boot ID with `/proc/<pid>/stat` start ticks. macOS combines the boot-session
-UUID with the microsecond process start time returned by a locally compiled
-libproc helper at `dist/native/process_identity`. The helper receives only a
-numeric PID, emits only `seconds:microseconds`, and runs within the same
-one-second lock budget. On the same boot, the recorded numeric user ID is
-checked before process birth so an inaccessible PID recycled across users can
-be reclaimed safely. An exited process's lock can be reclaimed without allowing
-the prior owner to unlink a replacement lock.
+caller-generated activity UUIDs, and recovery ciphertext for accepted turns
+whose dispatch marker is absent. Plaintext recovery routing metadata includes
+the action, session/webhook/execution IDs, recovery sequence, event timestamp,
+envelope `keyId`, and stop-fence provenance. Prompt, issue, and comment text,
+the raw signal, and the stop/body semantics remain inside the encrypted
+envelope until the dispatch marker is committed. Ciphertext length still
+reveals an approximate prompt length, so protect the state file and its backups
+as sensitive data.
+
+AES-256-GCM authenticates each encrypted payload against its routing identity,
+sequence, and `keyId`. It does not authenticate the state file as a whole.
+Owner-only file permissions and host integrity remain part of the trust
+boundary. Writes sync an owner-only temporary file before a same-directory
+atomic rename, then sync the containing directory.
+
+A process-owned lock bounds contention to one second so the webhook can still
+return 503 before Linear's five-second deadline. An old lock is retained while
+its recorded local process is alive. Lock ownership includes a boot-scoped
+process birth identity, so a recycled PID cannot preserve or steal an old
+lock. Linux combines the kernel boot ID with `/proc/<pid>/stat` start ticks.
+macOS combines the boot-session UUID with the microsecond process start time
+returned by a locally compiled libproc helper at
+`dist/native/process_identity`. The helper receives only a numeric PID, emits
+only `seconds:microseconds`, and runs within the same one-second lock budget.
+On the same boot, the recorded numeric user ID is checked before process birth
+so an inaccessible PID recycled across users can be reclaimed safely. An
+exited process's lock can be reclaimed without allowing the prior owner to
+unlink a replacement lock.
+
+#### Rotate the ingress recovery key
+
+Generate a replacement with the same command used during setup. Edit `.env`
+so the new key is `INGRESS_RECOVERY_KEY` and the former primary is the first
+entry in `INGRESS_RECOVERY_PREVIOUS_KEYS`. Retain any older reader keys after
+it, separated by commas with no spaces; at most four previous keys are allowed.
+Then run:
+
+```bash
+chmod 600 .env
+./deploy/install.sh
+```
+
+The restart loads the new writer and all retained readers before accepting
+webhooks. Envelopes normally disappear when the dispatch marker is committed.
+The following conservative check prints `0` when no envelope needs any
+previous key. Substitute your configured state path if it differs:
+
+```bash
+node -e 'const s=require("./data/bridge-state.json"); console.log(Object.values(s.receipts??{}).filter(r=>r.recoveryEnvelope).length)'
+```
+
+Remove retired keys from `INGRESS_RECOVERY_PREVIOUS_KEYS` and run the installer
+again only after that check prints `0`. Losing a key while one of its
+marker-free envelopes remains makes recovery unavailable and keeps the service
+unhealthy.
 
 #### Upgrading an existing installation
 
@@ -138,11 +196,42 @@ If Linear returns `401` and the bridge reports that no refresh token is
 stored, repeat the authorization step. Removing the app from Linear, revoking
 its grant, or deleting the token store also requires authorization again.
 
+Releases that predate recovery envelopes may have a `received` or `claimed`
+receipt with no `dispatchStartedAt`, `recoverySequence`, or
+`recoveryEnvelope`. Its original prompt was deliberately not stored. During
+startup the bridge stays unhealthy and accepts only a fresh, correctly signed
+Linear redelivery whose webhook, execution, session, and action identity match
+that true legacy receipt. The matching delivery attaches an encrypted envelope
+durably, then startup recovery runs the turn and opens normal webhook traffic.
+Invalid signatures, unrelated events, and nonmatching deliveries cannot repair
+the receipt.
+
+Before upgrading, let accepted work drain and inspect the state file. This
+read-only command labels true legacy state as `awaiting-redelivery` and an
+asymmetric sequence/envelope pair as `invalid`:
+
+```bash
+node -e 'const s=require("./data/bridge-state.json"); for(const r of Object.values(s.receipts??{})){if(!["received","claimed"].includes(r.status)||r.dispatchStartedAt)continue; const q=r.recoverySequence!==undefined,e=r.recoveryEnvelope!==undefined; if(!q||!e)console.log(!q&&!e?"awaiting-redelivery":"invalid",r.webhookId,r.linearSessionId,r.executionId)}'
+```
+
+The macOS installer polls health for a bounded window. If Linear does not
+redeliver during that window, the installer restores the previous build. Back
+up the state file, reconcile the affected Linear session manually, and remove
+or archive that stale receipt and its matching claim before retrying. An
+asymmetric pair, corrupted envelope, or missing reader key always fails closed
+and never enters redelivery repair. Do not discard the whole state file without
+reviewing the deduplication and activity IDs it contains.
+
 ### 4. Expose the webhook
 
 On macOS, `./deploy/install.sh` builds the service, installs a launchd
 user agent (so the SDK sees your Claude Code credentials), opens a
 tailscale funnel, and prints the webhook URL to paste into the app config.
+It validates the complete application configuration before stopping an
+existing service. Health is polled for up to ten seconds after restart. A
+failed health check exits nonzero and restores the prior build and launchd
+files; the message reports whether the restored service answered its health
+probe. Secrets are loaded from `.env`, not passed in command arguments.
 
 Any other HTTPS ingress works; the service only needs POST /webhook
 reachable. If your TLS terminator runs on a different host,
@@ -167,10 +256,10 @@ session takes.
   is `created:<agentSession.id>`; prompted execution is identified by
   `agentActivity.id`. Linear activity creation receives a caller-generated UUID
   persisted before the request, so an OAuth retry reuses the same id.
-- A restart can reclaim a claim whose dispatch marker is absent. Once the
-  marker exists, a different process records `AmbiguousDispatch` and does not
-  execute the turn again. Same-process duplicate deliveries remain ordinary
-  duplicates.
+- A restart recovers an accepted claim whose dispatch marker is absent by
+  decrypting its bounded recovery envelope. Once the marker exists, a
+  different process records `AmbiguousDispatch` and does not execute the turn
+  again. Same-process duplicate deliveries remain ordinary duplicates.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.
@@ -217,6 +306,14 @@ session takes.
 
 The webhook endpoint verifies signatures, rejects stale timestamps, and does
 not return 200 for a valid agent event unless its receipt and claim are durable.
+Marker-free accepted turns retain encrypted prompt material until the dispatch
+marker is durable. Bounded action, identity, sequence, timestamp, `keyId`, and
+stop-fence provenance remain plaintext for routing. Prompt, issue, and comment
+text, raw signal, and stop/body semantics remain encrypted, while ciphertext
+size leaks an approximate length. The envelope authenticates its payload and
+routing association, not the whole state file. Keep `.env`, the state file, and
+their backups owner-only; losing every reader key for an active envelope blocks
+startup rather than dropping accepted work.
 The OAuth callback consumes a random, expiring state value before exchanging an
 authorization code; only the local service log receives the matching setup
 URL. `/healthz` and `/oauth/callback` are the only other routes. Understand

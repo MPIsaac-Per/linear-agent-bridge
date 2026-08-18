@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit",
     "pretest": "npm run native:build",
     "test": "vitest run",
+    "test:install": "bash -n deploy/install.sh deploy/install.test.sh && bash deploy/install.test.sh",
     "pretest:watch": "npm run native:build",
     "test:watch": "vitest",
     "native:build": "node scripts/build-native.mjs",
