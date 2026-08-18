@@ -143,6 +143,10 @@ export interface BridgeStateStore {
     options?: { repairLegacyOnly?: boolean },
   ): Promise<ClaimEventResult>;
   markDispatchStarted(webhookId: string): Promise<DispatchStartDisposition>;
+  rollbackRuntimeStartIntent(
+    webhookId: string,
+    recoveryPayload: IngressRecoveryPayload,
+  ): Promise<void>;
   checkDispatchEligibility(webhookId: string): Promise<DispatchEligibility>;
   releasePreDispatchClaim(webhookId: string): Promise<boolean>;
   completeEvent(webhookId: string): Promise<void>;
@@ -236,6 +240,13 @@ export class BridgeStateLockTimeoutError extends Error {
   }
 }
 
+export class BridgeStateIntegrityError extends Error {
+  constructor() {
+    super("Bridge state integrity validation failed");
+    this.name = "BridgeStateIntegrityError";
+  }
+}
+
 export class DispatchMarkerDurabilityError extends Error {
   constructor() {
     super("Dispatch marker durability was not confirmed");
@@ -247,6 +258,20 @@ export class TerminalStateDurabilityError extends Error {
   constructor() {
     super("Terminal state durability was not confirmed");
     this.name = "TerminalStateDurabilityError";
+  }
+}
+
+class DeferredBridgeStateLockTimeoutError extends BridgeStateLockTimeoutError {
+  constructor(readonly settlement: Promise<void>) {
+    super();
+    this.name = "BridgeStateLockTimeoutError";
+  }
+}
+
+class StateTargetDurabilityError extends Error {
+  constructor(cause: unknown) {
+    super("Bridge state target durability was not confirmed", { cause });
+    this.name = "StateTargetDurabilityError";
   }
 }
 
@@ -312,6 +337,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   private readonly strandedOwnedLockTokens = new Map<string, Set<string>>();
   private readonly locallyUnconfirmedDispatchMarkers = new Set<string>();
   private readonly locallyUnconfirmedTerminalWrites = new Set<string>();
+  private readonly locallyUnconfirmedRuntimeRollbacks = new Set<string>();
   private stateDirectoryReady: Promise<void> | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
 
@@ -628,6 +654,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       try {
         await this.writeState(state, deadline);
       } catch (error) {
+        if (error instanceof StateTargetDurabilityError) {
+          this.locallyUnconfirmedDispatchMarkers.add(webhookId);
+          throw new DispatchMarkerDurabilityError();
+        }
         try {
           const visible = await this.readState(deadline);
           const visibleReceipt = visible.receipts[webhookId];
@@ -656,7 +686,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     webhookId: string,
   ): Promise<DispatchEligibility> {
     validateIdentifier(webhookId, "webhookId");
-    const state = await this.readState();
+    const state = await this.readState(Date.now() + this.lockTimeoutMs);
     const { receipt } = this.ownedActiveClaim(state, webhookId);
     const fence = state.recoveryStopFences?.[receipt.linearSessionId];
     if (fence === undefined) {
@@ -669,6 +699,46 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       this.receiptIsAtOrBeforeFence(receipt, fence)
       ? "superseded"
       : "eligible";
+  }
+
+  rollbackRuntimeStartIntent(
+    webhookId: string,
+    recoveryPayload: IngressRecoveryPayload,
+  ): Promise<void> {
+    validateIdentifier(webhookId, "webhookId");
+    return this.mutate(async (deadline) => {
+      const state = await this.readState(deadline);
+      const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
+      if (claim.dispatchStartedAt === undefined) {
+        if (this.locallyUnconfirmedRuntimeRollbacks.has(webhookId)) {
+          await this.writeState(state, deadline);
+          this.locallyUnconfirmedRuntimeRollbacks.delete(webhookId);
+        }
+        return;
+      }
+      const recovery = this.createRecoveryEnvelope(
+        state,
+        receiptIdentity(receipt),
+        recoveryPayload,
+        false,
+      );
+      delete claim.dispatchStartedAt;
+      delete receipt.dispatchStartedAt;
+      Object.assign(receipt, recovery);
+      const timestamp = this.timestamp();
+      claim.updatedAt = timestamp;
+      receipt.updatedAt = timestamp;
+      receipt.outcome = acceptedOutcome();
+      try {
+        await this.writeState(state, deadline);
+      } catch (error) {
+        if (error instanceof StateTargetDurabilityError) {
+          this.locallyUnconfirmedRuntimeRollbacks.add(webhookId);
+        }
+        throw error;
+      }
+      this.locallyUnconfirmedDispatchMarkers.delete(webhookId);
+    });
   }
 
   releasePreDispatchClaim(webhookId: string): Promise<boolean> {
@@ -717,16 +787,20 @@ export class JsonBridgeStateStore implements BridgeStateStore {
 
   async getReceipt(webhookId: string): Promise<IngressReceipt | undefined> {
     validateIdentifier(webhookId, "webhookId");
-    return (await this.readState()).receipts[webhookId];
+    return (await this.readState(Date.now() + this.lockTimeoutMs)).receipts[
+      webhookId
+    ];
   }
 
   async getClaim(executionId: string): Promise<IngressClaim | undefined> {
     validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
-    return (await this.readState()).claims[executionId];
+    return (await this.readState(Date.now() + this.lockTimeoutMs)).claims[
+      executionId
+    ];
   }
 
   async assertRecoverableEventsAvailable(): Promise<void> {
-    const state = await this.readState();
+    const state = await this.readState(Date.now() + this.lockTimeoutMs);
     this.assertRecoveryStateIsBounded(state);
     let missingLegacyEnvelope = false;
     const recoverySequences = new Set<number>();
@@ -754,7 +828,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
       throw new IngressRecoveryEnvelopeError();
     }
-    const state = await this.readState();
+    const state = await this.readState(Date.now() + this.lockTimeoutMs);
     this.assertRecoveryStateIsBounded(state);
     return activeRecoverableReceipts(state)
       .filter(
@@ -1233,6 +1307,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       try {
         await this.writeState(state, deadline);
       } catch (error) {
+        if (error instanceof StateTargetDurabilityError) {
+          this.locallyUnconfirmedTerminalWrites.add(webhookId);
+          throw new TerminalStateDurabilityError();
+        }
         try {
           const visible = await this.readState(deadline);
           const visibleReceipt = visible.receipts[webhookId];
@@ -1431,12 +1509,20 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     const lockToken = randomUUID();
     const candidatePath = `${lockPath}.${lockToken}.candidate`;
     const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
-    await resolveBeforeLockDeadline(
-      fs.mkdir(candidatePath, { mode: 0o700 }),
-      deadline,
-    );
     let acquired = false;
+    let deferredRelease: Promise<void> | undefined;
     try {
+      const candidateMkdir = fs.mkdir(candidatePath, { mode: 0o700 });
+      try {
+        await resolveBeforeLockDeadline(candidateMkdir, deadline);
+      } catch (error) {
+        if (error instanceof BridgeStateLockTimeoutError) {
+          void candidateMkdir
+            .then(() => fs.rm(candidatePath, { recursive: true, force: true }))
+            .catch(() => undefined);
+        }
+        throw error;
+      }
       await this.writeLockOwner(candidateOwnerPath, lockToken, deadline);
       while (!acquired) {
         if (Date.now() >= deadline) {
@@ -1449,7 +1535,13 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           } catch (error) {
             if (error instanceof BridgeStateLockTimeoutError) {
               void rename
-                .then(() => this.releaseOwnedLock(lockPath, lockToken))
+                .then(() =>
+                  this.releaseOwnedLock(
+                    lockPath,
+                    lockToken,
+                    Date.now() + this.lockTimeoutMs,
+                  ),
+                )
                 .catch(() => undefined);
             }
             throw error;
@@ -1476,18 +1568,42 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         }
       }
 
-      return await resolveBeforeLockDeadline(operation(), deadline);
+      try {
+        return await resolveBeforeLockDeadline(operation(), deadline);
+      } catch (error) {
+        if (error instanceof DeferredBridgeStateLockTimeoutError) {
+          deferredRelease = error.settlement;
+        }
+        throw error;
+      }
     } finally {
       if (acquired) {
-        const release = this.releaseOwnedLock(lockPath, lockToken);
-        try {
-          await resolveBeforeLockDeadline(release, deadline);
-        } catch (error) {
+        if (deferredRelease !== undefined) {
           this.rememberStrandedOwnedLock(lockPath, lockToken);
-          void release
-            .then(() => this.forgetStrandedOwnedLock(lockPath, lockToken))
+          void deferredRelease
+            .then(() =>
+              this.releaseOwnedLock(
+                lockPath,
+                lockToken,
+                Date.now() + this.lockTimeoutMs,
+              ),
+            )
             .catch(() => undefined);
-          throw error;
+        } else {
+          const release = this.releaseOwnedLock(
+            lockPath,
+            lockToken,
+            Date.now() + this.lockTimeoutMs,
+          );
+          try {
+            await resolveBeforeLockDeadline(release, deadline);
+          } catch (error) {
+            this.rememberStrandedOwnedLock(lockPath, lockToken);
+            void release
+              .then(() => this.forgetStrandedOwnedLock(lockPath, lockToken))
+              .catch(() => undefined);
+            throw error;
+          }
         }
       }
       const cleanup = fs.rm(candidatePath, { recursive: true, force: true });
@@ -1600,7 +1716,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   ): Promise<void> {
     let entries: string[];
     try {
-      entries = await fs.readdir(lockPath);
+      entries = await resolveBeforeLockDeadline(fs.readdir(lockPath), deadline);
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
         return;
@@ -1610,7 +1726,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (entries.length === 0) {
       assertBeforeLockDeadline(deadline);
       try {
-        await fs.rmdir(lockPath);
+        await resolveBeforeLockDeadline(fs.rmdir(lockPath), deadline);
       } catch (error) {
         if (
           !isNodeError(error, "ENOENT") &&
@@ -1628,7 +1744,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     const ownerPath = path.join(lockPath, entries[0]!);
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await fs.readFile(ownerPath, "utf8"));
+      parsed = JSON.parse(
+        await resolveBeforeLockDeadline(fs.readFile(ownerPath, "utf8"), deadline),
+      );
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
         return;
@@ -1652,7 +1770,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (this.strandedOwnedLockTokens.get(lockPath)?.has(owner.token) === true) {
       assertBeforeLockDeadline(deadline);
       await resolveBeforeLockDeadline(
-        this.removeLockDirectoryOwnedBy(lockPath, owner.token),
+        this.removeLockDirectoryOwnedBy(lockPath, owner.token, deadline),
         deadline,
       );
       this.forgetStrandedOwnedLock(lockPath, owner.token);
@@ -1678,14 +1796,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         currentBootIdentity !== recordedBootIdentity
       ) {
         assertBeforeLockDeadline(deadline);
-        await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+        await this.removeLockDirectoryOwnedBy(lockPath, owner.token, deadline);
         return;
       }
     }
 
     if (!isProcessAlive(owner.pid)) {
       assertBeforeLockDeadline(deadline);
-      await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+      await this.removeLockDirectoryOwnedBy(lockPath, owner.token, deadline);
       return;
     }
     if (
@@ -1708,7 +1826,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
     if (currentProcessUid !== undefined && currentProcessUid !== owner.uid) {
       assertBeforeLockDeadline(deadline);
-      await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+      await this.removeLockDirectoryOwnedBy(lockPath, owner.token, deadline);
       return;
     }
 
@@ -1732,7 +1850,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
 
     assertBeforeLockDeadline(deadline);
-    await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+    await this.removeLockDirectoryOwnedBy(lockPath, owner.token, deadline);
   }
 
   private async resolveLockProcessIdentity(
@@ -1820,9 +1938,13 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     return isValidUid(uid) ? uid : undefined;
   }
 
-  private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
+  private async releaseOwnedLock(
+    lockPath: string,
+    token: string,
+    deadline: number,
+  ): Promise<void> {
     try {
-      await this.removeLockDirectoryOwnedBy(lockPath, token);
+      await this.removeLockDirectoryOwnedBy(lockPath, token, deadline);
       this.forgetStrandedOwnedLock(lockPath, token);
     } catch (error) {
       this.rememberStrandedOwnedLock(lockPath, token);
@@ -1850,10 +1972,11 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   private async removeLockDirectoryOwnedBy(
     lockPath: string,
     token: string,
+    deadline: number,
   ): Promise<void> {
     const ownerPath = path.join(lockPath, `${token}.json`);
     try {
-      await fs.unlink(ownerPath);
+      await resolveBeforeLockDeadline(fs.unlink(ownerPath), deadline);
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
         return;
@@ -1862,7 +1985,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
 
     try {
-      await fs.rmdir(lockPath);
+      await resolveBeforeLockDeadline(fs.rmdir(lockPath), deadline);
     } catch (error) {
       if (!isNodeError(error, "ENOENT") && !isNodeError(error, "ENOTEMPTY")) {
         throw error;
@@ -1889,12 +2012,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     try {
       parsed = JSON.parse(raw);
     } catch (error) {
-      throw new Error(`Invalid bridge state JSON at ${this.statePath}`, {
-        cause: error,
-      });
+      throw new BridgeStateIntegrityError();
     }
     if (!isPersistedBridgeState(parsed)) {
-      throw new Error(`Invalid bridge state structure at ${this.statePath}`);
+      throw new BridgeStateIntegrityError();
     }
     return parsed;
   }
@@ -1910,6 +2031,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     );
     let tmpHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
     let closeDeferred = false;
+    let targetRenamed = false;
     const runHandleOperation = async (
       operation: Promise<unknown>,
     ): Promise<void> => {
@@ -1949,7 +2071,20 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       await resolveBeforeLockDeadline(tmpHandle.close(), deadline);
       tmpHandle = undefined;
 
-      await resolveBeforeLockDeadline(fs.rename(tmpPath, this.statePath), deadline);
+      const rename = fs.rename(tmpPath, this.statePath);
+      try {
+        await resolveBeforeLockDeadline(rename, deadline);
+        targetRenamed = true;
+      } catch (error) {
+        if (error instanceof BridgeStateLockTimeoutError) {
+          const settlement = rename.then(
+            () => undefined,
+            () => undefined,
+          );
+          throw new DeferredBridgeStateLockTimeoutError(settlement);
+        }
+        throw error;
+      }
       const directoryOpen = fs.open(directory, "r");
       let directoryHandle: Awaited<ReturnType<typeof fs.open>>;
       try {
@@ -1985,6 +2120,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           await resolveBeforeLockDeadline(directoryHandle.close(), deadline);
         }
       }
+    } catch (error) {
+      if (
+        targetRenamed &&
+        !(error instanceof StateTargetDurabilityError)
+      ) {
+        throw new StateTargetDurabilityError(error);
+      }
+      throw error;
     } finally {
       if (tmpHandle !== undefined && !closeDeferred) {
         await resolveBeforeLockDeadline(tmpHandle.close(), deadline).catch(

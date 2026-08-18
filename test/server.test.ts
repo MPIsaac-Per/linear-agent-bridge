@@ -1259,7 +1259,7 @@ describe("startServer", () => {
     }
   });
 
-  it("waits for an in-flight post-ack dispatch marker before close returns", async () => {
+  it("rolls back an in-flight runtime intent when close wins before runtime invocation", async () => {
     const pendingPostResponseWork: Array<() => void> = [];
     const markerEntered = createDeferred<void>();
     const releaseMarker = createDeferred<void>();
@@ -1322,8 +1322,9 @@ describe("startServer", () => {
       const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
       expect(receipt).toMatchObject({
         status: "claimed",
-        dispatchStartedAt: expect.any(String),
+        recoveryEnvelope: expect.any(Object),
       });
+      expect(receipt).not.toHaveProperty("dispatchStartedAt");
       expect(receipt).not.toHaveProperty("completedAt");
       expect(receipt).not.toHaveProperty("failedAt");
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1340,6 +1341,89 @@ describe("startServer", () => {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
       }
     }
+  });
+
+  it("rolls back a delayed runtime intent when a stop wins before runtime invocation", async () => {
+    const markerEntered = createDeferred<void>();
+    const releaseMarker = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      harness.bridgeState,
+    );
+    vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
+      async (webhookId) => {
+        const result = await originalMark(webhookId);
+        if (webhookId === "webhook-stop-during-runtime-intent") {
+          markerEntered.resolve();
+          await releaseMarker.promise;
+        }
+        return result;
+      },
+    );
+    const created = {
+      webhookId: "webhook-stop-during-runtime-intent",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-stop-during-runtime-intent" },
+      promptContext: "private delayed runtime intent prompt",
+      webhookTimestamp: Date.now(),
+    };
+    const createdBody = JSON.stringify(created);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+          },
+          body: createdBody,
+        })
+      ).status,
+    ).toBe(200);
+    await markerEntered.promise;
+
+    const stop = {
+      webhookId: "webhook-stop-wins-runtime-intent",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "session-stop-during-runtime-intent" },
+      agentActivity: {
+        id: "activity-stop-wins-runtime-intent",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "stop", signal: "stop" },
+      },
+      webhookTimestamp: Date.now(),
+    };
+    const stopBody = JSON.stringify(stop);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+          },
+          body: stopBody,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(() =>
+      harness.calls.some(
+        (call) =>
+          call.content.type === "response" && call.content.body === "Stopped.",
+      ),
+    );
+    releaseMarker.resolve();
+    await waitFor(async () =>
+      (await harness.bridgeState.getReceipt(created.webhookId))?.status ===
+      "superseded",
+    );
+    expect(runtime.requests).toHaveLength(0);
   });
 
   it("cancels recovery backoff on close without a false fatal diagnostic", async () => {

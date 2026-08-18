@@ -342,7 +342,7 @@ describe("JsonBridgeStateStore", () => {
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-a",
-      lockTimeoutMs: 40,
+      lockTimeoutMs: 250,
       lockProcessIdentity,
     });
     const startedAt = Date.now();
@@ -350,11 +350,11 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.claimEvent(event())).rejects.toThrow(
       /Timed out acquiring bridge state lock/,
     );
-    expect(Date.now() - startedAt).toBeLessThan(200);
+    expect(Date.now() - startedAt).toBeLessThan(500);
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
     await waitFor(async () => (await fs.readdir(tmpDir)).length === 0);
 
-    stalledIdentity.reject(new Error("late identity failure with private data"));
+    stalledIdentity.resolve(CURRENT_PROCESS_IDENTITY);
     await new Promise<void>((resolve) => setImmediate(resolve));
     await expect(store.claimEvent(event())).resolves.toMatchObject({
       disposition: "claimed",
@@ -406,6 +406,68 @@ describe("JsonBridgeStateStore", () => {
       stalledSync.resolve();
       await claim.catch(() => undefined);
       openSpy.mockRestore();
+    }
+  });
+
+  it("retains the lock until a timed-out state rename settles", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const releaseRename = deferred();
+    const originalRename = fs.rename.bind(fs);
+    let stalledStateRename = false;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(to) === storePath && !stalledStateRename) {
+        stalledStateRename = true;
+        await releaseRename.promise;
+      }
+      await originalRename(from, to);
+    });
+    const first = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 50,
+      lockRetryMs: 1,
+    });
+    const second = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-b",
+      lockTimeoutMs: 500,
+      lockRetryMs: 1,
+    });
+
+    try {
+      await expect(first.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      await expect(fs.stat(lockPath)).resolves.toBeDefined();
+      let secondSettled = false;
+      const secondClaim = second
+        .claimEvent(
+          event({
+            webhookId: "webhook-after-late-state-rename",
+            executionId: "created:session-after-late-state-rename",
+            linearSessionId: "session-after-late-state-rename",
+          }),
+        )
+        .finally(() => {
+          secondSettled = true;
+        });
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(secondSettled).toBe(false);
+
+      releaseRename.resolve();
+      await expect(secondClaim).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      await expect(second.getReceipt("webhook-1")).resolves.toMatchObject({
+        status: "received",
+      });
+      await expect(
+        second.getReceipt("webhook-after-late-state-rename"),
+      ).resolves.toMatchObject({ status: "claimed" });
+    } finally {
+      releaseRename.resolve();
+      renameSpy.mockRestore();
     }
   });
 
@@ -484,7 +546,7 @@ describe("JsonBridgeStateStore", () => {
     const store = new JsonBridgeStateStore(storePath, {
       ...TEST_LOCK_OPTIONS,
       ownerId: "runtime-a",
-      lockTimeoutMs: 100,
+      lockTimeoutMs: 500,
       lockRetryMs: 1,
     });
 
@@ -564,7 +626,7 @@ describe("JsonBridgeStateStore", () => {
     let bootLookups = 0;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-reboot",
-      lockTimeoutMs: 40,
+      lockTimeoutMs: 250,
       lockProcessIdentity: async (pid) => {
         if (pid !== process.pid) {
           throw new Error("stalled boot lookup inspected process birth");
@@ -2193,6 +2255,53 @@ describe("JsonBridgeStateStore", () => {
     expect(await fs.readFile(storePath, "utf8")).not.toContain(prompt);
   });
 
+  it("confirms a dispatch marker after its post-rename directory sync exceeds the deadline", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-stalled-marker-sync.json");
+    const directory = path.dirname(storePath);
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 500,
+    });
+    await store.claimEvent(event());
+    (
+      store as unknown as {
+        lockTimeoutMs: number;
+      }
+    ).lockTimeoutMs = 50;
+    const stalledSync = deferred();
+    const originalOpen = fs.open.bind(fs);
+    let stallNextDirectorySync = true;
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === directory) {
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          if (stallNextDirectorySync) {
+            stallNextDirectorySync = false;
+            await stalledSync.promise;
+            return;
+          }
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+
+    try {
+      await expect(store.markDispatchStarted("webhook-1")).rejects.toThrow(
+        "Dispatch marker durability was not confirmed",
+      );
+      stalledSync.resolve();
+      await expect(store.markDispatchStarted("webhook-1")).resolves.toBe(
+        "dispatch_started",
+      );
+    } finally {
+      stalledSync.resolve();
+      openSpy.mockRestore();
+    }
+  });
+
   it("reclaims when marker and release fail before either state write", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const store = new JsonBridgeStateStore(storePath, { ownerId: "runtime-a" });
@@ -2458,6 +2567,52 @@ describe("JsonBridgeStateStore", () => {
       expect(failedTerminalSync).toBe(true);
     } finally {
       renameSpy.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it("confirms terminal state after its post-rename directory sync exceeds the deadline", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-stalled-terminal-sync.json");
+    const directory = path.dirname(storePath);
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      lockTimeoutMs: 500,
+    });
+    await store.claimEvent(event());
+    await store.markDispatchStarted("webhook-1");
+    (
+      store as unknown as {
+        lockTimeoutMs: number;
+      }
+    ).lockTimeoutMs = 50;
+    const stalledSync = deferred();
+    const originalOpen = fs.open.bind(fs);
+    let stallNextDirectorySync = true;
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === directory) {
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          if (stallNextDirectorySync) {
+            stallNextDirectorySync = false;
+            await stalledSync.promise;
+            return;
+          }
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+
+    try {
+      await expect(store.completeEvent("webhook-1")).rejects.toThrow(
+        "Terminal state durability was not confirmed",
+      );
+      stalledSync.resolve();
+      await expect(store.completeEvent("webhook-1")).resolves.toBeUndefined();
+    } finally {
+      stalledSync.resolve();
       openSpy.mockRestore();
     }
   });

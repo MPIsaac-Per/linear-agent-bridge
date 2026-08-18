@@ -136,10 +136,10 @@ class OAuthStateStore {
   }
 }
 
-class PreDispatchClaimReleasedError extends Error {
+class PreRuntimeClaimReleasedError extends Error {
   constructor() {
-    super("Dispatch marker was not persisted; the ingress claim was released");
-    this.name = "PreDispatchClaimReleasedError";
+    super("Pre-runtime ingress work was released for durable retry");
+    this.name = "PreRuntimeClaimReleasedError";
   }
 }
 
@@ -677,7 +677,7 @@ async function processClaimedEvent(
     if (deps.closing && deps.shutdownController.signal.aborted) {
       return "settled";
     }
-    if (error instanceof PreDispatchClaimReleasedError) {
+    if (error instanceof PreRuntimeClaimReleasedError) {
       void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
       return "retryable";
     }
@@ -894,6 +894,7 @@ async function processClaimedWebhook(
         issueIdentifier,
         controller!,
         identity,
+        recoveryPayload(event),
       );
       enqueued = true;
       return;
@@ -951,10 +952,14 @@ async function processClaimedWebhook(
       issueIdentifier,
       controller!,
       identity,
+      recoveryPayload(event),
       { loadStoredSessionAtExecution: true },
     );
     enqueued = true;
   } catch (error) {
+    if (error instanceof ClaimOwnershipError) {
+      return;
+    }
     if (!deps.closing) {
       await releasePreIntentForRecovery(deps, identity, error);
     }
@@ -986,6 +991,7 @@ function enqueueSessionRun(
   issueIdentifier: string | undefined,
   controller: AbortController,
   identity: IngressEventIdentity,
+  acceptedRecoveryPayload: IngressRecoveryPayload,
   options: { loadStoredSessionAtExecution?: boolean } = {},
 ): void {
   void deps.queue
@@ -1031,7 +1037,22 @@ function enqueueSessionRun(
             runtimeIntentStarted =
               (await persistRuntimeStartIntent(deps, identity)) ===
               "dispatch_started";
-            return runtimeIntentStarted && !deps.closing;
+            if (
+              runtimeIntentStarted &&
+              (deps.closing || controller.signal.aborted)
+            ) {
+              await rollbackRuntimeStartIntent(
+                deps,
+                identity,
+                acceptedRecoveryPayload,
+              );
+              runtimeIntentStarted = false;
+              if (!deps.closing && controller.signal.aborted) {
+                await settlePreIntentAbort(deps, identity);
+              }
+              return false;
+            }
+            return runtimeIntentStarted;
           },
           () => {
             console.log(
@@ -1041,6 +1062,9 @@ function enqueueSessionRun(
           },
         );
       } catch (error) {
+        if (error instanceof ClaimOwnershipError) {
+          return;
+        }
         if (!runtimeIntentStarted && !deps.closing) {
           await releasePreIntentForRecovery(deps, identity, error);
         }
@@ -1069,7 +1093,7 @@ function enqueueSessionRun(
       }
     })
     .catch((error: unknown) => {
-      if (!deps.closing && !(error instanceof PreDispatchClaimReleasedError)) {
+      if (!deps.closing && !(error instanceof PreRuntimeClaimReleasedError)) {
         console.error(
           `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
         );
@@ -1082,18 +1106,45 @@ async function persistRuntimeStartIntent(
   identity: IngressEventIdentity,
 ): Promise<"dispatch_started" | "superseded"> {
   let retryDelayMs = 25;
-  while (!deps.closing) {
+  let markerAttempted = false;
+  while (!deps.closing || markerAttempted) {
     try {
+      markerAttempted = true;
       return await deps.bridgeState.markDispatchStarted(identity.webhookId);
     } catch (error) {
       if (!(error instanceof DispatchMarkerDurabilityError)) {
         throw error;
       }
-      await delay(retryDelayMs, deps.shutdownController.signal);
+      if (!deps.closing) {
+        await delay(retryDelayMs, deps.shutdownController.signal);
+      }
       retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
     }
   }
   throw deps.shutdownController.signal.reason ?? new Error("Server shutting down");
+}
+
+async function rollbackRuntimeStartIntent(
+  deps: InternalServerDeps,
+  identity: IngressEventIdentity,
+  payload: IngressRecoveryPayload,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await deps.bridgeState.rollbackRuntimeStartIntent(
+        identity.webhookId,
+        payload,
+      );
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        await delay(25 * 2 ** attempt);
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function releasePreIntentForRecovery(
@@ -1111,18 +1162,26 @@ async function releasePreIntentForRecovery(
   }
   if (released || !deps.closing) {
     void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
-    throw new PreDispatchClaimReleasedError();
+    throw new PreRuntimeClaimReleasedError();
   }
-  throw cause ?? new PreDispatchClaimReleasedError();
+  throw cause ?? new PreRuntimeClaimReleasedError();
 }
 
 async function settlePreIntentAbort(
   deps: InternalServerDeps,
   identity: IngressEventIdentity,
 ): Promise<void> {
-  const eligibility = await deps.bridgeState.checkDispatchEligibility(
-    identity.webhookId,
-  );
+  let eligibility;
+  try {
+    eligibility = await deps.bridgeState.checkDispatchEligibility(
+      identity.webhookId,
+    );
+  } catch (error) {
+    if (error instanceof ClaimOwnershipError) {
+      return;
+    }
+    throw error;
+  }
   if (eligibility === "superseded") {
     await deps.bridgeState.markDispatchStarted(identity.webhookId);
     return;
@@ -1305,8 +1364,7 @@ async function runSessionTask(
   try {
     if (
       signalIsAborted(controller?.signal) ||
-      !(await beforeRuntimeStart()) ||
-      signalIsAborted(controller?.signal)
+      !(await beforeRuntimeStart())
     ) {
       controller?.signal.removeEventListener("abort", onControllerAbort);
       return "stopped";
@@ -1590,8 +1648,8 @@ function boundedErrorClass(error: unknown): string {
   if (error instanceof BridgeStateLockTimeoutError) {
     return "BridgeStateLockTimeoutError";
   }
-  if (error instanceof PreDispatchClaimReleasedError) {
-    return "PreDispatchClaimReleasedError";
+  if (error instanceof PreRuntimeClaimReleasedError) {
+    return "PreRuntimeClaimReleasedError";
   }
   if (error instanceof ClaimOwnershipError) {
     return "ClaimOwnershipError";
