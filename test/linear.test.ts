@@ -778,6 +778,71 @@ describe("LinearAgentClient.createActivity", () => {
   });
 });
 
+describe("LinearAgentClient.activityExists", () => {
+  it("confirms only the exact caller activity id in the expected session", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse({
+        data: {
+          agentActivities: {
+            nodes: [
+              {
+                id: "activity-id",
+                agentSession: { id: "session-id" },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("token", fetchFn);
+
+    await expect(
+      client.activityExists("session-id", "activity-id"),
+    ).resolves.toBe(true);
+    const request = JSON.parse(fetchFn.mock.calls[0]![1]!.body as string) as {
+      query: string;
+      variables: { id: string };
+    };
+    expect(request.query).toContain("agentActivities(first: 2");
+    expect(request.variables).toEqual({ id: "activity-id" });
+  });
+
+  it("returns false only when the exact activity is absent", async () => {
+    const client = new LinearAgentClient(
+      "token",
+      vi.fn().mockResolvedValue(
+        jsonResponse({ data: { agentActivities: { nodes: [] } } }),
+      ),
+    );
+    await expect(
+      client.activityExists("session-id", "missing-activity"),
+    ).resolves.toBe(false);
+  });
+
+  it("fails closed when the query identity is inconsistent", async () => {
+    const client = new LinearAgentClient(
+      "token",
+      vi.fn().mockResolvedValue(
+        jsonResponse({
+          data: {
+            agentActivities: {
+              nodes: [
+                {
+                  id: "activity-id",
+                  agentSession: { id: "different-session" },
+                },
+              ],
+            },
+          },
+        }),
+      ),
+    );
+    await expect(
+      client.activityExists("session-id", "activity-id"),
+    ).rejects.toBeInstanceOf(LinearActivityError);
+  });
+});
+
 const WEBHOOK_SECRET = "whsec_test_secret";
 
 function makeBody(webhookTimestamp: number): Buffer {
