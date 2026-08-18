@@ -5,9 +5,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  IngressRecoveryEnvelopeError,
+  isCanonicalRecoveryTimestamp,
+  openIngressRecoveryPayload,
+  sealIngressRecoveryPayload,
+  type IngressRecoveryKeyring,
+  type IngressRecoveryPayload,
+  type SealedIngressRecoveryEnvelope,
+} from "./recovery-envelope.js";
 
 export const DEFAULT_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_RECEIPT_MAX_ENTRIES = 10_000;
+export const MAX_RECOVERABLE_INGRESS_EVENTS = 128;
+export const RECOVERABLE_INGRESS_BATCH_SIZE = 16;
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_EXECUTION_ID_LENGTH = 512;
@@ -74,6 +85,8 @@ export interface IngressReceipt extends IngressEventIdentity {
   supersededAt?: string | undefined;
   supersededByWebhookId?: string | undefined;
   dispatchStartedAt?: string | undefined;
+  recoverySequence?: number | undefined;
+  recoveryEnvelope?: SealedIngressRecoveryEnvelope | undefined;
   outcome: ReceiptOutcome;
 }
 
@@ -96,14 +109,38 @@ export type ClaimEventResult =
   | { disposition: "superseded"; receipt: IngressReceipt }
   | { disposition: "ambiguous"; receipt: IngressReceipt };
 
+export type RecoverableIngressEvent =
+  | {
+      identity: IngressEventIdentity;
+      sequence: number;
+      payload: IngressRecoveryPayload;
+      available: true;
+    }
+  | {
+      identity: IngressEventIdentity;
+      sequence?: number | undefined;
+      available: false;
+      reason: "missing" | "invalid";
+    };
+
+export type DispatchStartDisposition = "dispatch_started" | "superseded";
+
 export interface BridgeStateStore {
-  claimEvent(identity: IngressEventIdentity): Promise<ClaimEventResult>;
-  markDispatchStarted(webhookId: string): Promise<void>;
+  claimEvent(
+    identity: IngressEventIdentity,
+    recoveryPayload?: IngressRecoveryPayload,
+    options?: { repairLegacyOnly?: boolean },
+  ): Promise<ClaimEventResult>;
+  markDispatchStarted(webhookId: string): Promise<DispatchStartDisposition>;
   releasePreDispatchClaim(webhookId: string): Promise<boolean>;
   completeEvent(webhookId: string): Promise<void>;
   failEvent(webhookId: string, errorClass?: ReceiptErrorClass): Promise<void>;
   getReceipt(webhookId: string): Promise<IngressReceipt | undefined>;
   getClaim(executionId: string): Promise<IngressClaim | undefined>;
+  assertRecoverableEventsAvailable(): Promise<void>;
+  listRecoverableEvents(
+    afterSequence?: number,
+  ): Promise<RecoverableIngressEvent[]>;
   getOrCreateActivityId(executionId: string, activityKey: string): Promise<string>;
 }
 
@@ -111,6 +148,15 @@ interface PersistedBridgeState {
   version: 1;
   receipts: Record<string, IngressReceipt>;
   claims: Record<string, IngressClaim>;
+  nextRecoverySequence?: number | undefined;
+  recoveryStopFences?: Record<string, RecoveryStopFence> | undefined;
+}
+
+interface RecoveryStopFence {
+  occurredAt: string;
+  sequence: number;
+  webhookId: string;
+  executionId: string;
 }
 
 export interface JsonBridgeStateStoreOptions {
@@ -129,6 +175,9 @@ export interface JsonBridgeStateStoreOptions {
     pid: number,
     deadline: number,
   ) => Promise<number | undefined>;
+  recoveryKeyring?: IngressRecoveryKeyring;
+  /** May only lower the hard admission cap; primarily useful for tests. */
+  maxRecoverableEvents?: number;
 }
 
 interface LegacyLockOwnerRecord {
@@ -156,6 +205,20 @@ export class BridgeStateLockTimeoutError extends Error {
   constructor() {
     super("Timed out acquiring bridge state lock");
     this.name = "BridgeStateLockTimeoutError";
+  }
+}
+
+export class LegacyIngressRecoveryUnavailableError extends Error {
+  constructor() {
+    super("Accepted legacy ingress requires a signed matching redelivery");
+    this.name = "LegacyIngressRecoveryUnavailableError";
+  }
+}
+
+export class LegacyIngressRecoveryMismatchError extends Error {
+  constructor() {
+    super("Webhook does not match a repairable legacy ingress receipt");
+    this.name = "LegacyIngressRecoveryMismatchError";
   }
 }
 
@@ -196,6 +259,8 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   ) => Promise<number | undefined>;
   private currentProcessIdentityPromise: Promise<string | undefined> | undefined;
   private currentBootIdentityPromise: Promise<string | undefined> | undefined;
+  private readonly recoveryKeyring: IngressRecoveryKeyring | undefined;
+  private readonly maxRecoverableEvents: number;
   // This process may reclaim a visible pre-dispatch claim only when the
   // mutation that created it never completed through lock release.
   private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
@@ -215,6 +280,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       options.lockProcessIdentity ?? defaultLockProcessIdentity;
     this.lockBootIdentity = options.lockBootIdentity ?? defaultLockBootIdentity;
     this.lockProcessUid = options.lockProcessUid ?? defaultLockProcessUid;
+    this.recoveryKeyring = options.recoveryKeyring;
+    this.maxRecoverableEvents =
+      options.maxRecoverableEvents ?? MAX_RECOVERABLE_INGRESS_EVENTS;
 
     if (!Number.isInteger(this.maxEntries) || this.maxEntries <= 0) {
       throw new Error("maxEntries must be a positive integer");
@@ -228,25 +296,71 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (!Number.isInteger(this.lockTimeoutMs) || this.lockTimeoutMs <= 0) {
       throw new Error("lockTimeoutMs must be a positive integer");
     }
+    if (
+      !Number.isInteger(this.maxRecoverableEvents) ||
+      this.maxRecoverableEvents <= 0 ||
+      this.maxRecoverableEvents > MAX_RECOVERABLE_INGRESS_EVENTS
+    ) {
+      throw new Error(
+        `maxRecoverableEvents must be an integer between 1 and ${MAX_RECOVERABLE_INGRESS_EVENTS}`,
+      );
+    }
     validateIdentifier(this.ownerId, "ownerId");
   }
 
-  async claimEvent(identity: IngressEventIdentity): Promise<ClaimEventResult> {
+  async claimEvent(
+    identity: IngressEventIdentity,
+    recoveryPayload?: IngressRecoveryPayload,
+    options: { repairLegacyOnly?: boolean } = {},
+  ): Promise<ClaimEventResult> {
     validateIdentity(identity);
+    if (options.repairLegacyOnly === true && recoveryPayload === undefined) {
+      throw new LegacyIngressRecoveryMismatchError();
+    }
+    if (recoveryPayload !== undefined && this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
 
     return await this.mutateClaim(async () => {
       const state = await this.readState();
       this.prune(state);
       const existingReceipt = state.receipts[identity.webhookId];
+      if (
+        options.repairLegacyOnly === true &&
+        (existingReceipt === undefined ||
+          existingReceipt.recoveryEnvelope !== undefined ||
+          existingReceipt.recoverySequence !== undefined ||
+          existingReceipt.dispatchStartedAt !== undefined ||
+          (existingReceipt.status !== "received" &&
+            existingReceipt.status !== "claimed"))
+      ) {
+        throw new LegacyIngressRecoveryMismatchError();
+      }
       if (existingReceipt !== undefined) {
         assertSameIdentity(existingReceipt, identity);
-        if (existingReceipt.status !== "received") {
-          return await this.resolveExistingReceipt(state, existingReceipt);
-        }
       } else {
         const timestamp = this.timestamp();
+        let recovery: {
+          recoverySequence: number;
+          recoveryEnvelope: SealedIngressRecoveryEnvelope;
+        } | undefined;
+        if (recoveryPayload !== undefined) {
+          recovery = this.createRecoveryEnvelope(
+            state,
+            identity,
+            recoveryPayload,
+            true,
+          );
+          this.recordRecoveryStopFence(
+            state,
+            identity,
+            recoveryPayload,
+            recovery.recoverySequence,
+          );
+        }
         state.receipts[identity.webhookId] = {
           ...identity,
+          ...(recovery ?? {}),
           status: "received",
           receivedAt: timestamp,
           updatedAt: timestamp,
@@ -261,6 +375,30 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       }
 
       const receipt = state.receipts[identity.webhookId]!;
+      if (
+        recoveryPayload !== undefined &&
+        receipt.recoveryEnvelope === undefined &&
+        (receipt.status === "received" ||
+          (receipt.status === "claimed" &&
+            receipt.dispatchStartedAt === undefined))
+      ) {
+        const recovery = this.createRecoveryEnvelope(
+          state,
+          identity,
+          recoveryPayload,
+          false,
+        );
+        Object.assign(receipt, recovery);
+        this.recordRecoveryStopFence(
+          state,
+          identity,
+          recoveryPayload,
+          recovery.recoverySequence,
+        );
+      }
+      if (existingReceipt !== undefined && receipt.status !== "received") {
+        return await this.resolveExistingReceipt(state, receipt);
+      }
       const existingClaim = state.claims[identity.executionId];
       const timestamp = this.timestamp();
       if (existingClaim !== undefined) {
@@ -278,6 +416,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
             priorReceipt.supersededAt = timestamp;
             priorReceipt.supersededByWebhookId = receipt.webhookId;
             priorReceipt.updatedAt = timestamp;
+            clearRecoveryEnvelope(priorReceipt);
             priorReceipt.outcome = {
               httpStatus: 200,
               result: "not_dispatched",
@@ -313,6 +452,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
             receipt.supersededByWebhookId = existingClaim.webhookId;
           }
           receipt.updatedAt = timestamp;
+          clearRecoveryEnvelope(receipt);
           receipt.outcome = ambiguousOutcome();
           await this.writeState(state);
           return { disposition: "ambiguous", receipt };
@@ -322,6 +462,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         receipt.supersededAt = timestamp;
         receipt.supersededByWebhookId = existingClaim.webhookId;
         receipt.updatedAt = timestamp;
+        clearRecoveryEnvelope(receipt);
         receipt.outcome = {
           httpStatus: 200,
           result: "not_dispatched",
@@ -354,7 +495,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     });
   }
 
-  markDispatchStarted(webhookId: string): Promise<void> {
+  markDispatchStarted(
+    webhookId: string,
+  ): Promise<DispatchStartDisposition> {
     validateIdentifier(webhookId, "webhookId");
 
     return this.mutate(async () => {
@@ -362,7 +505,25 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
       if (claim.dispatchStartedAt !== undefined) {
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
-        return;
+        return "dispatch_started";
+      }
+      const fence = state.recoveryStopFences?.[receipt.linearSessionId];
+      if (fence !== undefined && !isValidRecoveryStopFence(fence)) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      if (
+        fence !== undefined &&
+        fence.executionId !== receipt.executionId &&
+        this.receiptIsAtOrBeforeFence(receipt, fence)
+      ) {
+        this.supersedeOwnedActiveClaimInState(
+          state,
+          webhookId,
+          fence.webhookId,
+        );
+        await this.writeState(state);
+        this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+        return "superseded";
       }
 
       const timestamp = this.timestamp();
@@ -370,6 +531,8 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       claim.updatedAt = timestamp;
       receipt.dispatchStartedAt = timestamp;
       receipt.updatedAt = timestamp;
+      delete receipt.recoverySequence;
+      delete receipt.recoveryEnvelope;
       receipt.outcome = {
         httpStatus: 200,
         result: "dispatch_started",
@@ -377,6 +540,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       };
       await this.writeState(state);
       this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+      return "dispatch_started";
     });
   }
 
@@ -429,6 +593,239 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
     return (await this.readState()).claims[executionId];
   }
+
+  async assertRecoverableEventsAvailable(): Promise<void> {
+    const state = await this.readState();
+    this.assertRecoveryStateIsBounded(state);
+    let missingLegacyEnvelope = false;
+    const recoverySequences = new Set<number>();
+    for (const receipt of activeRecoverableReceipts(state)) {
+      const candidate = this.decodeRecoverableReceipt(receipt);
+      if (!candidate.available && candidate.reason === "invalid") {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      if (candidate.available && recoverySequences.has(candidate.sequence)) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      if (candidate.available) {
+        recoverySequences.add(candidate.sequence);
+      }
+      missingLegacyEnvelope ||= !candidate.available;
+    }
+    if (missingLegacyEnvelope) {
+      throw new LegacyIngressRecoveryUnavailableError();
+    }
+  }
+
+  async listRecoverableEvents(
+    afterSequence = 0,
+  ): Promise<RecoverableIngressEvent[]> {
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const state = await this.readState();
+    this.assertRecoveryStateIsBounded(state);
+    return activeRecoverableReceipts(state)
+      .filter(
+        (receipt) =>
+          receipt.recoverySequence !== undefined &&
+          receipt.recoverySequence > afterSequence,
+      )
+      .sort((left, right) => {
+        const leftSequence = left.recoverySequence ?? Number.MAX_SAFE_INTEGER;
+        const rightSequence = right.recoverySequence ?? Number.MAX_SAFE_INTEGER;
+        return (
+          leftSequence - rightSequence ||
+          left.webhookId.localeCompare(right.webhookId)
+        );
+      })
+      .slice(0, RECOVERABLE_INGRESS_BATCH_SIZE)
+      .map((receipt) => this.decodeRecoverableReceipt(receipt));
+  }
+
+  private decodeRecoverableReceipt(
+    receipt: IngressReceipt,
+  ): RecoverableIngressEvent {
+    const identity = receiptIdentity(receipt);
+    const missingLegacyEnvelope =
+      receipt.recoverySequence === undefined &&
+      receipt.recoveryEnvelope === undefined;
+    if (
+      this.recoveryKeyring === undefined ||
+      !Number.isSafeInteger(receipt.recoverySequence) ||
+      receipt.recoverySequence === undefined ||
+      receipt.recoverySequence <= 0
+    ) {
+      return {
+        identity,
+        available: false,
+        reason: missingLegacyEnvelope ? "missing" : "invalid",
+      };
+    }
+    if (receipt.recoveryEnvelope === undefined) {
+      return {
+        identity,
+        sequence: receipt.recoverySequence,
+        available: false,
+        reason: "invalid",
+      };
+    }
+    try {
+      return {
+        identity,
+        sequence: receipt.recoverySequence,
+        payload: openIngressRecoveryPayload(
+          this.recoveryKeyring,
+          identity,
+          receipt.recoverySequence,
+          receipt.recoveryEnvelope,
+        ),
+        available: true,
+      };
+    } catch {
+      return {
+        identity,
+        sequence: receipt.recoverySequence,
+        available: false,
+        reason: "invalid",
+      };
+    }
+  }
+
+  private assertRecoveryStateIsBounded(state: PersistedBridgeState): void {
+    for (const fence of Object.values(state.recoveryStopFences ?? {})) {
+      if (!isValidRecoveryStopFence(fence)) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+    }
+    if (
+      activeRecoverableReceipts(state).length > this.maxRecoverableEvents
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+  }
+
+  private createRecoveryEnvelope(
+    state: PersistedBridgeState,
+    identity: IngressEventIdentity,
+    payload: IngressRecoveryPayload,
+    admittingNewEvent: boolean,
+  ): {
+    recoverySequence: number;
+    recoveryEnvelope: SealedIngressRecoveryEnvelope;
+  } {
+    if (this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const activeRecoveryCount = activeRecoverableReceipts(state).length;
+    if (
+      (admittingNewEvent && activeRecoveryCount >= this.maxRecoverableEvents) ||
+      (!admittingNewEvent && activeRecoveryCount > this.maxRecoverableEvents)
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    let highestSequence = 0;
+    for (const receipt of Object.values(state.receipts)) {
+      if (
+        receipt.recoverySequence !== undefined &&
+        Number.isSafeInteger(receipt.recoverySequence) &&
+        receipt.recoverySequence > highestSequence
+      ) {
+        highestSequence = receipt.recoverySequence;
+      }
+    }
+    for (const fence of Object.values(state.recoveryStopFences ?? {})) {
+      if (!isValidRecoveryStopFence(fence)) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      highestSequence = Math.max(highestSequence, fence.sequence);
+    }
+    if (
+      state.nextRecoverySequence !== undefined &&
+      (!Number.isSafeInteger(state.nextRecoverySequence) ||
+        state.nextRecoverySequence <= 0)
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const sequence = Math.max(
+      state.nextRecoverySequence ?? 1,
+      highestSequence + 1,
+    );
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const nextSequence = sequence + 1;
+    if (!Number.isSafeInteger(nextSequence)) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const recoveryEnvelope = sealIngressRecoveryPayload(
+      this.recoveryKeyring,
+      identity,
+      sequence,
+      payload,
+    );
+    state.nextRecoverySequence = nextSequence;
+    return {
+      recoverySequence: sequence,
+      recoveryEnvelope,
+    };
+  }
+
+  private recordRecoveryStopFence(
+    state: PersistedBridgeState,
+    identity: IngressEventIdentity,
+    payload: IngressRecoveryPayload,
+    sequence: number,
+  ): void {
+    if (payload.action !== "prompted" || !payload.stop) {
+      return;
+    }
+    const fences = (state.recoveryStopFences ??= {});
+    const existing = fences[identity.linearSessionId];
+    if (
+      existing === undefined ||
+      compareRecoveryOrder(payload.occurredAt, sequence, existing) > 0
+    ) {
+      fences[identity.linearSessionId] = {
+        occurredAt: payload.occurredAt,
+        sequence,
+        webhookId: identity.webhookId,
+        executionId: identity.executionId,
+      };
+    }
+  }
+
+  private receiptIsAtOrBeforeFence(
+    receipt: IngressReceipt,
+    fence: RecoveryStopFence,
+  ): boolean {
+    if (
+      this.recoveryKeyring === undefined ||
+      receipt.recoveryEnvelope === undefined ||
+      receipt.recoverySequence === undefined
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const payload = openIngressRecoveryPayload(
+      this.recoveryKeyring,
+      receiptIdentity(receipt),
+      receipt.recoverySequence,
+      receipt.recoveryEnvelope,
+    );
+    if (!isValidRecoveryStopFence(fence)) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    if (receipt.action === "created") {
+      return true;
+    }
+    const byTime = Date.parse(payload.occurredAt) - Date.parse(fence.occurredAt);
+    return (
+      byTime < 0 ||
+      (byTime === 0 && receipt.recoverySequence <= fence.sequence)
+    );
+  }
+
+
 
   getOrCreateActivityId(
     executionId: string,
@@ -507,6 +904,30 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       this.prune(state);
       await this.writeState(state);
     });
+  }
+
+  private supersedeOwnedActiveClaimInState(
+    state: PersistedBridgeState,
+    webhookId: string,
+    supersededByWebhookId: string,
+  ): void {
+    const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
+    if (claim.dispatchStartedAt !== undefined) {
+      throw new Error(`Dispatch already started for webhookId "${webhookId}"`);
+    }
+    const timestamp = this.timestamp();
+    receipt.status = "superseded";
+    receipt.supersededAt = timestamp;
+    receipt.supersededByWebhookId = supersededByWebhookId;
+    receipt.updatedAt = timestamp;
+    clearRecoveryEnvelope(receipt);
+    receipt.outcome = {
+      httpStatus: 200,
+      result: "not_dispatched",
+      disposition: "superseded",
+    };
+    claim.status = "completed";
+    claim.updatedAt = timestamp;
   }
 
   private async resolveExistingReceipt(
@@ -1040,6 +1461,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     ) {
       removeReceipt(state, remainingTerminal.shift()!);
     }
+    for (const [sessionId, fence] of Object.entries(
+      state.recoveryStopFences ?? {},
+    )) {
+      if (
+        isValidRecoveryStopFence(fence) &&
+        state.receipts[fence.webhookId] === undefined
+      ) {
+        delete state.recoveryStopFences![sessionId];
+      }
+    }
+    if (Object.keys(state.recoveryStopFences ?? {}).length === 0) {
+      delete state.recoveryStopFences;
+    }
   }
 
   private timestamp(): string {
@@ -1066,6 +1500,59 @@ function ambiguousOutcome(): ReceiptOutcome {
     disposition: "ambiguous",
     errorClass: "AmbiguousDispatch",
   };
+}
+
+function receiptIdentity(receipt: IngressReceipt): IngressEventIdentity {
+  return {
+    webhookId: receipt.webhookId,
+    executionId: receipt.executionId,
+    linearSessionId: receipt.linearSessionId,
+    action: receipt.action,
+  };
+}
+
+function clearRecoveryEnvelope(receipt: IngressReceipt): void {
+  delete receipt.recoverySequence;
+  delete receipt.recoveryEnvelope;
+}
+
+function activeRecoverableReceipts(
+  state: PersistedBridgeState,
+): IngressReceipt[] {
+  return Object.values(state.receipts).filter(
+    (receipt) =>
+      (receipt.status === "received" || receipt.status === "claimed") &&
+      receipt.dispatchStartedAt === undefined,
+  );
+}
+
+function compareRecoveryOrder(
+  occurredAt: string,
+  sequence: number,
+  other: { occurredAt: string; sequence: number },
+): number {
+  const byTime = Date.parse(occurredAt) - Date.parse(other.occurredAt);
+  return byTime === 0 ? sequence - other.sequence : byTime;
+}
+
+function isValidRecoveryStopFence(value: unknown): value is RecoveryStopFence {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).length === 4 &&
+    isCanonicalRecoveryTimestamp(record.occurredAt) &&
+    typeof record.sequence === "number" &&
+    Number.isSafeInteger(record.sequence) &&
+    record.sequence > 0 &&
+    typeof record.webhookId === "string" &&
+    record.webhookId.length > 0 &&
+    record.webhookId.length <= MAX_IDENTIFIER_LENGTH &&
+    typeof record.executionId === "string" &&
+    record.executionId.length > 0 &&
+    record.executionId.length <= MAX_EXECUTION_ID_LENGTH
+  );
 }
 
 function validateIdentity(identity: IngressEventIdentity): void {

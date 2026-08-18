@@ -4,6 +4,7 @@ import { LinearAgentClient } from "./linear/client.js";
 import { LinearOAuthTokenManager } from "./linear/oauth.js";
 import { JsonSessionStore } from "./sessions/store.js";
 import { JsonBridgeStateStore } from "./state/store.js";
+import { createIngressRecoveryKeyring } from "./state/recovery-envelope.js";
 import { SerialQueue } from "./queue.js";
 import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
@@ -21,13 +22,19 @@ const oauth = new LinearOAuthTokenManager({
   storePath: config.oauthTokenStorePath,
 });
 await oauth.load();
-startServer({
+const server = startServer({
   config,
   runtime: buildRuntime(config.runtime, config.kbPath),
   linear: new LinearAgentClient(oauth),
   oauth,
   store: new JsonSessionStore(config.sessionStorePath),
-  bridgeState: new JsonBridgeStateStore(config.bridgeStateStorePath),
+  bridgeState: new JsonBridgeStateStore(config.bridgeStateStorePath, {
+    recoveryKeyring: createIngressRecoveryKeyring(
+      config.ingressRecoveryKey,
+      config.ingressRecoveryPreviousKeys,
+    ),
+  }),
   queue: new SerialQueue(),
 });
+await server.ready;
 console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);

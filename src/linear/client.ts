@@ -72,7 +72,10 @@ export class LinearAgentClient {
       signal?: AbortSignal;
     } = {},
   ): Promise<void> {
-    const accessToken = await this.getAccessToken();
+    const accessToken = await abortable(
+      this.getAccessToken(),
+      options.signal,
+    );
     let response = await this.postActivity(
       accessToken,
       agentSessionId,
@@ -82,8 +85,10 @@ export class LinearAgentClient {
 
     if (response.status === 401 && typeof this.tokenSource !== "string") {
       await discardResponseBody(response);
-      const refreshedAccessToken =
-        await this.tokenSource.refreshAfterUnauthorized(accessToken);
+      const refreshedAccessToken = await abortable(
+        this.tokenSource.refreshAfterUnauthorized(accessToken),
+        options.signal,
+      );
       response = await this.postActivity(
         refreshedAccessToken,
         agentSessionId,
@@ -150,4 +155,28 @@ export class LinearAgentClient {
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
   }
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

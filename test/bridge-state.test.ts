@@ -7,6 +7,8 @@ import {
   buildLinuxLockProcessIdentity,
   darwinProcessRealUidArgs,
   JsonBridgeStateStore,
+  LegacyIngressRecoveryMismatchError,
+  LegacyIngressRecoveryUnavailableError,
   parseBootSessionUuid,
   parseDarwinProcessRealUid,
   parseDarwinProcessStartTime,
@@ -16,6 +18,13 @@ import {
   type IngressEventIdentity,
   type JsonBridgeStateStoreOptions,
 } from "../src/state/store.js";
+import {
+  createIngressRecoveryKeyring,
+  IngressRecoveryEnvelopeError,
+  openIngressRecoveryPayload,
+  parseCanonicalRecoveryKey,
+  sealIngressRecoveryPayload,
+} from "../src/state/recovery-envelope.js";
 
 let tmpDir: string;
 
@@ -23,6 +32,13 @@ const BOOT_A = "24f0c7a0-3dd9-4b33-869c-8f07d374ebd8";
 const BOOT_B = "79326562-1a4c-42a2-ac6d-00478b65895d";
 const TEST_UID = process.getuid?.() ?? 501;
 const CURRENT_PROCESS_IDENTITY = `linux-boot:${BOOT_A}:proc-start:100`;
+const RECOVERY_KEY_A = "A".repeat(43);
+const RECOVERY_KEY_B = Buffer.alloc(32, 1).toString("base64url");
+const TEST_LOCK_OPTIONS = {
+  lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
+  lockBootIdentity: async () => BOOT_A,
+  lockProcessUid: async () => TEST_UID,
+} satisfies JsonBridgeStateStoreOptions;
 
 beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "bridge-state-test-"));
@@ -79,6 +95,155 @@ type LockBootIdentity = NonNullable<
 type LockProcessUid = NonNullable<
   JsonBridgeStateStoreOptions["lockProcessUid"]
 >;
+
+describe("ingress recovery envelopes", () => {
+  const identity = event();
+  const payload = {
+    action: "created" as const,
+    prompt: "private exact recovery prompt",
+    occurredAt: "2026-08-18T12:00:00.000Z",
+    issueIdentifier: "MPI-1448",
+  };
+
+  it("accepts only canonical 32-byte base64url keys", () => {
+    expect(parseCanonicalRecoveryKey(RECOVERY_KEY_A)).toHaveLength(32);
+    expect(parseCanonicalRecoveryKey(`${RECOVERY_KEY_A}=`)).toBeUndefined();
+    expect(parseCanonicalRecoveryKey(RECOVERY_KEY_A.slice(1))).toBeUndefined();
+    expect(parseCanonicalRecoveryKey("_".repeat(44))).toBeUndefined();
+  });
+
+  it("decrypts retained-key envelopes after rotation and encrypts new work with the primary key", () => {
+    const oldKeyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const oldEnvelope = sealIngressRecoveryPayload(
+      oldKeyring,
+      identity,
+      7,
+      payload,
+    );
+    const rotatedKeyring = createIngressRecoveryKeyring(RECOVERY_KEY_B, [
+      RECOVERY_KEY_A,
+    ]);
+
+    expect(
+      openIngressRecoveryPayload(rotatedKeyring, identity, 7, oldEnvelope),
+    ).toEqual(payload);
+    const newEnvelope = sealIngressRecoveryPayload(
+      rotatedKeyring,
+      identity,
+      8,
+      payload,
+    );
+    expect(newEnvelope.keyId).toBe(rotatedKeyring.primary.id);
+    expect(() =>
+      openIngressRecoveryPayload(oldKeyring, identity, 8, newEnvelope),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+
+  it("rejects tamper and identity, action, and sequence AAD swaps", () => {
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const envelope = sealIngressRecoveryPayload(keyring, identity, 3, payload);
+    const first = envelope.ciphertext[0] === "A" ? "B" : "A";
+
+    expect(() =>
+      openIngressRecoveryPayload(keyring, identity, 3, {
+        ...envelope,
+        ciphertext: `${first}${envelope.ciphertext.slice(1)}`,
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(
+        keyring,
+        { ...identity, webhookId: "webhook-swapped" },
+        3,
+        envelope,
+      ),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(
+        keyring,
+        { ...identity, executionId: "created:session-swapped" },
+        3,
+        envelope,
+      ),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(
+        keyring,
+        { ...identity, action: "prompted" },
+        3,
+        envelope,
+      ),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(keyring, identity, 4, envelope),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+
+  it("enforces prompt and encoded field boundaries before decoding", () => {
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const maximumPrompt = "x".repeat(256 * 1024);
+    expect(() =>
+      sealIngressRecoveryPayload(keyring, identity, 1, {
+        ...payload,
+        prompt: maximumPrompt,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      sealIngressRecoveryPayload(keyring, identity, 1, {
+        ...payload,
+        prompt: `${maximumPrompt}x`,
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+
+    const envelope = sealIngressRecoveryPayload(keyring, identity, 2, payload);
+    expect(() =>
+      openIngressRecoveryPayload(keyring, identity, 2, {
+        ...envelope,
+        nonce: "A".repeat(17),
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(keyring, identity, 2, {
+        ...envelope,
+        tag: "A".repeat(23),
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      openIngressRecoveryPayload(keyring, identity, 2, {
+        ...envelope,
+        ciphertext: "A".repeat(Math.ceil(((258 * 1024 + 1) * 4) / 3)),
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+
+  it("rejects noncanonical timestamps and contradictory stop metadata", () => {
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    expect(() =>
+      sealIngressRecoveryPayload(keyring, identity, 1, {
+        ...payload,
+        occurredAt: "2026-08-18T12:00:00Z",
+      }),
+    ).toThrow(IngressRecoveryEnvelopeError);
+    expect(() =>
+      sealIngressRecoveryPayload(
+        keyring,
+        {
+          ...identity,
+          action: "prompted",
+          executionId: "activity-stop",
+        },
+        1,
+        {
+          action: "prompted",
+          prompt: "stop",
+          signal: "stop",
+          stop: false,
+          occurredAt: payload.occurredAt,
+        },
+      ),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+});
 
 describe("JsonBridgeStateStore", () => {
   it("retries current-process identity lookup after a transient unavailable result", async () => {
@@ -1022,6 +1187,338 @@ describe("JsonBridgeStateStore", () => {
     });
   });
 
+  it("persists only encrypted recovery content and removes the envelope at dispatch", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: keyring,
+    });
+    const privatePrompt = "private prompt body that must stay encrypted";
+    const privateIssue = "PRIVATE-ISSUE-TITLE";
+    await store.claimEvent(event(), {
+      action: "created",
+      prompt: privatePrompt,
+      issueIdentifier: privateIssue,
+      occurredAt: "2026-08-18T12:00:00.000Z",
+    });
+
+    const rawAccepted = await fs.readFile(storePath, "utf8");
+    expect(rawAccepted).not.toContain(privatePrompt);
+    expect(rawAccepted).not.toContain(privateIssue);
+    await expect(store.assertRecoverableEventsAvailable()).resolves.toBeUndefined();
+    await expect(store.listRecoverableEvents()).resolves.toEqual([
+      expect.objectContaining({
+        available: true,
+        sequence: 1,
+        payload: expect.objectContaining({ prompt: privatePrompt }),
+      }),
+    ]);
+
+    await expect(store.markDispatchStarted("webhook-1")).resolves.toBe(
+      "dispatch_started",
+    );
+    const persisted = JSON.parse(
+      await fs.readFile(storePath, "utf8"),
+    ) as { receipts: Record<string, Record<string, unknown>> };
+    expect(persisted.receipts["webhook-1"]).not.toHaveProperty(
+      "recoveryEnvelope",
+    );
+    expect(persisted.receipts["webhook-1"]).not.toHaveProperty(
+      "recoverySequence",
+    );
+
+    const privateSignal = "private-follow-up-signal";
+    await store.claimEvent(
+      event({
+        webhookId: "webhook-private-prompted",
+        executionId: "activity-private-prompted",
+        action: "prompted",
+      }),
+      {
+        action: "prompted",
+        prompt: privatePrompt,
+        signal: privateSignal,
+        stop: false,
+        occurredAt: "2026-08-18T12:00:01.000Z",
+      },
+    );
+    const rawPrompted = await fs.readFile(storePath, "utf8");
+    expect(rawPrompted).not.toContain(privatePrompt);
+    expect(rawPrompted).not.toContain(privateSignal);
+    await expect(
+      store.claimEvent(
+        event({
+          webhookId: "webhook-private-prompted-duplicate",
+          executionId: "activity-private-prompted",
+          action: "prompted",
+        }),
+        {
+          action: "prompted",
+          prompt: privatePrompt,
+          signal: privateSignal,
+          stop: false,
+          occurredAt: "2026-08-18T12:00:01.000Z",
+        },
+      ),
+    ).resolves.toMatchObject({ disposition: "superseded" });
+    const afterSupersede = JSON.parse(
+      await fs.readFile(storePath, "utf8"),
+    ) as { receipts: Record<string, Record<string, unknown>> };
+    expect(
+      afterSupersede.receipts["webhook-private-prompted-duplicate"],
+    ).not.toHaveProperty("recoveryEnvelope");
+  });
+
+  it("repairs only true legacy marker-free receipts and rejects asymmetric state", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const legacy = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-before-upgrade",
+    });
+    await legacy.claimEvent(event());
+    const upgraded = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-after-upgrade",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await expect(upgraded.assertRecoverableEventsAvailable()).rejects.toBeInstanceOf(
+      LegacyIngressRecoveryUnavailableError,
+    );
+    await expect(
+      upgraded.claimEvent(
+        event(),
+        {
+          action: "created",
+          prompt: "signed redelivery body",
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+        { repairLegacyOnly: true },
+      ),
+    ).resolves.toMatchObject({ disposition: "claimed" });
+    await expect(upgraded.assertRecoverableEventsAvailable()).resolves.toBeUndefined();
+
+    const raw = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+      receipts: Record<string, Record<string, unknown>>;
+    };
+    delete raw.receipts["webhook-1"]!.recoveryEnvelope;
+    await fs.writeFile(storePath, JSON.stringify(raw), { mode: 0o600 });
+    const asymmetric = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-after-tamper",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await expect(asymmetric.assertRecoverableEventsAvailable()).rejects.toBeInstanceOf(
+      IngressRecoveryEnvelopeError,
+    );
+    await expect(
+      asymmetric.claimEvent(
+        event(),
+        {
+          action: "created",
+          prompt: "must not repair asymmetric state",
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+        { repairLegacyOnly: true },
+      ),
+    ).rejects.toBeInstanceOf(LegacyIngressRecoveryMismatchError);
+  });
+
+  it("fails closed when a pending envelope key is unavailable", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const writer = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await writer.claimEvent(event(), {
+      action: "created",
+      prompt: "encrypted with retired key",
+      occurredAt: "2026-08-18T12:00:00.000Z",
+    });
+    const reader = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-b",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_B),
+    });
+
+    await expect(reader.assertRecoverableEventsAvailable()).rejects.toBeInstanceOf(
+      IngressRecoveryEnvelopeError,
+    );
+  });
+
+  it("orders same-millisecond stop fences by the durable recovery sequence", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    const occurredAt = "2026-08-18T12:00:00.000Z";
+    const olderPrompt = event({
+      webhookId: "webhook-older-prompt",
+      executionId: "activity-older-prompt",
+      action: "prompted",
+    });
+    const stop = event({
+      webhookId: "webhook-stop",
+      executionId: "activity-stop",
+      action: "prompted",
+    });
+    await store.claimEvent(olderPrompt, {
+      action: "prompted",
+      prompt: "older work",
+      occurredAt,
+      stop: false,
+    });
+    await store.claimEvent(stop, {
+      action: "prompted",
+      prompt: "stop",
+      signal: "stop",
+      occurredAt,
+      stop: true,
+    });
+    await expect(
+      store.markDispatchStarted(olderPrompt.webhookId),
+    ).resolves.toBe("superseded");
+
+    const newerPrompt = event({
+      webhookId: "webhook-newer-prompt",
+      executionId: "activity-newer-prompt",
+      action: "prompted",
+    });
+    await store.claimEvent(newerPrompt, {
+      action: "prompted",
+      prompt: "newer work",
+      occurredAt,
+      stop: false,
+    });
+    await expect(
+      store.markDispatchStarted(newerPrompt.webhookId),
+    ).resolves.toBe("dispatch_started");
+  });
+
+  it("fails closed on a malformed persisted stop fence", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await store.claimEvent(
+      event({
+        webhookId: "webhook-malformed-fence-stop",
+        executionId: "activity-malformed-fence-stop",
+        action: "prompted",
+      }),
+      {
+        action: "prompted",
+        prompt: "stop",
+        signal: "stop",
+        stop: true,
+        occurredAt: "2026-08-18T12:00:00.000Z",
+      },
+    );
+    const raw = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+      recoveryStopFences: Record<string, { occurredAt: string }>;
+    };
+    raw.recoveryStopFences["session-1"]!.occurredAt = "not-canonical";
+    await fs.writeFile(storePath, JSON.stringify(raw), { mode: 0o600 });
+
+    await expect(store.assertRecoverableEventsAvailable()).rejects.toBeInstanceOf(
+      IngressRecoveryEnvelopeError,
+    );
+  });
+
+  it("bounds active recovery admission and returns fixed-size recovery batches", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const capped = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: keyring,
+      maxRecoverableEvents: 2,
+    });
+    for (let index = 0; index < 2; index += 1) {
+      await capped.claimEvent(
+        event({
+          webhookId: `webhook-cap-${index}`,
+          executionId: `created:session-cap-${index}`,
+          linearSessionId: `session-cap-${index}`,
+        }),
+        {
+          action: "created",
+          prompt: `prompt ${index}`,
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+      );
+    }
+    await expect(
+      capped.claimEvent(
+        event({
+          webhookId: "webhook-cap-rejected",
+          executionId: "created:session-cap-rejected",
+          linearSessionId: "session-cap-rejected",
+        }),
+        {
+          action: "created",
+          prompt: "over capacity",
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+      ),
+    ).rejects.toBeInstanceOf(IngressRecoveryEnvelopeError);
+
+    const batchPath = path.join(tmpDir, "bridge-state-batches.json");
+    const batched = new JsonBridgeStateStore(batchPath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: keyring,
+      maxRecoverableEvents: 20,
+    });
+    for (let index = 0; index < 17; index += 1) {
+      await batched.claimEvent(
+        event({
+          webhookId: `webhook-batch-${index}`,
+          executionId: `created:session-batch-${index}`,
+          linearSessionId: `session-batch-${index}`,
+        }),
+        {
+          action: "created",
+          prompt: `batch ${index}`,
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+      );
+    }
+    const firstBatch = await batched.listRecoverableEvents();
+    expect(firstBatch).toHaveLength(16);
+    expect(firstBatch.every((candidate) => candidate.available)).toBe(true);
+    const lastSequence = firstBatch.at(-1)?.sequence;
+    expect(lastSequence).toBe(16);
+    const raw = JSON.parse(await fs.readFile(batchPath, "utf8")) as {
+      nextRecoverySequence?: number;
+    };
+    raw.nextRecoverySequence = 1;
+    await fs.writeFile(batchPath, JSON.stringify(raw), { mode: 0o600 });
+    await expect(
+      batched.claimEvent(
+        event({
+          webhookId: "webhook-batch-after-stale-cursor",
+          executionId: "created:session-batch-after-stale-cursor",
+          linearSessionId: "session-batch-after-stale-cursor",
+        }),
+        {
+          action: "created",
+          prompt: "after stale cursor",
+          occurredAt: "2026-08-18T12:00:00.000Z",
+        },
+      ),
+    ).resolves.toMatchObject({ receipt: { recoverySequence: 18 } });
+    await expect(batched.listRecoverableEvents(lastSequence)).resolves.toHaveLength(
+      2,
+    );
+  });
+
   it("reclaims a same-process pre-dispatch claim when its durability acknowledgement fails", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const directory = path.dirname(storePath);
@@ -1237,7 +1734,9 @@ describe("JsonBridgeStateStore", () => {
     await expect(runtimeA.markDispatchStarted("webhook-1")).rejects.toThrow(
       /ownership/i,
     );
-    await expect(runtimeB.markDispatchStarted("webhook-1")).resolves.toBeUndefined();
+    await expect(runtimeB.markDispatchStarted("webhook-1")).resolves.toBe(
+      "dispatch_started",
+    );
   });
 
   it("releases only a pre-dispatch claim and lets the same delivery reclaim it", async () => {
@@ -1377,6 +1876,51 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.getReceipt("old-active")).resolves.toMatchObject({
       status: "claimed",
     });
+  });
+
+  it("prunes a stop fence with its retained terminal receipt", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    let now = Date.parse("2026-08-01T00:00:00.000Z");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      now: () => now,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+    });
+    await store.claimEvent(
+      event({
+        webhookId: "old-stop",
+        executionId: "activity-old-stop",
+        action: "prompted",
+      }),
+      {
+        action: "prompted",
+        prompt: "stop",
+        signal: "stop",
+        stop: true,
+        occurredAt: new Date(now).toISOString(),
+      },
+    );
+    await store.markDispatchStarted("old-stop");
+    await store.completeEvent("old-stop");
+
+    now += 8 * 24 * 60 * 60 * 1000;
+    await store.claimEvent(
+      event({
+        webhookId: "new-after-stop-retention",
+        executionId: "created:new-after-stop-retention",
+        linearSessionId: "new-after-stop-retention",
+      }),
+      {
+        action: "created",
+        prompt: "new work",
+        occurredAt: new Date(now).toISOString(),
+      },
+    );
+    const raw = JSON.parse(await fs.readFile(storePath, "utf8")) as {
+      recoveryStopFences?: Record<string, unknown>;
+    };
+    expect(raw.recoveryStopFences?.["session-1"]).toBeUndefined();
   });
 
   it("caps retained receipts by evicting the oldest terminal entry first", async () => {

@@ -12,6 +12,7 @@ interface LinearAgentSessionEventBase {
   promptContext?: string | undefined;
   previousComments?: unknown;
   guidance?: string | undefined;
+  webhookTimestamp: number;
 }
 
 /** Subset of Linear's AgentSessionEvent webhook payload we consume. */
@@ -29,6 +30,7 @@ export type LinearAgentSessionEvent =
        */
       agentActivity: {
         id: string;
+        createdAt?: string | undefined;
         body?: string | undefined;
         content?: { type?: string; body?: string; signal?: string } | undefined;
         signal?: string | undefined;

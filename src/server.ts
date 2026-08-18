@@ -26,12 +26,20 @@ import type { JsonSessionStore } from "./sessions/store.js";
 import type {
   BridgeStateStore,
   IngressEventIdentity,
+  RecoverableIngressEvent,
   ReceiptErrorClass,
 } from "./state/store.js";
 import {
   BridgeStateLockTimeoutError,
   ClaimOwnershipError,
+  LegacyIngressRecoveryMismatchError,
+  LegacyIngressRecoveryUnavailableError,
 } from "./state/store.js";
+import {
+  isStopPrompt,
+  IngressRecoveryEnvelopeError,
+  type IngressRecoveryPayload,
+} from "./state/recovery-envelope.js";
 import type { SerialQueue } from "./queue.js";
 
 /** Linear's OAuth2 token-exchange endpoint (linear.app/developers/oauth-2-0-authentication). */
@@ -53,7 +61,27 @@ const STOPPED_RESPONSE_BODY = "Stopped.";
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 
 interface InternalServerDeps extends ServerDeps {
-  activeRuns: Map<string, Set<AbortController>>;
+  activeRuns: Map<string, Set<ActiveRun>>;
+  shutdownController: AbortController;
+  processingInFlight: Set<Promise<void>>;
+  closing: boolean;
+  recoveryInFlight?: Promise<void> | undefined;
+  recoveryRequested: boolean;
+  recoveryBlocked: boolean;
+  recoveryAwaitingRedelivery: boolean;
+  dispatchReady: boolean;
+  requestStartupRecovery: () => void;
+}
+
+interface RecoveryOrder {
+  action: "created" | "prompted";
+  occurredAt: string;
+  sequence: number;
+}
+
+interface ActiveRun {
+  controller: AbortController;
+  recoveryOrder: RecoveryOrder;
 }
 
 export interface ServerDeps {
@@ -78,6 +106,8 @@ export interface ServerDeps {
   onListening?: (port: number) => void;
   /** Test hook for the state-bearing URL printed during initial setup. */
   onOAuthAuthorizationUrl?: (url: string) => void;
+  /** Test seam for work that begins only after the HTTP acknowledgement. */
+  schedulePostResponseWork?: (work: () => void) => void;
 }
 
 class OAuthStateStore {
@@ -112,6 +142,13 @@ class PreDispatchClaimReleasedError extends Error {
   }
 }
 
+class ServerListenError extends Error {
+  constructor() {
+    super("Bridge HTTP listener could not start");
+    this.name = "ServerListenError";
+  }
+}
+
 /**
  * HTTP server + session orchestration.
  *
@@ -132,11 +169,22 @@ class PreDispatchClaimReleasedError extends Error {
  * rotating actor=app token pair, and persist it for automatic refresh.
  * GET /healthz — liveness for launchd.
  */
-export function startServer(deps: ServerDeps): { close(): Promise<void> } {
+export function startServer(deps: ServerDeps): {
+  ready: Promise<void>;
+  close(): Promise<void>;
+} {
   const oauthStates = new OAuthStateStore();
   const internalDeps: InternalServerDeps = {
     ...deps,
-    activeRuns: new Map<string, Set<AbortController>>(),
+    activeRuns: new Map<string, Set<ActiveRun>>(),
+    shutdownController: new AbortController(),
+    processingInFlight: new Set<Promise<void>>(),
+    closing: false,
+    recoveryRequested: false,
+    recoveryBlocked: false,
+    recoveryAwaitingRedelivery: false,
+    dispatchReady: false,
+    requestStartupRecovery: () => undefined,
   };
   const server = createServer((req, res) => {
     handleRequest(req, res, internalDeps, oauthStates).catch((error: unknown) => {
@@ -150,22 +198,113 @@ export function startServer(deps: ServerDeps): { close(): Promise<void> } {
     });
   });
 
+  let resolveReady!: () => void;
+  let rejectReady!: (error: unknown) => void;
+  let readySettled = false;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = () => {
+      if (!readySettled) {
+        readySettled = true;
+        resolve();
+      }
+    };
+    rejectReady = (error) => {
+      if (!readySettled) {
+        readySettled = true;
+        reject(error);
+      }
+    };
+  });
+  // A caller may close immediately without ever awaiting ready. Keep the
+  // returned promise rejectable while preventing an unhandled rejection.
+  void ready.catch(() => undefined);
+
+  let resolveListenOutcome!: () => void;
+  const listenOutcome = new Promise<void>((resolve) => {
+    resolveListenOutcome = resolve;
+  });
+  server.once("error", () => {
+    resolveListenOutcome();
+    rejectReady(new ServerListenError());
+  });
+
+  let startupAttempt: Promise<void> | undefined;
+  const requestStartupRecovery = (): void => {
+    if (
+      internalDeps.closing ||
+      internalDeps.dispatchReady ||
+      internalDeps.recoveryBlocked ||
+      startupAttempt !== undefined
+    ) {
+      return;
+    }
+    const attempt = (async () => {
+      try {
+        await scheduleAcceptedIngressRecovery(internalDeps);
+        if (internalDeps.closing) {
+          return;
+        }
+        await emitOAuthAuthorizationUrlIfNeeded(deps, oauthStates);
+        if (internalDeps.closing) {
+          return;
+        }
+        internalDeps.recoveryAwaitingRedelivery = false;
+        internalDeps.dispatchReady = true;
+        resolveReady();
+      } catch (error) {
+        if (error instanceof LegacyIngressRecoveryUnavailableError) {
+          internalDeps.recoveryAwaitingRedelivery = true;
+          return;
+        }
+        if (!internalDeps.closing) {
+          internalDeps.recoveryAwaitingRedelivery = false;
+          internalDeps.recoveryBlocked = true;
+          rejectReady(error);
+        }
+      }
+    })();
+    startupAttempt = attempt;
+    void attempt.then(() => {
+      if (startupAttempt === attempt) {
+        startupAttempt = undefined;
+      }
+    });
+  };
+  internalDeps.requestStartupRecovery = requestStartupRecovery;
+
   server.listen(deps.config.port, () => {
+    resolveListenOutcome();
     const address = server.address();
-    if (deps.onListening !== undefined && address !== null && typeof address === "object") {
+    if (
+      deps.onListening !== undefined &&
+      address !== null &&
+      typeof address === "object"
+    ) {
       deps.onListening(address.port);
     }
-    void emitOAuthAuthorizationUrlIfNeeded(deps, oauthStates);
+    requestStartupRecovery();
   });
 
   return {
-    close(): Promise<void> {
-      for (const controllers of internalDeps.activeRuns.values()) {
-        for (const controller of controllers) {
-          controller.abort(new Error("Server shutting down"));
+    ready,
+    async close(): Promise<void> {
+      internalDeps.closing = true;
+      rejectReady(new Error("Server shutting down"));
+      internalDeps.shutdownController.abort(new Error("Server shutting down"));
+      for (const runs of internalDeps.activeRuns.values()) {
+        for (const run of runs) {
+          run.controller.abort(new Error("Server shutting down"));
         }
       }
-      return new Promise((resolve, reject) => {
+      await Promise.allSettled([...internalDeps.processingInFlight]);
+      await internalDeps.recoveryInFlight?.catch(() => undefined);
+      await startupAttempt?.catch(() => undefined);
+      await internalDeps.queue.enqueue(async () => {});
+      await listenOutcome;
+      if (!server.listening) {
+        return;
+      }
+      await new Promise<void>((resolve, reject) => {
         server.close((err) => {
           if (err) {
             reject(err);
@@ -188,6 +327,25 @@ async function handleRequest(
   oauthStates: OAuthStateStore,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (
+    deps.recoveryBlocked &&
+    (url.pathname === "/healthz" || url.pathname === "/webhook")
+  ) {
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("ingress recovery unavailable");
+    return;
+  }
+
+  if (
+    !deps.dispatchReady &&
+    (url.pathname === "/healthz" ||
+      (url.pathname === "/webhook" && !deps.recoveryAwaitingRedelivery))
+  ) {
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("ingress recovery unavailable");
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === "/healthz") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -296,15 +454,41 @@ async function handleWebhook(
   }
 
   const identity = eventIdentity(event);
+  const recoverablePayload = recoveryPayload(event);
+  const repairingLegacyReceipt =
+    !deps.dispatchReady &&
+    !deps.recoveryBlocked &&
+    deps.recoveryAwaitingRedelivery;
   let claimResult;
+  let recoveryOrder: RecoveryOrder | undefined;
   try {
-    claimResult = await deps.bridgeState.claimEvent(identity);
+    claimResult = await deps.bridgeState.claimEvent(
+      identity,
+      recoverablePayload,
+      repairingLegacyReceipt ? { repairLegacyOnly: true } : undefined,
+    );
+    if (claimResult.disposition === "claimed") {
+      recoveryOrder = recoveryOrderFromReceipt(
+        claimResult.receipt.recoverySequence,
+        recoverablePayload,
+      );
+    }
+    if (
+      repairingLegacyReceipt &&
+      (claimResult.disposition !== "claimed" ||
+        !(await deps.bridgeState.releasePreDispatchClaim(identity.webhookId)))
+    ) {
+      throw new LegacyIngressRecoveryMismatchError();
+    }
   } catch (error) {
     console.error(
       `[linear-agent-bridge] ingress persistence failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
     );
     res.writeHead(503, { "Content-Type": "text/plain" });
     res.end("ingress persistence unavailable");
+    if (repairingLegacyReceipt) {
+      deps.requestStartupRecovery();
+    }
     return;
   }
 
@@ -313,6 +497,11 @@ async function handleWebhook(
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok");
 
+  if (repairingLegacyReceipt) {
+    deps.requestStartupRecovery();
+    return;
+  }
+
   if (claimResult.disposition !== "claimed") {
     console.log(
       `[linear-agent-bridge] ingress ${claimResult.disposition}: webhook=${identity.webhookId} execution=${identity.executionId}`,
@@ -320,17 +509,191 @@ async function handleWebhook(
     return;
   }
 
-  processClaimedWebhook(event, identity, deps).catch(async (error: unknown) => {
-    console.error(
-      `[linear-agent-bridge] webhook processing failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
-    );
-    if (
-      !(error instanceof ClaimOwnershipError) &&
-      !(error instanceof PreDispatchClaimReleasedError)
-    ) {
-      await markIngressFailed(deps, identity, "WebhookProcessingError");
+  const schedule = deps.schedulePostResponseWork ?? setImmediate;
+  schedule(() => {
+    if (!deps.closing) {
+      trackClaimedEventProcessing(
+        deps,
+        processClaimedEvent(
+          event,
+          identity,
+          recoveryOrder!,
+          deps,
+          "webhook",
+        ),
+      );
     }
   });
+}
+
+function trackClaimedEventProcessing(
+  deps: InternalServerDeps,
+  processing: Promise<"settled" | "retryable">,
+): void {
+  const tracked = processing.then(() => undefined);
+  deps.processingInFlight.add(tracked);
+  void tracked.then(
+    () => deps.processingInFlight.delete(tracked),
+    () => deps.processingInFlight.delete(tracked),
+  );
+}
+
+function scheduleAcceptedIngressRecovery(
+  deps: InternalServerDeps,
+): Promise<void> {
+  if (deps.closing) {
+    return Promise.resolve();
+  }
+  deps.recoveryRequested = true;
+  if (deps.recoveryInFlight !== undefined) {
+    return deps.recoveryInFlight;
+  }
+  const recovery = runAcceptedIngressRecovery(deps)
+    .catch((error: unknown) => {
+      if (deps.closing) {
+        return;
+      }
+      if (!(error instanceof LegacyIngressRecoveryUnavailableError)) {
+        deps.recoveryBlocked = true;
+      }
+      console.error(
+        `[linear-agent-bridge] ingress recovery failed: error=${boundedErrorClass(error)}`,
+      );
+      throw error;
+    })
+    .finally(() => {
+      if (deps.recoveryInFlight === recovery) {
+        deps.recoveryInFlight = undefined;
+      }
+    });
+  deps.recoveryInFlight = recovery;
+  return recovery;
+}
+
+async function runAcceptedIngressRecovery(
+  deps: InternalServerDeps,
+): Promise<void> {
+  let retryDelayMs = 100;
+  while (!deps.closing && deps.recoveryRequested) {
+    deps.recoveryRequested = false;
+    await recoverAcceptedIngressPass(deps);
+    if (deps.recoveryRequested && !deps.closing) {
+      await delay(retryDelayMs, deps.shutdownController.signal);
+      retryDelayMs = Math.min(retryDelayMs * 2, 5_000);
+    }
+  }
+}
+
+async function recoverAcceptedIngressPass(
+  deps: InternalServerDeps,
+): Promise<void> {
+  await deps.bridgeState.assertRecoverableEventsAvailable();
+  let afterSequence = 0;
+  while (!deps.closing) {
+    const recoverable = await deps.bridgeState.listRecoverableEvents(
+      afterSequence,
+    );
+    if (recoverable.length === 0) {
+      return;
+    }
+    for (const candidate of recoverable) {
+      if (deps.closing) {
+        return;
+      }
+      if (!candidate.available) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      afterSequence = candidate.sequence;
+      const claim = await deps.bridgeState.claimEvent(candidate.identity);
+      if (claim.disposition !== "claimed") {
+        continue;
+      }
+      const outcome = await processClaimedEvent(
+        recoveredEvent(candidate),
+        candidate.identity,
+        {
+          action: candidate.payload.action,
+          occurredAt: candidate.payload.occurredAt,
+          sequence: candidate.sequence,
+        },
+        deps,
+        "recovery",
+      );
+      if (outcome === "retryable") {
+        return;
+      }
+    }
+  }
+}
+
+async function processClaimedEvent(
+  event: LinearAgentSessionEvent,
+  identity: IngressEventIdentity,
+  recoveryOrder: RecoveryOrder,
+  deps: InternalServerDeps,
+  scope: "webhook" | "recovery",
+): Promise<"settled" | "retryable"> {
+  try {
+    await processClaimedWebhook(event, identity, recoveryOrder, deps);
+    return "settled";
+  } catch (error) {
+    if (deps.closing && deps.shutdownController.signal.aborted) {
+      return "settled";
+    }
+    console.error(
+      `[linear-agent-bridge] ${scope} processing failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+    );
+    if (error instanceof PreDispatchClaimReleasedError) {
+      void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
+      return "retryable";
+    }
+    if (!(error instanceof ClaimOwnershipError)) {
+      await markIngressFailed(deps, identity, "WebhookProcessingError");
+    }
+    return "settled";
+  }
+}
+
+function recoveredEvent(
+  candidate: Extract<RecoverableIngressEvent, { available: true }>,
+): LinearAgentSessionEvent {
+  const { identity, payload } = candidate;
+  if (payload.action === "created") {
+    return {
+      webhookId: identity.webhookId,
+      webhookTimestamp: Date.parse(payload.occurredAt),
+      action: "created",
+      agentSession: {
+        id: identity.linearSessionId,
+        ...(payload.issueIdentifier !== undefined
+          ? {
+              issue: {
+                id: payload.issueIdentifier,
+                identifier: payload.issueIdentifier,
+                title: "",
+              },
+            }
+          : {}),
+      },
+      promptContext: payload.prompt,
+    };
+  }
+  return {
+    webhookId: identity.webhookId,
+    webhookTimestamp: Date.parse(payload.occurredAt),
+    action: "prompted",
+    agentSession: { id: identity.linearSessionId },
+    agentActivity: {
+      id: identity.executionId,
+      createdAt: payload.occurredAt,
+      content: {
+        type: "prompt",
+        body: payload.prompt,
+        ...(payload.signal !== undefined ? { signal: payload.signal } : {}),
+      },
+      ...(payload.signal !== undefined ? { signal: payload.signal } : {}),
+    },
+  };
 }
 
 function readRawBody(req: IncomingMessage): Promise<Buffer> {
@@ -379,7 +742,12 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
   }
   if (obj.action === "prompted") {
     const agentActivity = asRecord(obj.agentActivity);
-    if (!isBoundedIdentifier(agentActivity?.id)) {
+    if (
+      !isBoundedIdentifier(agentActivity?.id) ||
+      (agentActivity.createdAt !== undefined &&
+        (typeof agentActivity.createdAt !== "string" ||
+          !Number.isFinite(Date.parse(agentActivity.createdAt))))
+    ) {
       return undefined;
     }
   }
@@ -399,40 +767,89 @@ function eventIdentity(event: LinearAgentSessionEvent): IngressEventIdentity {
   };
 }
 
+function recoveryPayload(
+  event: LinearAgentSessionEvent,
+): IngressRecoveryPayload {
+  const occurredAt = new Date(
+    event.action === "prompted" && event.agentActivity.createdAt !== undefined
+      ? Date.parse(event.agentActivity.createdAt)
+      : event.webhookTimestamp,
+  ).toISOString();
+  const issueIdentifier = event.agentSession.issue?.identifier;
+  if (event.action === "created") {
+    return {
+      action: "created",
+      occurredAt,
+      prompt: event.promptContext ?? event.agentSession.issue?.title ?? "",
+      ...(issueIdentifier !== undefined ? { issueIdentifier } : {}),
+    };
+  }
+  const prompt =
+    event.agentActivity.content?.body ?? event.agentActivity.body ?? "";
+  const signal =
+    event.agentActivity.content?.signal ?? event.agentActivity.signal;
+  return {
+    action: "prompted",
+    occurredAt,
+    prompt,
+    stop: isStopPrompt(prompt, signal),
+    ...(signal !== undefined ? { signal } : {}),
+  };
+}
+
 async function processClaimedWebhook(
   event: LinearAgentSessionEvent,
   identity: IngressEventIdentity,
+  recoveryOrder: RecoveryOrder,
   deps: InternalServerDeps,
 ): Promise<void> {
-  try {
-    await deps.bridgeState.markDispatchStarted(identity.webhookId);
-  } catch (error) {
-    let released = false;
-    try {
-      released = await deps.bridgeState.releasePreDispatchClaim(
-        identity.webhookId,
-      );
-    } catch (releaseError) {
-      console.error(
-        `[linear-agent-bridge] pre-dispatch claim release failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(releaseError)}`,
-      );
-    }
-    if (released) {
-      throw new PreDispatchClaimReleasedError();
-    }
-    throw error;
-  }
-  console.log(
-    `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
-  );
-
   const sessionId = event.agentSession.id;
   const issueIdentifier = event.agentSession.issue?.identifier;
-
-  if (event.action === "created") {
-    const controller = registerSessionRun(deps, sessionId);
-    let enqueued = false;
+  const prompt =
+    event.action === "created"
+      ? event.promptContext ?? event.agentSession.issue?.title ?? ""
+      : event.agentActivity.content?.body ?? event.agentActivity.body ?? "";
+  const isStop =
+    event.action === "prompted" &&
+    isStopPrompt(
+      prompt,
+      event.agentActivity.content?.signal ?? event.agentActivity.signal,
+    );
+  const controller = isStop
+    ? undefined
+    : registerSessionRun(deps, sessionId, recoveryOrder);
+  let enqueued = false;
+  try {
     try {
+      const dispatch = await deps.bridgeState.markDispatchStarted(
+        identity.webhookId,
+      );
+      if (dispatch === "superseded") {
+        return;
+      }
+    } catch (error) {
+      let released = false;
+      let releaseFailed = false;
+      try {
+        released = await deps.bridgeState.releasePreDispatchClaim(
+          identity.webhookId,
+        );
+      } catch (releaseError) {
+        releaseFailed = true;
+        console.error(
+          `[linear-agent-bridge] pre-dispatch claim release failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(releaseError)}`,
+        );
+      }
+      if (released || releaseFailed) {
+        throw new PreDispatchClaimReleasedError();
+      }
+      throw error;
+    }
+    console.log(
+      `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
+    );
+
+    if (event.action === "created") {
       // 10s liveness rule: emit a thought before doing anything else.
       await emitActivity(
         deps,
@@ -443,56 +860,45 @@ async function processClaimedWebhook(
           type: "thought",
           body: CREATED_THOUGHT_BODY,
         },
-        { ephemeral: true },
+        { ephemeral: true, signal: controller!.signal },
       );
-      if (controller.signal.aborted) {
-        await deps.bridgeState.completeEvent(identity.webhookId);
+      if (controller!.signal.aborted) {
+        if (!deps.closing) {
+          await deps.bridgeState.completeEvent(identity.webhookId);
+        }
         return;
       }
-
-      const prompt = event.promptContext ?? event.agentSession.issue?.title ?? "";
       enqueueSessionRun(
         deps,
         { linearSessionId: sessionId, prompt },
         issueIdentifier,
-        controller,
+        controller!,
         identity,
       );
       enqueued = true;
-    } finally {
-      if (!enqueued) {
-        unregisterRun(deps, sessionId, controller);
-      }
+      return;
     }
-    return;
-  }
 
-  // action === "prompted" — the user text lives in the content union
-  // (verified against live payloads 2026-08-12); bare body is a fallback.
-  const prompt = event.agentActivity?.content?.body ?? event.agentActivity?.body ?? "";
-  const isStop =
-    event.agentActivity?.content?.signal === "stop" ||
-    event.agentActivity?.signal === "stop" ||
-    /^stop[.!]?$/i.test(prompt.trim());
-  if (isStop) {
-    abortSessionRuns(deps, sessionId);
-    await emitActivity(
-      deps,
-      identity.executionId,
-      "stop-response",
-      sessionId,
-      { type: "response", body: STOPPED_RESPONSE_BODY },
-    );
-    await deps.bridgeState.completeEvent(identity.webhookId);
-    return;
-  }
+    if (isStop) {
+      abortSessionRuns(deps, sessionId, recoveryOrder);
+      await emitActivity(
+        deps,
+        identity.executionId,
+        "stop-response",
+        sessionId,
+        { type: "response", body: STOPPED_RESPONSE_BODY },
+        { signal: deps.shutdownController.signal },
+      );
+      if (!deps.closing) {
+        await deps.bridgeState.completeEvent(identity.webhookId);
+      }
+      return;
+    }
 
-  const controller = registerSessionRun(deps, sessionId);
-  let enqueued = false;
-  try {
-    const record = await deps.store.get(sessionId);
-    if (controller.signal.aborted) {
-      await deps.bridgeState.completeEvent(identity.webhookId);
+    if (controller!.signal.aborted) {
+      if (!deps.closing) {
+        await deps.bridgeState.completeEvent(identity.webhookId);
+      }
       return;
     }
     if (prompt === "") {
@@ -509,22 +915,25 @@ async function processClaimedWebhook(
         type: "thought",
         body: PROMPTED_THOUGHT_BODY,
       },
-      { ephemeral: true },
+      { ephemeral: true, signal: controller!.signal },
     );
-    if (controller.signal.aborted) {
-      await deps.bridgeState.completeEvent(identity.webhookId);
+    if (controller!.signal.aborted) {
+      if (!deps.closing) {
+        await deps.bridgeState.completeEvent(identity.webhookId);
+      }
       return;
     }
     enqueueSessionRun(
       deps,
-      { linearSessionId: sessionId, prompt, resumeSessionId: record?.runtimeSessionId },
-      issueIdentifier ?? record?.issueIdentifier,
-      controller,
+      { linearSessionId: sessionId, prompt },
+      issueIdentifier,
+      controller!,
       identity,
+      { loadStoredSessionAtExecution: true },
     );
     enqueued = true;
   } finally {
-    if (!enqueued) {
+    if (controller !== undefined && !enqueued) {
       unregisterRun(deps, sessionId, controller);
     }
   }
@@ -533,14 +942,15 @@ async function processClaimedWebhook(
 function registerSessionRun(
   deps: InternalServerDeps,
   sessionId: string,
+  recoveryOrder: RecoveryOrder,
 ): AbortController {
   const controller = new AbortController();
-  let controllers = deps.activeRuns.get(sessionId);
-  if (controllers === undefined) {
-    controllers = new Set<AbortController>();
-    deps.activeRuns.set(sessionId, controllers);
+  let runs = deps.activeRuns.get(sessionId);
+  if (runs === undefined) {
+    runs = new Set<ActiveRun>();
+    deps.activeRuns.set(sessionId, runs);
   }
-  controllers.add(controller);
+  runs.add({ controller, recoveryOrder });
   return controller;
 }
 
@@ -550,21 +960,34 @@ function enqueueSessionRun(
   issueIdentifier: string | undefined,
   controller: AbortController,
   identity: IngressEventIdentity,
+  options: { loadStoredSessionAtExecution?: boolean } = {},
 ): void {
   void deps.queue
     .enqueue(async () => {
+      let effectiveRequest = request;
+      let effectiveIssueIdentifier = issueIdentifier;
       let terminalReason: TurnTerminalReason = controller.signal.aborted
         ? "stopped"
         : "failed";
       try {
+        if (options.loadStoredSessionAtExecution === true) {
+          const storedSession = await deps.store.get(request.linearSessionId);
+          effectiveRequest = {
+            ...request,
+            ...(storedSession?.runtimeSessionId !== undefined
+              ? { resumeSessionId: storedSession.runtimeSessionId }
+              : {}),
+          };
+          effectiveIssueIdentifier ??= storedSession?.issueIdentifier;
+        }
         if (!controller.signal.aborted) {
           console.log(
             `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
           );
           terminalReason = await runSessionTask(
             deps,
-            { ...request, abortController: controller },
-            issueIdentifier,
+            { ...effectiveRequest, abortController: controller },
+            effectiveIssueIdentifier,
             identity.executionId,
           );
         }
@@ -573,15 +996,17 @@ function enqueueSessionRun(
           `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
         );
         try {
-          if (terminalReason === "failed" || terminalReason === "inactive") {
-            await deps.bridgeState.failEvent(
-              identity.webhookId,
-              terminalReason === "inactive"
-                ? "RuntimeTimeout"
-                : "RuntimeExecutionError",
-            );
-          } else {
-            await deps.bridgeState.completeEvent(identity.webhookId);
+          if (!deps.closing) {
+            if (terminalReason === "failed" || terminalReason === "inactive") {
+              await deps.bridgeState.failEvent(
+                identity.webhookId,
+                terminalReason === "inactive"
+                  ? "RuntimeTimeout"
+                  : "RuntimeExecutionError",
+              );
+            } else {
+              await deps.bridgeState.completeEvent(identity.webhookId);
+            }
           }
         } finally {
           unregisterRun(deps, request.linearSessionId, controller);
@@ -589,15 +1014,23 @@ function enqueueSessionRun(
       }
     })
     .catch((error: unknown) => {
-      console.error(
-        `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
-      );
+      if (!deps.closing) {
+        console.error(
+          `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+        );
+      }
     });
 }
 
-function abortSessionRuns(deps: InternalServerDeps, sessionId: string): void {
-  for (const controller of deps.activeRuns.get(sessionId) ?? []) {
-    controller.abort(new Error("Stopped by user"));
+function abortSessionRuns(
+  deps: InternalServerDeps,
+  sessionId: string,
+  stopOrder: RecoveryOrder,
+): void {
+  for (const run of deps.activeRuns.get(sessionId) ?? []) {
+    if (runIsAtOrBeforeStop(run.recoveryOrder, stopOrder)) {
+      run.controller.abort(new Error("Stopped by user"));
+    }
   }
 }
 
@@ -606,11 +1039,68 @@ function unregisterRun(
   sessionId: string,
   controller: AbortController,
 ): void {
-  const controllers = deps.activeRuns.get(sessionId);
-  controllers?.delete(controller);
-  if (controllers?.size === 0) {
+  const runs = deps.activeRuns.get(sessionId);
+  if (runs !== undefined) {
+    for (const run of runs) {
+      if (run.controller === controller) {
+        runs.delete(run);
+        break;
+      }
+    }
+  }
+  if (runs?.size === 0) {
     deps.activeRuns.delete(sessionId);
   }
+}
+
+function recoveryOrderFromReceipt(
+  sequence: number | undefined,
+  payload: IngressRecoveryPayload,
+): RecoveryOrder {
+  if (
+    !Number.isSafeInteger(sequence) ||
+    sequence === undefined ||
+    sequence <= 0
+  ) {
+    throw new IngressRecoveryEnvelopeError();
+  }
+  return {
+    action: payload.action,
+    occurredAt: payload.occurredAt,
+    sequence,
+  };
+}
+
+function runIsAtOrBeforeStop(
+  runOrder: RecoveryOrder,
+  stopOrder: RecoveryOrder,
+): boolean {
+  if (runOrder.action === "created") {
+    return true;
+  }
+  const byTime =
+    Date.parse(runOrder.occurredAt) - Date.parse(stopOrder.occurredAt);
+  return (
+    byTime < 0 ||
+    (byTime === 0 && runOrder.sequence <= stopOrder.sequence)
+  );
+}
+
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) {
+    return Promise.reject(signal.reason);
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -643,19 +1133,28 @@ async function runSessionTask(
       );
     }
   };
+  const onControllerAbort = (): void => {
+    acceptEvents = false;
+    forceCloseRuntime();
+    resolveWatchdog(inactivityTriggered ? "inactive" : "stopped");
+  };
+  controller?.signal.addEventListener("abort", onControllerAbort, {
+    once: true,
+  });
+  if (controller?.signal.aborted === true) {
+    onControllerAbort();
+  }
   const armWatchdog = (): void => {
     clearTimeout(inactivityTimer);
     inactivityTimer = setTimeout(() => {
       acceptEvents = false;
-      if (controller?.signal.aborted === true) {
-        forceCloseRuntime();
-        resolveWatchdog("stopped");
-        return;
-      }
       inactivityTriggered = true;
-      controller?.abort(new Error("Session inactivity limit exceeded"));
-      forceCloseRuntime();
-      resolveWatchdog("inactive");
+      if (controller !== undefined) {
+        controller.abort(new Error("Session inactivity limit exceeded"));
+      } else {
+        forceCloseRuntime();
+        resolveWatchdog("inactive");
+      }
     }, deps.config.runInactivityTimeoutMs);
   };
   // Queue and webhook time do not count. The first watchdog window begins
@@ -696,6 +1195,7 @@ async function runSessionTask(
     watchdog.then((reason) => ({ source: "watchdog" as const, reason })),
   ]);
   clearTimeout(inactivityTimer!);
+  controller?.signal.removeEventListener("abort", onControllerAbort);
 
   if (
     inactivityTriggered ||
@@ -800,9 +1300,14 @@ async function emitActivity(
     executionId,
     activityKey,
   );
+  const signal =
+    options.signal === undefined
+      ? deps.shutdownController.signal
+      : AbortSignal.any([options.signal, deps.shutdownController.signal]);
   await deps.linear.createActivity(agentSessionId, content, {
     activityId,
     ...options,
+    signal,
   });
 }
 
@@ -846,6 +1351,18 @@ function boundedErrorClass(error: unknown): string {
   }
   if (error instanceof ClaimOwnershipError) {
     return "ClaimOwnershipError";
+  }
+  if (error instanceof LegacyIngressRecoveryMismatchError) {
+    return "LegacyIngressRecoveryMismatchError";
+  }
+  if (error instanceof LegacyIngressRecoveryUnavailableError) {
+    return "LegacyIngressRecoveryUnavailableError";
+  }
+  if (error instanceof IngressRecoveryEnvelopeError) {
+    return "IngressRecoveryEnvelopeError";
+  }
+  if (error instanceof ServerListenError) {
+    return "ServerListenError";
   }
   if (error instanceof LinearActivityError) {
     return "LinearActivityError";

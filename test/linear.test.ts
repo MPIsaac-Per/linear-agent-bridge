@@ -48,6 +48,32 @@ function observableFailureResponse(
 }
 
 describe("LinearAgentClient.createActivity", () => {
+  it("safely detaches an already-aborted caller from a later rejecting token lookup", async () => {
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "unused",
+      storePath: path.join(os.tmpdir(), "unused-aborted-token-store.json"),
+    });
+    vi.spyOn(oauth, "getAccessToken").mockRejectedValue(
+      new Error("late private token lookup failure"),
+    );
+    const fetchFn = vi.fn();
+    const client = new LinearAgentClient(oauth, fetchFn);
+    const controller = new AbortController();
+    controller.abort(new Error("caller closed"));
+
+    await expect(
+      client.createActivity(
+        "session-aborted-token-lookup",
+        { type: "thought", body: "never sent" },
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow("caller closed");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it("retains a newly rotated pair in memory when durable persistence fails", async () => {
     const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
     const tokenStorePath = path.join(tmpDir, "tokens.json");

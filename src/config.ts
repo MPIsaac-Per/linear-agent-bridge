@@ -1,3 +1,5 @@
+import { parseCanonicalRecoveryKey } from "./state/recovery-envelope.js";
+
 export interface Config {
   linearClientId: string;
   linearClientSecret: string;
@@ -10,6 +12,8 @@ export interface Config {
   bridgeStateStorePath: string;
   oauthTokenStorePath: string;
   runInactivityTimeoutMs: number;
+  ingressRecoveryKey: string;
+  ingressRecoveryPreviousKeys: string[];
 }
 
 const DEFAULT_PORT = "3979";
@@ -36,17 +40,47 @@ function positiveInteger(value: string, key: string): number {
   return parsed;
 }
 
+function parseRecoveryKeys(
+  primary: string,
+  previousRaw: string | undefined,
+): string[] {
+  if (parseCanonicalRecoveryKey(primary) === undefined) {
+    throw new Error(
+      "Invalid INGRESS_RECOVERY_KEY: expected canonical 32-byte base64url",
+    );
+  }
+  const previous =
+    previousRaw === undefined || previousRaw === ""
+      ? []
+      : previousRaw.split(",");
+  if (
+    previous.length > 4 ||
+    previous.some((value) => parseCanonicalRecoveryKey(value) === undefined) ||
+    new Set([primary, ...previous]).size !== previous.length + 1
+  ) {
+    throw new Error(
+      "Invalid INGRESS_RECOVERY_PREVIOUS_KEYS: expected up to four unique canonical 32-byte base64url keys",
+    );
+  }
+  return previous;
+}
+
 /**
  * Load and validate config from process.env (see .env.example).
  * Missing required values fail fast, naming the first missing variable
  * in declared order: LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET,
- * LINEAR_WEBHOOK_SECRET, LINEAR_ACCESS_TOKEN.
+ * LINEAR_WEBHOOK_SECRET, LINEAR_ACCESS_TOKEN, INGRESS_RECOVERY_KEY.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const linearClientId = requireEnv(env, "LINEAR_CLIENT_ID");
   const linearClientSecret = requireEnv(env, "LINEAR_CLIENT_SECRET");
   const linearWebhookSecret = requireEnv(env, "LINEAR_WEBHOOK_SECRET");
   const linearAccessToken = requireEnv(env, "LINEAR_ACCESS_TOKEN");
+  const ingressRecoveryKey = requireEnv(env, "INGRESS_RECOVERY_KEY");
+  const ingressRecoveryPreviousKeys = parseRecoveryKeys(
+    ingressRecoveryKey,
+    env.INGRESS_RECOVERY_PREVIOUS_KEYS,
+  );
 
   const runtimeRaw = env.RUNTIME ?? DEFAULT_RUNTIME;
   if (runtimeRaw !== "claude" && runtimeRaw !== "codex") {
@@ -89,5 +123,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     oauthTokenStorePath:
       env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
     runInactivityTimeoutMs,
+    ingressRecoveryKey,
+    ingressRecoveryPreviousKeys,
   };
 }
