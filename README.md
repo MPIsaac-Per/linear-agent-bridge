@@ -247,18 +247,24 @@ whether the restored service answered its health probe. Before mutation it
 accepts only an empty public Funnel state or the single existing exact target;
 unrelated or ambiguous public routes are left untouched. It fails closed if
 local health, Funnel setup, or route discovery fails. `SKIP_FUNNEL=1` is an
-explicit local-only installation mode. Secrets are loaded from `.env`, not
-passed in command arguments.
+explicit local-only installation mode. It completes the build, launchd setup,
+and loopback health check without discovering, inspecting, or changing
+Tailscale state. Secrets are loaded from `.env`, not passed in command
+arguments.
 
 Set `WEBHOOK_URL` to the printed credential-free HTTPS URL, keep
 `LINEAR_WEBHOOK_SECRET` in the environment, and run
 `./deploy/verify-ingress.sh` before changing Linear. The verifier probes public
-`GET /healthz` and a signed harmless non-AgentSession `POST /webhook` without
-printing the secret, signature, or body.
+`GET /healthz`, requires an unsigned harmless `POST /webhook` to return 401,
+then requires the same correctly signed non-AgentSession request to return 200.
+It does not print the secret, signature, or body.
 
 The HTTP server binds only to `127.0.0.1`. `deploy/tcp_forward.py` is retained
-only as a bounded, loopback-bound diagnostic for a private last hop. It is not
-a supported production ingress. See
+only as a bounded, loopback-bound diagnostic for a private last hop. On a
+separate ingress host, first establish an SSH local tunnel to the bridge host's
+`127.0.0.1:<PORT>` listener, then point the forwarder at that local tunnel
+endpoint. The forwarder rejects a bridge private address as its upstream. It
+is not a supported production ingress. See
 [the ingress cutover runbook](docs/ingress-cutover.md) for ownership fields,
 tracing, failure diagnosis, the live checklist, and rollback.
 

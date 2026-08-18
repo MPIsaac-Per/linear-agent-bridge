@@ -182,10 +182,17 @@ echo "Health check: $HEALTH_RESULT"
 ROLLBACK_NEEDED=0
 DIST_BACKED_UP=0
 
-# 7. Expose this exact loopback listener directly with Tailscale Funnel when
-#    available (macOS keeps the CLI inside the app bundle).
-TAILSCALE=${TAILSCALE_BIN:-$(command -v tailscale || echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale")}
-if [ -x "$TAILSCALE" ]; then
+# 7. Expose this exact loopback listener directly with Tailscale Funnel unless
+#    the operator explicitly requested a local-only install.
+if [ "${SKIP_FUNNEL:-0}" = "1" ]; then
+	echo "SKIP_FUNNEL=1: service installed without public ingress"
+else
+	# macOS keeps the CLI inside the app bundle.
+	TAILSCALE=${TAILSCALE_BIN:-$(command -v tailscale || echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale")}
+	if [ ! -x "$TAILSCALE" ]; then
+		echo "tailscale not found; refusing to complete without public ingress (set SKIP_FUNNEL=1 for an explicit local-only install)" >&2
+		exit 1
+	fi
 	FUNNEL_TARGET="http://127.0.0.1:$PORT"
 	FUNNEL_CLEANUP_REQUIRED=0
 	FUNNEL_STATUS_FILE=$(mktemp "${TMPDIR:-/tmp}/linear-agent-funnel.XXXXXX")
@@ -238,11 +245,4 @@ if [ -x "$TAILSCALE" ]; then
 	esac
 	echo "Webhook URL: $WEBHOOK_URL"
 	echo "Verify with: WEBHOOK_URL='$WEBHOOK_URL' LINEAR_WEBHOOK_SECRET='<from .env>' ./deploy/verify-ingress.sh"
-else
-	if [ "${SKIP_FUNNEL:-0}" = "1" ]; then
-		echo "SKIP_FUNNEL=1: service installed without public ingress"
-	else
-		echo "tailscale not found; refusing to complete without public ingress (set SKIP_FUNNEL=1 for an explicit local-only install)" >&2
-		exit 1
-	fi
 fi

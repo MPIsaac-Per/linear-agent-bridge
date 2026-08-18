@@ -15,7 +15,38 @@ Linear webhook delivery
 
 `deploy/tcp_forward.py` is diagnostic-only. It remains available to isolate a
 private last-hop problem, is loopback-bound, and must not become the canonical
-ingress or remain in the production path after diagnosis.
+ingress or remain in the production path after diagnosis. A separate ingress
+host cannot connect directly to the bridge host's private address because the
+bridge listens only on `127.0.0.1`.
+
+For that diagnostic, establish a local SSH tunnel on the ingress host first:
+
+```bash
+ssh -N -T \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=2 \
+  -L 127.0.0.1:9900:127.0.0.1:3979 bridge-host
+```
+
+In a second shell on the ingress host, start the forwarder against the local
+tunnel endpoint and point the existing HTTPS ingress at `127.0.0.1:8899`:
+
+```bash
+python3 deploy/tcp_forward.py 8899 127.0.0.1 9900
+```
+
+```text
+HTTPS ingress on diagnostic host
+  -> 127.0.0.1:8899 tcp_forward.py
+  -> 127.0.0.1:9900 SSH local tunnel
+  -> bridge host 127.0.0.1:3979
+```
+
+The SSH destination resolves its final `127.0.0.1:3979` hop on the bridge
+host. Do not pass a LAN, Tailscale, or other bridge address to
+`tcp_forward.py`; it rejects non-loopback upstreams. Stop both diagnostic
+processes after restoring direct Funnel.
 
 ## Cutover record
 
@@ -68,7 +99,9 @@ before declaring readiness.
 A listener on
 `0.0.0.0`, `::`, a Tailscale address, or a LAN address is a stop condition.
 The local health check must return exactly `ok`. `deploy/install.sh` exits
-nonzero if it cannot prove that result.
+nonzero if it cannot prove that result. `SKIP_FUNNEL=1` stops after this local
+verification and bypasses Tailscale binary discovery, status reads, and route
+enablement.
 
 Durable ingress state is stored at `BRIDGE_STATE_STORE_PATH`, which defaults to
 `data/bridge-state.json`. Completed and failed webhook receipts are retained for
@@ -97,18 +130,22 @@ LINEAR_WEBHOOK_SECRET="$(sed -n 's/^LINEAR_WEBHOOK_SECRET=//p' .env)" \
 
 Do not use `set -a` or export the whole `.env` file for verification. The
 extraction above passes only the public URL and webhook secret to the verifier.
-The verifier then runs URL/body generation and both curl probes with clean
-child environments. Only the HMAC-generation Node child receives the webhook
-secret; unrelated Linear, OAuth, runtime, and shell credentials are excluded.
+The verifier then runs URL/body generation and all three curl probes with clean
+child environments. The HMAC-generation Node child reads the secret and body
+from owner-only temporary files; neither value enters its arguments or
+environment. Unrelated Linear, OAuth, runtime, and shell credentials are
+excluded.
 
 The verifier requires `WEBHOOK_URL` and `LINEAR_WEBHOOK_SECRET`. It performs a
-bounded public `GET /healthz`, then sends a current-time HMAC-SHA256 signed,
-non-AgentSession `POST /webhook`. The harmless event must return HTTP 200 and
-cannot start an agent turn. Curl ignores user curl configuration, follows no
-redirects, emits no response body, and uses five-second connect and 15-second
-total timeouts. Output is limited to the sanitized URL, status, and elapsed
-time. The secret, signature, request body, and authorization data are not
-printed or passed in curl arguments.
+bounded public `GET /healthz`, sends a harmless unsigned non-AgentSession
+`POST /webhook` that must return HTTP 401, then sends the same request with a
+current-time HMAC-SHA256 signature and requires HTTP 200. This control proves
+the route enforces the bridge's authentication boundary before the signed
+probe can pass. Neither request can start an agent turn. Curl ignores user curl
+configuration, follows no redirects, emits no response body, and uses
+five-second connect and 15-second total timeouts. Output is limited to the
+sanitized URL, status, and elapsed time. The secret, signature, request body,
+and authorization data are not printed or passed in curl arguments.
 
 ## Tracing a delivery
 
@@ -135,7 +172,7 @@ not prove a turn ran.
 | --- | --- | --- | --- |
 | DNS failure | Public hostname | Resolve the exact canonical host from a non-tailnet resolver | Keep the old URL; wait for Funnel DNS or fix the serving host |
 | TLS failure | Funnel certificate/public edge | Run the signed verifier and inspect Funnel status JSON | Do not bypass TLS; keep or restore the old URL |
-| Forwarder failure | Diagnostic private hop only | Correlate its connection ID and bounded upstream failure class | Remove it from the test path and restore direct Funnel before cutover |
+| Forwarder or tunnel failure | Diagnostic private hop only | Correlate the forwarder connection ID, confirm the local SSH tunnel endpoint, and inspect its bounded upstream failure class | Stop both diagnostic processes and restore direct Funnel before cutover |
 | HTTP 401 signature | Secret or exact body mismatch | Confirm the Linear app secret and verifier environment without printing either | Correct the secret; never disable HMAC validation |
 | Duplicate receipt | Linear delivery retry | Match `webhookId` in `BRIDGE_STATE_STORE_PATH` | Expected deduplication; do not delete the receipt |
 | Duplicate activity | Outbound retry or semantic duplicate | Compare activity UUID and execution identity | Preserve state and investigate before replaying |

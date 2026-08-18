@@ -436,6 +436,43 @@ describe("startServer", () => {
     await ipv4Response.text();
   });
 
+  it("rejects the verifier authentication control before accepting its signed harmless event", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const body = JSON.stringify({
+      type: "IngressVerificationEvent",
+      action: "verify",
+      webhookTimestamp: Date.now(),
+    });
+    const webhookUrl = serverUrl(harness.port, "/webhook");
+
+    const authenticationControl = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", connection: "close" },
+      body,
+    });
+    expect(authenticationControl.status).toBe(401);
+    await authenticationControl.text();
+
+    const signedProbe = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(body, WEBHOOK_SECRET),
+        connection: "close",
+      },
+      body,
+    });
+    expect(signedProbe.status).toBe(200);
+    await signedProbe.text();
+
+    expect(harness.calls).toEqual([]);
+    expect(runtime.lastRequest).toBeUndefined();
+  });
+
   it("signed created event: acks 200, emits the liveness thought, forwards runtime activities in order, persists the session mapping", async () => {
     const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
       yield { kind: "session-started", runtimeSessionId: "runtime-session-abc" };

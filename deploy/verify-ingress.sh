@@ -20,28 +20,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 SECRET_FILE="$VERIFY_TEMP_DIR/secret"
-HMAC_HELPER="$VERIFY_TEMP_DIR/hmac-helper.sh"
 printf '%s' "$WEBHOOK_SECRET" > "$SECRET_FILE"
 unset WEBHOOK_SECRET
-cat > "$HMAC_HELPER" <<'BASH'
-#!/bin/bash
-set -eu
-node_bin=$1
-secret_file=$2
-body_file=$3
-LINEAR_WEBHOOK_SECRET=$(< "$secret_file")
-export LINEAR_WEBHOOK_SECRET
-unset node_bin secret_file PWD OLDPWD SHLVL _
-exec "$1" -e '
-  const { createHmac } = require("node:crypto");
-  const { readFileSync } = require("node:fs");
-  process.stdout.write(
-    createHmac("sha256", process.env.LINEAR_WEBHOOK_SECRET)
-      .update(readFileSync(process.argv[1]))
-      .digest("hex"),
-  );
-' "$body_file"
-BASH
 
 URLS=$(
   /usr/bin/env -i WEBHOOK_URL="$WEBHOOK_INPUT" "$NODE_BIN" <<'NODE'
@@ -86,16 +66,25 @@ process.stdout.write(JSON.stringify({
 NODE
 )
 BODY_FILE="$VERIFY_TEMP_DIR/body.json"
-HEADER_CONFIG="$VERIFY_TEMP_DIR/headers.curlrc"
+CONTENT_TYPE_CONFIG="$VERIFY_TEMP_DIR/content-type.curlrc"
+SIGNED_HEADER_CONFIG="$VERIFY_TEMP_DIR/signed-headers.curlrc"
 printf '%s' "$BODY" > "$BODY_FILE"
 
-if ! SIGNATURE=$(/usr/bin/env -i /bin/bash "$HMAC_HELPER" \
-  "$NODE_BIN" "$SECRET_FILE" "$BODY_FILE"); then
+if ! SIGNATURE=$(/usr/bin/env -i "$NODE_BIN" -e '
+  const { createHmac } = require("node:crypto");
+  const { readFileSync } = require("node:fs");
+  process.stdout.write(
+    createHmac("sha256", readFileSync(process.argv[1]))
+      .update(readFileSync(process.argv[2]))
+      .digest("hex"),
+  );
+' "$SECRET_FILE" "$BODY_FILE"); then
   printf '%s\n' "verify-ingress: signature generation failed" >&2
   exit 1
 fi
-printf 'header = "linear-signature: %s"\n' "$SIGNATURE" > "$HEADER_CONFIG"
-printf 'header = "content-type: application/json"\n' >> "$HEADER_CONFIG"
+printf 'header = "content-type: application/json"\n' > "$CONTENT_TYPE_CONFIG"
+printf 'header = "linear-signature: %s"\n' "$SIGNATURE" > "$SIGNED_HEADER_CONFIG"
+printf 'header = "content-type: application/json"\n' >> "$SIGNED_HEADER_CONFIG"
 unset SIGNATURE BODY
 
 probe_get() {
@@ -126,6 +115,8 @@ probe_get() {
 probe_post() {
   probe_label=$1
   probe_url=$2
+  expected_status=$3
+  header_config=$4
   probe_result=""
   probe_exit=0
   probe_result=$(/usr/bin/env -i "$CURL_BIN" -q \
@@ -137,7 +128,7 @@ probe_post() {
     --proto '=https' \
     --output /dev/null \
     --write-out '%{http_code} %{time_total}' \
-    --config "$HEADER_CONFIG" \
+    --config "$header_config" \
     --data-binary "@$BODY_FILE" \
     "$probe_url" 2>/dev/null) || probe_exit=$?
   set -- $probe_result
@@ -145,10 +136,11 @@ probe_post() {
   probe_elapsed=${2:-0.000}
   printf '%s url=%s http_status=%s elapsed_seconds=%s\n' \
     "$probe_label" "$probe_url" "$probe_status" "$probe_elapsed"
-  if [ "$probe_exit" -ne 0 ] || [ "$probe_status" != "200" ]; then
+  if [ "$probe_exit" -ne 0 ] || [ "$probe_status" != "$expected_status" ]; then
     return 1
   fi
 }
 
 probe_get healthz "$HEALTH_URL"
-probe_post webhook "$VALIDATED_WEBHOOK_URL"
+probe_post authentication_control "$VALIDATED_WEBHOOK_URL" 401 "$CONTENT_TYPE_CONFIG"
+probe_post webhook "$VALIDATED_WEBHOOK_URL" 200 "$SIGNED_HEADER_CONFIG"
