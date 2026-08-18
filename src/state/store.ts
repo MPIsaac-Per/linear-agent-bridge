@@ -940,59 +940,6 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (this.recoveryKeyring === undefined) {
       throw new IngressRecoveryEnvelopeError();
     }
-    let activeRecoveryCount = retainedRecoveryReceipts(state).length;
-    if (
-      admittingNewEvent &&
-      activeRecoveryCount >= this.maxRecoverableEvents &&
-      payload.action === "prompted" &&
-      payload.stop
-    ) {
-      const reclaimable = activeRecoverableReceipts(state)
-        .filter(
-          (receipt) =>
-            receipt.linearSessionId === identity.linearSessionId &&
-            receipt.executionId !== identity.executionId &&
-            receipt.dispatchStartedAt === undefined,
-        )
-        .sort(
-          (left, right) =>
-            (left.recoverySequence ?? Number.MAX_SAFE_INTEGER) -
-            (right.recoverySequence ?? Number.MAX_SAFE_INTEGER),
-        );
-      while (
-        activeRecoveryCount >= this.maxRecoverableEvents &&
-        reclaimable.length > 0
-      ) {
-        const receipt = reclaimable.shift()!;
-        const timestamp = this.timestamp();
-        receipt.status = "superseded";
-        receipt.supersededAt = timestamp;
-        receipt.supersededByWebhookId = identity.webhookId;
-        receipt.updatedAt = timestamp;
-        clearRecoveryEnvelope(receipt);
-        receipt.outcome = {
-          httpStatus: 200,
-          result: "not_dispatched",
-          disposition: "superseded",
-        };
-        const claim = state.claims[receipt.executionId];
-        if (claim?.webhookId === receipt.webhookId) {
-          claim.status = "completed";
-          claim.updatedAt = timestamp;
-        }
-        activeRecoveryCount -= 1;
-      }
-    }
-    if (
-      (admittingNewEvent &&
-        activeRecoveryCount >=
-          (payload.action === "prompted" && payload.stop
-            ? this.maxRecoverableEvents
-            : Math.max(1, this.maxRecoverableEvents - 1))) ||
-      (!admittingNewEvent && activeRecoveryCount > this.maxRecoverableEvents)
-    ) {
-      throw new IngressRecoveryEnvelopeError();
-    }
     let highestSequence = 0;
     for (const receipt of Object.values(state.receipts)) {
       if (
@@ -1025,6 +972,66 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
     const nextSequence = sequence + 1;
     if (!Number.isSafeInteger(nextSequence)) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    let activeRecoveryCount = retainedRecoveryReceipts(state).length;
+    if (
+      admittingNewEvent &&
+      activeRecoveryCount >= this.maxRecoverableEvents &&
+      payload.action === "prompted" &&
+      payload.stop
+    ) {
+      const reclaimable = activeRecoverableReceipts(state)
+        .filter(
+          (receipt) =>
+            receipt.linearSessionId === identity.linearSessionId &&
+            receipt.executionId !== identity.executionId &&
+            receipt.dispatchStartedAt === undefined &&
+            this.receiptIsAtOrBeforeFence(receipt, {
+              occurredAt: payload.occurredAt,
+              sequence,
+              webhookId: identity.webhookId,
+              executionId: identity.executionId,
+            }),
+        )
+        .sort(
+          (left, right) =>
+            (left.recoverySequence ?? Number.MAX_SAFE_INTEGER) -
+            (right.recoverySequence ?? Number.MAX_SAFE_INTEGER),
+        );
+      while (
+        activeRecoveryCount >= this.maxRecoverableEvents &&
+        reclaimable.length > 0
+      ) {
+        const receipt = reclaimable.shift()!;
+        const timestamp = this.timestamp();
+        receipt.status = "superseded";
+        receipt.supersededAt = timestamp;
+        receipt.supersededByWebhookId = identity.webhookId;
+        receipt.updatedAt = timestamp;
+        clearRecoveryEnvelope(receipt);
+        receipt.outcome = {
+          httpStatus: 200,
+          result: "not_dispatched",
+          disposition: "superseded",
+        };
+        const claim = state.claims[receipt.executionId];
+        if (claim?.webhookId === receipt.webhookId) {
+          claim.status = "completed";
+          claim.updatedAt = timestamp;
+        }
+        this.locallyAcceptedPreDispatchClaims.delete(receipt.webhookId);
+        activeRecoveryCount -= 1;
+      }
+    }
+    if (
+      (admittingNewEvent &&
+        activeRecoveryCount >=
+          (payload.action === "prompted" && payload.stop
+            ? this.maxRecoverableEvents
+            : Math.max(1, this.maxRecoverableEvents - 1))) ||
+      (!admittingNewEvent && activeRecoveryCount > this.maxRecoverableEvents)
+    ) {
       throw new IngressRecoveryEnvelopeError();
     }
     const recoveryEnvelope = sealIngressRecoveryPayload(

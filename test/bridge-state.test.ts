@@ -2208,6 +2208,117 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.listRecoverableEvents()).resolves.toHaveLength(1);
   });
 
+  it("rejects an older same-session stop at capacity without superseding newer work", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-older-stop-capacity.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+      maxRecoverableEvents: 1,
+    });
+    const prompt = event({
+      webhookId: "webhook-capacity-newer-prompt",
+      executionId: "activity-capacity-newer-prompt",
+      linearSessionId: "session-capacity-older-stop",
+      action: "prompted",
+    });
+    await store.claimEvent(prompt, {
+      action: "prompted",
+      prompt: "newer accepted work",
+      stop: false,
+      occurredAt: "2026-08-18T12:00:02.000Z",
+    });
+
+    await expect(
+      store.claimEvent(
+        event({
+          webhookId: "webhook-capacity-older-stop",
+          executionId: "activity-capacity-older-stop",
+          linearSessionId: prompt.linearSessionId,
+          action: "prompted",
+        }),
+        {
+          action: "prompted",
+          prompt: "stop",
+          stop: true,
+          signal: "stop",
+          occurredAt: "2026-08-18T12:00:01.000Z",
+        },
+      ),
+    ).rejects.toBeInstanceOf(IngressRecoveryEnvelopeError);
+    await expect(store.getReceipt(prompt.webhookId)).resolves.toMatchObject({
+      status: "claimed",
+      recoverySequence: 1,
+    });
+    await expect(
+      store.getReceipt("webhook-capacity-older-stop"),
+    ).resolves.toBeUndefined();
+    await expect(store.listRecoverableEvents()).resolves.toEqual([
+      expect.objectContaining({
+        identity: expect.objectContaining({ webhookId: prompt.webhookId }),
+        sequence: 1,
+        available: true,
+      }),
+    ]);
+  });
+
+  it("bounds process-local acceptance bookkeeping across repeated capacity stops", async () => {
+    const storePath = path.join(tmpDir, "bridge-state-capacity-bookkeeping.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+      recoveryKeyring: createIngressRecoveryKeyring(RECOVERY_KEY_A),
+      maxRecoverableEvents: 1,
+    });
+    const sessionId = "session-capacity-bookkeeping";
+    await store.claimEvent(
+      event({
+        webhookId: "webhook-capacity-bookkeeping-created",
+        executionId: `created:${sessionId}`,
+        linearSessionId: sessionId,
+      }),
+      {
+        action: "created",
+        prompt: "initial work",
+        occurredAt: "2026-08-18T12:00:00.000Z",
+      },
+    );
+
+    for (let index = 1; index <= 12; index += 1) {
+      await store.claimEvent(
+        event({
+          webhookId: `webhook-capacity-bookkeeping-stop-${index}`,
+          executionId: `activity-capacity-bookkeeping-stop-${index}`,
+          linearSessionId: sessionId,
+          action: "prompted",
+        }),
+        {
+          action: "prompted",
+          prompt: "stop",
+          stop: true,
+          signal: "stop",
+          occurredAt: "2026-08-18T12:00:01.000Z",
+        },
+      );
+    }
+
+    const acceptedWebhookIds = (
+      store as unknown as {
+        locallyAcceptedPreDispatchClaims: Set<string>;
+      }
+    ).locallyAcceptedPreDispatchClaims;
+    expect(acceptedWebhookIds).toEqual(
+      new Set(["webhook-capacity-bookkeeping-stop-12"]),
+    );
+    await expect(store.listRecoverableEvents()).resolves.toEqual([
+      expect.objectContaining({
+        identity: expect.objectContaining({
+          webhookId: "webhook-capacity-bookkeeping-stop-12",
+        }),
+      }),
+    ]);
+  });
+
   it("reclaims a same-process pre-dispatch claim when its durability acknowledgement fails", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const directory = path.dirname(storePath);
