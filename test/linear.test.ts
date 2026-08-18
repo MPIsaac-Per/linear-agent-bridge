@@ -47,6 +47,17 @@ function observableFailureResponse(
   );
 }
 
+function oauthDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe("LinearAgentClient.createActivity", () => {
   it("safely detaches an already-aborted caller from a later rejecting token lookup", async () => {
     const oauth = new LinearOAuthTokenManager({
@@ -74,14 +85,22 @@ describe("LinearAgentClient.createActivity", () => {
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("retains a newly rotated pair in memory when durable persistence fails", async () => {
+  it("autonomously retries a pre-rename failure before adopting the rotated pair", async () => {
     const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
     const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse({
+        access_token: "rotated-access",
+        refresh_token: "rotated-refresh",
+        expires_in: 86399,
+      }),
+    );
     const oauth = new LinearOAuthTokenManager({
       clientId: "client-id",
       clientSecret: "client-secret",
       initialAccessToken: "initial-access",
       storePath: tokenStorePath,
+      fetchFn,
     });
 
     try {
@@ -94,15 +113,349 @@ describe("LinearAgentClient.createActivity", () => {
       await fsPromises.mkdir(tokenStorePath);
 
       await expect(
+        oauth.refreshAfterUnauthorized("initial-access"),
+      ).rejects.toThrow();
+      expect(await oauth.getAccessToken()).toBe("initial-access");
+
+      await fsPromises.rm(tokenStorePath, { recursive: true });
+      await vi.waitFor(
+        async () => expect(await oauth.getAccessToken()).toBe("rotated-access"),
+        { timeout: 1_000, interval: 20 },
+      );
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "rotated-access",
+        refreshToken: "rotated-refresh",
+      });
+      expect((await fsPromises.stat(tokenStorePath)).mode & 0o777).toBe(0o600);
+
+      const reloaded = new LinearOAuthTokenManager({
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        initialAccessToken: "unused",
+        storePath: tokenStorePath,
+      });
+      await expect(reloaded.getAccessToken()).resolves.toBe("rotated-access");
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("autonomously retries a post-rename sync failure before adoption", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse({
+        access_token: "rotated-access",
+        refresh_token: "rotated-refresh",
+        expires_in: 86399,
+      }),
+    );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+      fetchFn,
+    });
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      await fsPromises.chmod(tmpDir, 0o300);
+
+      await expect(
+        oauth.refreshAfterUnauthorized("initial-access"),
+      ).rejects.toThrow();
+      expect(await oauth.getAccessToken()).toBe("initial-access");
+
+      await fsPromises.chmod(tmpDir, 0o700);
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "rotated-access",
+        refreshToken: "rotated-refresh",
+      });
+      await vi.waitFor(
+        async () => expect(await oauth.getAccessToken()).toBe("rotated-access"),
+        { timeout: 1_000, interval: 20 },
+      );
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    } finally {
+      await fsPromises.chmod(tmpDir, 0o700).catch(() => undefined);
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries an incomplete directory-chain sync and repeats it in a fresh manager", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "first", "second", "tokens.json");
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+      fetchFn: vi.fn(),
+    });
+
+    try {
+      await fsPromises.chmod(tmpDir, 0o300);
+      await expect(
         oauth.install({
-          access_token: "rotated-access",
-          refresh_token: "rotated-refresh",
+          access_token: "first-access",
+          refresh_token: "first-refresh",
           expires_in: 86399,
         }),
       ).rejects.toThrow();
-      expect(await oauth.getAccessToken()).toBe("rotated-access");
-      expect(await oauth.hasRefreshToken()).toBe(true);
+      await expect(
+        oauth.refreshAfterUnauthorized("initial-access"),
+      ).rejects.toThrow();
+      expect(await oauth.getAccessToken()).toBe("initial-access");
+
+      await fsPromises.chmod(tmpDir, 0o700);
+      await vi.waitFor(
+        async () => expect(await oauth.getAccessToken()).toBe("first-access"),
+        { timeout: 1_000, interval: 20 },
+      );
+
+      const freshManager = new LinearOAuthTokenManager({
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        initialAccessToken: "unused",
+        storePath: tokenStorePath,
+      });
+      await freshManager.load();
+      await fsPromises.chmod(tmpDir, 0o300);
+      await expect(
+        freshManager.install({
+          access_token: "second-access",
+          refresh_token: "second-refresh",
+          expires_in: 86399,
+        }),
+      ).rejects.toThrow();
+      expect(await freshManager.getAccessToken()).toBe("first-access");
+
+      await fsPromises.chmod(tmpDir, 0o700);
+      await vi.waitFor(
+        async () => expect(await freshManager.getAccessToken()).toBe("second-access"),
+        { timeout: 1_000, interval: 20 },
+      );
     } finally {
+      await fsPromises.chmod(tmpDir, 0o700).catch(() => undefined);
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the persistence error when temporary-file cleanup also fails", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse({
+        access_token: "rotated-access",
+        refresh_token: "rotated-refresh",
+        expires_in: 86399,
+      }),
+    );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+      fetchFn,
+    });
+    const primaryError = new Error("primary token-store failure");
+    const cleanupError = new Error("secondary temporary-file cleanup failure");
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      vi.spyOn(fsPromises, "rename").mockRejectedValueOnce(primaryError);
+      vi.spyOn(fsPromises, "rm").mockRejectedValueOnce(cleanupError);
+
+      const caught = await oauth
+        .refreshAfterUnauthorized("initial-access")
+        .catch((err: unknown) => err);
+      expect(caught).toBe(primaryError);
+      expect(String(caught)).not.toContain(cleanupError.message);
+      vi.restoreAllMocks();
+      await vi.waitFor(
+        async () => expect(await oauth.getAccessToken()).toBe("rotated-access"),
+        { timeout: 1_000, interval: 20 },
+      );
+    } finally {
+      vi.restoreAllMocks();
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent token installs so the newer pair wins durably", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+    });
+    const firstRenameStarted = oauthDeferred<void>();
+    const releaseFirstRename = oauthDeferred<void>();
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      const actualRename = fsPromises.rename.bind(fsPromises);
+      const renameSpy = vi
+        .spyOn(fsPromises, "rename")
+        .mockImplementation(async (from, to) => {
+          if (renameSpy.mock.calls.length === 1) {
+            firstRenameStarted.resolve();
+            await releaseFirstRename.promise;
+          }
+          await actualRename(from, to);
+        });
+
+      const firstInstall = oauth.install({
+        access_token: "first-access",
+        refresh_token: "first-refresh",
+        expires_in: 86399,
+      });
+      await firstRenameStarted.promise;
+      const secondInstall = oauth.install({
+        access_token: "second-access",
+        refresh_token: "second-refresh",
+        expires_in: 86399,
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const renameCallsBeforeRelease = renameSpy.mock.calls.length;
+      releaseFirstRename.resolve();
+      const installResults = await Promise.allSettled([firstInstall, secondInstall]);
+      expect(renameCallsBeforeRelease).toBe(1);
+      expect(installResults.map((result) => result.status)).toEqual([
+        "fulfilled",
+        "fulfilled",
+      ]);
+      expect(await oauth.getAccessToken()).toBe("second-access");
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "second-access",
+        refreshToken: "second-refresh",
+      });
+    } finally {
+      releaseFirstRename.resolve();
+      vi.restoreAllMocks();
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a stale refresh response when a newer install advances the generation", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const refreshStarted = oauthDeferred<void>();
+    const refreshResponse = oauthDeferred<Response>();
+    const fetchFn = vi.fn(async () => {
+      refreshStarted.resolve();
+      return refreshResponse.promise;
+    });
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+      fetchFn,
+    });
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      const refresh = oauth.refreshAfterUnauthorized("initial-access");
+      await refreshStarted.promise;
+      await oauth.install({
+        access_token: "newer-access",
+        refresh_token: "newer-refresh",
+        expires_in: 86399,
+      });
+      refreshResponse.resolve(
+        jsonResponse({
+          access_token: "stale-access",
+          refresh_token: "stale-refresh",
+          expires_in: 86399,
+        }),
+      );
+
+      await expect(refresh).resolves.toBe("newer-access");
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "newer-access",
+        refreshToken: "newer-refresh",
+      });
+    } finally {
+      refreshResponse.resolve(jsonResponse({}));
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("autonomous retry persists the newest pending pair without another refresh", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-oauth-"));
+    const tokenStorePath = path.join(tmpDir, "tokens.json");
+    const fetchFn = vi.fn().mockResolvedValue(
+      jsonResponse({
+        access_token: "refresh-access",
+        refresh_token: "refresh-token",
+        expires_in: 86399,
+      }),
+    );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "initial-access",
+      storePath: tokenStorePath,
+      fetchFn,
+    });
+
+    try {
+      await oauth.install({
+        access_token: "initial-access",
+        refresh_token: "initial-refresh",
+        expires_in: 86399,
+      });
+      const persistenceFailure = new Error("private persistence failure");
+      const actualRename = fsPromises.rename.bind(fsPromises);
+      vi.spyOn(fsPromises, "rename")
+        .mockRejectedValueOnce(persistenceFailure)
+        .mockRejectedValueOnce(persistenceFailure)
+        .mockImplementation(actualRename);
+
+      await expect(
+        oauth.refreshAfterUnauthorized("initial-access"),
+      ).rejects.toBe(persistenceFailure);
+      await expect(
+        oauth.install({
+          access_token: "newest-access",
+          refresh_token: "newest-refresh",
+          expires_in: 86399,
+        }),
+      ).rejects.toBe(persistenceFailure);
+
+      await vi.waitFor(
+        async () => expect(await oauth.getAccessToken()).toBe("newest-access"),
+        { timeout: 1_000, interval: 20 },
+      );
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(await fsPromises.readFile(tokenStorePath, "utf8"))).toMatchObject({
+        accessToken: "newest-access",
+        refreshToken: "newest-refresh",
+      });
+    } finally {
+      vi.restoreAllMocks();
       await fsPromises.rm(tmpDir, { recursive: true, force: true });
     }
   });

@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { discardResponseBody, type FetchFn } from "./client.js";
 
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
+const INITIAL_PERSISTENCE_RETRY_DELAY_MS = 100;
+const MAX_PERSISTENCE_RETRY_DELAY_MS = 30_000;
 
 export interface LinearOAuthTokenResponse {
   access_token?: string;
@@ -15,6 +17,11 @@ interface StoredOAuthTokens {
   accessToken: string;
   refreshToken: string;
   expiresAt: string;
+}
+
+interface PendingOAuthTokens {
+  generation: number;
+  tokens: StoredOAuthTokens;
 }
 
 export interface LinearOAuthTokenManagerOptions {
@@ -36,8 +43,15 @@ export class LinearOAuthTokenManager {
   private accessToken: string;
   private refreshToken: string | undefined;
   private expiresAt: string | undefined;
+  private pendingTokens: PendingOAuthTokens | undefined;
+  private mutationGeneration = 0;
+  private mutationTail: Promise<void> = Promise.resolve();
+  private directoryChainSynced = false;
   private loaded = false;
+  private loadPromise: Promise<void> | undefined;
   private refreshPromise: Promise<string> | undefined;
+  private persistenceRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private persistenceRetryDelayMs = INITIAL_PERSISTENCE_RETRY_DELAY_MS;
   private readonly fetchFn: FetchFn;
 
   constructor(private readonly options: LinearOAuthTokenManagerOptions) {
@@ -50,6 +64,17 @@ export class LinearOAuthTokenManager {
       return;
     }
 
+    if (this.loadPromise === undefined) {
+      this.loadPromise = this.loadFromStore().finally(() => {
+        if (!this.loaded) {
+          this.loadPromise = undefined;
+        }
+      });
+    }
+    await this.loadPromise;
+  }
+
+  private async loadFromStore(): Promise<void> {
     try {
       const stored = JSON.parse(
         await fsPromises.readFile(this.options.storePath, "utf8"),
@@ -85,39 +110,59 @@ export class LinearOAuthTokenManager {
   async install(response: LinearOAuthTokenResponse): Promise<void> {
     await this.load();
     const tokens = parseTokenResponse(response);
-    this.accessToken = tokens.accessToken;
-    this.refreshToken = tokens.refreshToken;
-    this.expiresAt = tokens.expiresAt;
-    await this.persist(tokens);
+    await this.serializeMutation(async () => {
+      const pending = this.stagePending(tokens);
+      await this.persistAndAdopt(pending);
+    });
   }
 
   async refreshAfterUnauthorized(failedAccessToken: string): Promise<string> {
     await this.load();
 
-    // Another caller may already have rotated the pair while this request was
-    // in flight. Reuse that access token instead of consuming the new refresh
-    // token a second time.
-    if (failedAccessToken !== this.accessToken) {
-      return this.accessToken;
-    }
-
     if (this.refreshPromise === undefined) {
-      this.refreshPromise = this.refresh().finally(() => {
-        this.refreshPromise = undefined;
+      const refreshPromise = this.refresh(failedAccessToken);
+      const sharedRefresh = refreshPromise.finally(() => {
+        if (this.refreshPromise === sharedRefresh) {
+          this.refreshPromise = undefined;
+        }
       });
+      this.refreshPromise = sharedRefresh;
     }
     return this.refreshPromise;
   }
 
-  private async refresh(): Promise<string> {
-    if (this.refreshToken === undefined) {
-      throw new Error(
-        "Linear OAuth access expired and no refresh token is stored; authorize the app once more",
-      );
+  private async refresh(failedAccessToken: string): Promise<string> {
+    const decision = await this.serializeMutation(async () => {
+      if (this.pendingTokens !== undefined) {
+        await this.persistAndAdopt(this.pendingTokens);
+        return { kind: "return" as const, accessToken: this.accessToken };
+      }
+
+      // Another caller may already have rotated the pair while this request
+      // was in flight. Reuse that durable access token instead of consuming
+      // its refresh token a second time.
+      if (failedAccessToken !== this.accessToken) {
+        return { kind: "return" as const, accessToken: this.accessToken };
+      }
+
+      if (this.refreshToken === undefined) {
+        throw new Error(
+          "Linear OAuth access expired and no refresh token is stored; authorize the app once more",
+        );
+      }
+      return {
+        kind: "refresh" as const,
+        generation: this.mutationGeneration,
+        refreshToken: this.refreshToken,
+      };
+    });
+
+    if (decision.kind === "return") {
+      return decision.accessToken;
     }
 
     const body = new URLSearchParams({
-      refresh_token: this.refreshToken,
+      refresh_token: decision.refreshToken,
       grant_type: "refresh_token",
       client_id: this.options.clientId,
       client_secret: this.options.clientSecret,
@@ -134,22 +179,228 @@ export class LinearOAuthTokenManager {
       );
     }
 
-    await this.install((await response.json()) as LinearOAuthTokenResponse);
-    return this.accessToken;
+    const tokens = parseTokenResponse(
+      (await response.json()) as LinearOAuthTokenResponse,
+    );
+    return this.serializeMutation(async () => {
+      if (
+        this.mutationGeneration !== decision.generation ||
+        this.refreshToken !== decision.refreshToken ||
+        this.pendingTokens !== undefined
+      ) {
+        return this.accessToken;
+      }
+
+      const pending = this.stagePending(tokens);
+      await this.persistAndAdopt(pending);
+      return this.accessToken;
+    });
+  }
+
+  private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(operation);
+    this.mutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private stagePending(tokens: StoredOAuthTokens): PendingOAuthTokens {
+    const pending = {
+      generation: this.mutationGeneration + 1,
+      tokens,
+    };
+    this.mutationGeneration = pending.generation;
+    this.pendingTokens = pending;
+    return pending;
+  }
+
+  private async persistAndAdopt(pending: PendingOAuthTokens): Promise<boolean> {
+    if (!this.isCurrentPending(pending)) {
+      this.schedulePendingRetry();
+      return false;
+    }
+
+    try {
+      await this.persist(pending.tokens);
+    } catch (err) {
+      this.schedulePendingRetry();
+      throw err;
+    }
+
+    if (!this.isCurrentPending(pending)) {
+      this.schedulePendingRetry();
+      return false;
+    }
+
+    this.accessToken = pending.tokens.accessToken;
+    this.refreshToken = pending.tokens.refreshToken;
+    this.expiresAt = pending.tokens.expiresAt;
+    this.pendingTokens = undefined;
+    this.clearPendingRetry();
+    return true;
+  }
+
+  private isCurrentPending(pending: PendingOAuthTokens): boolean {
+    return (
+      this.pendingTokens === pending &&
+      this.mutationGeneration === pending.generation
+    );
+  }
+
+  private schedulePendingRetry(): void {
+    if (
+      this.pendingTokens === undefined ||
+      this.persistenceRetryTimer !== undefined
+    ) {
+      return;
+    }
+
+    const delayMs = this.persistenceRetryDelayMs;
+    const timer = setTimeout(() => {
+      if (this.persistenceRetryTimer === timer) {
+        this.persistenceRetryTimer = undefined;
+      }
+      void this.serializeMutation(async () => {
+        const pending = this.pendingTokens;
+        if (pending === undefined) {
+          return;
+        }
+        try {
+          await this.persistAndAdopt(pending);
+        } catch {
+          // persistAndAdopt schedules the next bounded retry.
+        }
+      }).catch(() => undefined);
+    }, delayMs);
+    timer.unref?.();
+    this.persistenceRetryTimer = timer;
+    this.persistenceRetryDelayMs = Math.min(
+      delayMs * 2,
+      MAX_PERSISTENCE_RETRY_DELAY_MS,
+    );
+  }
+
+  private clearPendingRetry(): void {
+    if (this.persistenceRetryTimer !== undefined) {
+      clearTimeout(this.persistenceRetryTimer);
+      this.persistenceRetryTimer = undefined;
+    }
+    this.persistenceRetryDelayMs = INITIAL_PERSISTENCE_RETRY_DELAY_MS;
   }
 
   private async persist(tokens: StoredOAuthTokens): Promise<void> {
-    const directory = path.dirname(this.options.storePath);
-    await fsPromises.mkdir(directory, { recursive: true });
-    const tempPath = `${this.options.storePath}.${randomUUID()}.tmp`;
-    try {
-      await fsPromises.writeFile(tempPath, `${JSON.stringify(tokens, null, 2)}\n`, {
-        mode: 0o600,
-      });
-      await fsPromises.rename(tempPath, this.options.storePath);
-    } finally {
-      await fsPromises.rm(tempPath, { force: true });
+    const directory = path.resolve(path.dirname(this.options.storePath));
+    if (!this.directoryChainSynced) {
+      await ensureDirectoryDurable(directory);
+      this.directoryChainSynced = true;
     }
+    const tempPath = `${this.options.storePath}.${randomUUID()}.tmp`;
+    let tempFile: Awaited<ReturnType<typeof fsPromises.open>> | undefined;
+    let persistenceFailed = false;
+    let persistenceError: unknown;
+    try {
+      tempFile = await fsPromises.open(tempPath, "wx", 0o600);
+      await tempFile.writeFile(`${JSON.stringify(tokens, null, 2)}\n`, "utf8");
+      await tempFile.chmod(0o600);
+      await tempFile.sync();
+      await tempFile.close();
+      tempFile = undefined;
+      await fsPromises.rename(tempPath, this.options.storePath);
+      await syncDirectory(directory);
+    } catch (err) {
+      persistenceFailed = true;
+      persistenceError = err;
+    }
+
+    let cleanupFailed = false;
+    let cleanupError: unknown;
+    if (tempFile !== undefined) {
+      try {
+        await tempFile.close();
+      } catch (err) {
+        cleanupFailed = true;
+        cleanupError = err;
+      }
+    }
+    try {
+      await fsPromises.rm(tempPath, { force: true });
+    } catch (err) {
+      if (!cleanupFailed) {
+        cleanupFailed = true;
+        cleanupError = err;
+      }
+    }
+
+    if (persistenceFailed) {
+      throw persistenceError;
+    }
+    if (cleanupFailed) {
+      throw cleanupError;
+    }
+  }
+}
+
+async function ensureDirectoryDurable(directory: string): Promise<void> {
+  const missingDirectories: string[] = [];
+  let cursor = directory;
+
+  while (true) {
+    try {
+      const existing = await fsPromises.stat(cursor);
+      if (!existing.isDirectory()) {
+        throw new Error(`Linear OAuth token store parent is not a directory: ${cursor}`);
+      }
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw err;
+      }
+      missingDirectories.push(cursor);
+      const parent = path.dirname(cursor);
+      if (parent === cursor) {
+        throw err;
+      }
+      cursor = parent;
+    }
+  }
+
+  for (const missing of missingDirectories.reverse()) {
+    try {
+      await fsPromises.mkdir(missing, { mode: 0o700 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err;
+      }
+      const existing = await fsPromises.stat(missing);
+      if (!existing.isDirectory()) {
+        throw err;
+      }
+    }
+  }
+
+  const directoryChain: string[] = [];
+  cursor = directory;
+  while (true) {
+    directoryChain.unshift(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) {
+      break;
+    }
+    cursor = parent;
+  }
+  for (const ancestor of directoryChain) {
+    await syncDirectory(ancestor);
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await fsPromises.open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 
