@@ -116,7 +116,10 @@ export interface JsonBridgeStateStoreOptions {
   ownerId?: string;
   lockRetryMs?: number;
   lockTimeoutMs?: number;
-  lockProcessIdentity?: (pid: number) => Promise<string | undefined>;
+  lockProcessIdentity?: (
+    pid: number,
+    deadline: number,
+  ) => Promise<string | undefined>;
 }
 
 interface LegacyLockOwnerRecord {
@@ -160,7 +163,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   private readonly lockTimeoutMs: number;
   private readonly lockProcessIdentity: (
     pid: number,
+    deadline: number,
   ) => Promise<string | undefined>;
+  private currentProcessIdentityPromise: Promise<string | undefined> | undefined;
   // This process may reclaim a visible pre-dispatch claim only when the
   // mutation that created it never completed through lock release.
   private readonly locallyAcceptedPreDispatchClaims = new Set<string>();
@@ -622,7 +627,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     await fs.mkdir(candidatePath, { mode: 0o700 });
     let acquired = false;
     try {
-      await this.writeLockOwner(candidateOwnerPath, lockToken);
+      await this.writeLockOwner(candidateOwnerPath, lockToken, deadline);
       while (!acquired) {
         if (Date.now() >= deadline) {
           throw new BridgeStateLockTimeoutError();
@@ -640,7 +645,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           ) {
             throw error;
           }
-          await this.removeAbandonedLock(lockPath);
+          await this.removeAbandonedLock(lockPath, deadline);
           if (Date.now() >= deadline) {
             throw new BridgeStateLockTimeoutError();
           }
@@ -657,13 +662,21 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
   }
 
-  private async writeLockOwner(ownerPath: string, token: string): Promise<void> {
+  private async writeLockOwner(
+    ownerPath: string,
+    token: string,
+    deadline: number,
+  ): Promise<void> {
     const handle = await fs.open(ownerPath, "wx", 0o600);
     try {
-      const processIdentity = await this.lockProcessIdentity(process.pid);
+      const processIdentity = await this.resolveLockProcessIdentity(
+        process.pid,
+        deadline,
+      );
       if (!isValidProcessIdentity(processIdentity)) {
         throw new Error("Could not determine current process identity for state lock");
       }
+      assertBeforeLockDeadline(deadline);
       const owner: LockOwnerRecord = {
         token,
         pid: process.pid,
@@ -678,7 +691,10 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
   }
 
-  private async removeAbandonedLock(lockPath: string): Promise<void> {
+  private async removeAbandonedLock(
+    lockPath: string,
+    deadline: number,
+  ): Promise<void> {
     let entries: string[];
     try {
       entries = await fs.readdir(lockPath);
@@ -717,6 +733,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
 
     if (!isProcessAlive(owner.pid)) {
+      assertBeforeLockDeadline(deadline);
       await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
       return;
     }
@@ -725,8 +742,14 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     }
     let currentProcessIdentity: string | undefined;
     try {
-      currentProcessIdentity = await this.lockProcessIdentity(owner.pid);
-    } catch {
+      currentProcessIdentity = await this.resolveLockProcessIdentity(
+        owner.pid,
+        deadline,
+      );
+    } catch (error) {
+      if (error instanceof BridgeStateLockTimeoutError) {
+        throw error;
+      }
       return;
     }
     if (
@@ -736,7 +759,47 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       return;
     }
 
+    assertBeforeLockDeadline(deadline);
     await this.removeLockDirectoryOwnedBy(lockPath, owner.token);
+  }
+
+  private async resolveLockProcessIdentity(
+    pid: number,
+    deadline: number,
+  ): Promise<string | undefined> {
+    assertBeforeLockDeadline(deadline);
+    const isCurrentProcess = pid === process.pid;
+    let lookup = isCurrentProcess
+      ? this.currentProcessIdentityPromise
+      : undefined;
+    if (lookup === undefined) {
+      lookup = Promise.resolve().then(() =>
+        this.lockProcessIdentity(pid, deadline),
+      );
+      if (isCurrentProcess) {
+        this.currentProcessIdentityPromise = lookup;
+      }
+    }
+
+    try {
+      const identity = await resolveBeforeLockDeadline(lookup, deadline);
+      if (
+        isCurrentProcess &&
+        !isValidProcessIdentity(identity) &&
+        this.currentProcessIdentityPromise === lookup
+      ) {
+        this.currentProcessIdentityPromise = undefined;
+      }
+      return identity;
+    } catch (error) {
+      if (
+        isCurrentProcess &&
+        this.currentProcessIdentityPromise === lookup
+      ) {
+        this.currentProcessIdentityPromise = undefined;
+      }
+      throw error;
+    }
   }
 
   private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
@@ -989,66 +1052,171 @@ function isValidProcessIdentity(value: unknown): value is string {
   );
 }
 
-let currentProcessIdentityPromise: Promise<string | undefined> | undefined;
-
 function defaultLockProcessIdentity(
   pid: number,
+  deadline: number,
 ): Promise<string | undefined> {
-  if (pid === process.pid) {
-    currentProcessIdentityPromise ??= readCurrentProcessIdentity();
-    return currentProcessIdentityPromise;
-  }
-  return readProcessIdentity(pid);
+  return readProcessIdentity(pid, deadline);
 }
 
-async function readCurrentProcessIdentity(): Promise<string | undefined> {
-  return readProcessIdentity(process.pid);
-}
-
-async function readProcessIdentity(pid: number): Promise<string | undefined> {
+async function readProcessIdentity(
+  pid: number,
+  deadline: number,
+): Promise<string | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     return undefined;
   }
   if (process.platform === "linux") {
+    let stat: string;
+    let bootId: string;
     try {
-      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-      const commandEnd = stat.lastIndexOf(")");
-      if (commandEnd < 0) {
-        return undefined;
-      }
-      const fieldsAfterCommand = stat
-        .slice(commandEnd + 1)
-        .trim()
-        .split(/\s+/);
-      const startTime = fieldsAfterCommand[19];
-      return startTime !== undefined && /^\d+$/.test(startTime)
-        ? `linux-proc-start:${startTime}`
-        : undefined;
+      [stat, bootId] = await Promise.all([
+        fs.readFile(`/proc/${pid}/stat`, "utf8"),
+        fs.readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      ]);
     } catch {
       return undefined;
     }
+    assertBeforeLockDeadline(deadline);
+    return buildLinuxLockProcessIdentity(bootId, stat);
   }
   if (process.platform === "darwin") {
+    let launchctlOutput: string;
+    let bootSessionOutput: string;
     try {
-      const result = await execFileAsync(
-        "/bin/ps",
-        ["-o", "lstart=", "-p", String(pid)],
-        {
-          encoding: "utf8",
-          timeout: 1_000,
-          maxBuffer: 4_096,
-          env: { ...process.env, LC_ALL: "C" },
-        },
-      );
-      const startedAt = result.stdout.trim().replace(/\s+/g, " ");
-      return startedAt === ""
-        ? undefined
-        : `darwin-ps-start:${startedAt}`;
+      [launchctlOutput, bootSessionOutput] = await Promise.all([
+        execFileBeforeLockDeadline(
+          "/bin/launchctl",
+          ["print", `pid/${pid}`],
+          deadline,
+          64 * 1024,
+        ),
+        execFileBeforeLockDeadline(
+          "/usr/sbin/sysctl",
+          ["-n", "kern.bootsessionuuid"],
+          deadline,
+          4 * 1024,
+        ),
+      ]);
     } catch {
       return undefined;
     }
+    assertBeforeLockDeadline(deadline);
+    return buildDarwinLockProcessIdentity(
+      bootSessionOutput,
+      launchctlOutput,
+    );
   }
   return undefined;
+}
+
+async function execFileBeforeLockDeadline(
+  executable: string,
+  args: string[],
+  deadline: number,
+  maxBuffer: number,
+): Promise<string> {
+  assertBeforeLockDeadline(deadline);
+  const result = await execFileAsync(executable, args, {
+    encoding: "utf8",
+    timeout: Math.max(1, deadline - Date.now()),
+    maxBuffer,
+    env: { LC_ALL: "C" },
+  });
+  assertBeforeLockDeadline(deadline);
+  return result.stdout;
+}
+
+export function parseBootSessionUuid(output: string): string | undefined {
+  const value = output.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    value,
+  )
+    ? value.toLowerCase()
+    : undefined;
+}
+
+export function parseDarwinProcessUniqueId(
+  output: string,
+): string | undefined {
+  const matches = [
+    ...output.matchAll(/^[\t ]*uniqueid = ([1-9]\d{0,19})[\t ]*$/gm),
+  ];
+  return matches.length === 1 ? matches[0]![1] : undefined;
+}
+
+export function parseLinuxProcessStartTicks(
+  stat: string,
+): string | undefined {
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) {
+    return undefined;
+  }
+  const fieldsAfterCommand = stat
+    .slice(commandEnd + 1)
+    .trim()
+    .split(/\s+/);
+  const startTicks = fieldsAfterCommand[19];
+  return startTicks !== undefined && /^\d+$/.test(startTicks)
+    ? startTicks
+    : undefined;
+}
+
+/** @internal Pure constructor kept exported for cross-platform lock tests. */
+export function buildLinuxLockProcessIdentity(
+  bootIdOutput: string,
+  processStat: string,
+): string | undefined {
+  const bootSessionUuid = parseBootSessionUuid(bootIdOutput);
+  const processStartTicks = parseLinuxProcessStartTicks(processStat);
+  return bootSessionUuid === undefined || processStartTicks === undefined
+    ? undefined
+    : `linux-boot:${bootSessionUuid}:proc-start:${processStartTicks}`;
+}
+
+/** @internal Pure constructor kept exported for cross-platform lock tests. */
+export function buildDarwinLockProcessIdentity(
+  bootSessionOutput: string,
+  launchctlOutput: string,
+): string | undefined {
+  const bootSessionUuid = parseBootSessionUuid(bootSessionOutput);
+  const processUniqueId = parseDarwinProcessUniqueId(launchctlOutput);
+  return bootSessionUuid === undefined || processUniqueId === undefined
+    ? undefined
+    : `darwin-boot:${bootSessionUuid}:proc-uniqueid:${processUniqueId}`;
+}
+
+function assertBeforeLockDeadline(deadline: number): void {
+  if (Date.now() >= deadline) {
+    throw new BridgeStateLockTimeoutError();
+  }
+}
+
+async function resolveBeforeLockDeadline<T>(
+  promise: Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    void promise.catch(() => undefined);
+    throw new BridgeStateLockTimeoutError();
+  }
+
+  let timeout: NodeJS.Timeout | undefined;
+  const deadlineReached = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new BridgeStateLockTimeoutError());
+    }, remainingMs);
+  });
+  try {
+    const result = await Promise.race([promise, deadlineReached]);
+    assertBeforeLockDeadline(deadline);
+    return result;
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function delay(milliseconds: number): Promise<void> {
