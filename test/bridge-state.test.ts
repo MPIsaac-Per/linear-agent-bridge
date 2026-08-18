@@ -2412,7 +2412,7 @@ describe("JsonBridgeStateStore", () => {
       store as unknown as {
         lockTimeoutMs: number;
       }
-    ).lockTimeoutMs = 50;
+    ).lockTimeoutMs = 250;
     const stalledSync = deferred();
     const originalOpen = fs.open.bind(fs);
     let stallNextDirectorySync = true;
