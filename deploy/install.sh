@@ -15,7 +15,8 @@ if [ ! -f .env ]; then
 	exit 1
 fi
 
-# 2. Build
+# 2. Build. On macOS this also compiles dist/native/process_identity with
+# Xcode Command Line Tools and fails with installation guidance if unavailable.
 npm run build
 
 # 3. Render the plist template for this checkout

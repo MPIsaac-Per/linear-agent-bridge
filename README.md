@@ -56,6 +56,8 @@ while a differing result is forwarded.
 
 - Node 22+, a machine that stays on, and [Claude Code](https://claude.com/claude-code)
   installed and logged in as the user who runs the service.
+- On macOS, Xcode Command Line Tools (`xcode-select --install`). The build uses
+  the supported libproc API to compile a small local process-identity helper.
 - A Linear workspace where you can create OAuth applications.
 - A public HTTPS route to the service (tailscale funnel, cloudflared, or
   any reverse proxy).
@@ -83,6 +85,11 @@ npm install && cp .env.example .env
 npm run dev
 ```
 
+The `dev`, `test`, `build`, and `start` scripts build the macOS helper when its
+source, target architecture, or compile flags change. The native step is
+skipped on other platforms. A required macOS rebuild fails closed with an
+installation command when Command Line Tools are unavailable.
+
 ### 3. Install the app as an agent (actor=app)
 
 Start the service, then open the `OAuth authorization URL` printed in its
@@ -109,8 +116,14 @@ set an owner-only mode and sync the temporary file before a same-directory
 atomic rename, then sync the containing directory. A process-owned lock bounds
 contention to one second so the webhook can still return 503 before Linear's
 five-second deadline. An old lock is retained while its recorded local process
-is alive; an exited process's lock can be reclaimed without allowing the prior
-owner to unlink a replacement lock.
+is alive. Lock ownership includes a boot-scoped process birth identity, so a
+recycled PID cannot preserve or steal an old lock. Linux combines the kernel
+boot ID with `/proc/<pid>/stat` start ticks. macOS combines the boot-session
+UUID with the microsecond process start time returned by a locally compiled
+libproc helper at `dist/native/process_identity`. The helper receives only a
+numeric PID, emits only `seconds:microseconds`, and runs within the same
+one-second lock budget. An exited process's lock can be reclaimed without
+allowing the prior owner to unlink a replacement lock.
 
 #### Upgrading an existing installation
 

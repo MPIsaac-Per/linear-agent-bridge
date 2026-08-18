@@ -8,12 +8,19 @@
     "node": ">=22"
   },
   "scripts": {
+    "predev": "npm run native:build",
     "dev": "tsx src/index.ts",
+    "prebuild": "npm run native:build",
     "build": "tsc",
+    "prestart": "npm run native:build",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run native:build",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "pretest:watch": "npm run native:build",
+    "test:watch": "vitest",
+    "native:build": "node scripts/build-native.mjs",
+    "native:check": "node scripts/build-native.mjs --check"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.228"

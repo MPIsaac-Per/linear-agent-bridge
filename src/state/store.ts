@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 export const DEFAULT_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -16,6 +17,9 @@ const LOCK_RETRY_MS = 10;
 const LOCK_TIMEOUT_MS = 1_000;
 const MAX_PROCESS_IDENTITY_LENGTH = 512;
 const execFileAsync = promisify(execFile);
+const DARWIN_PROCESS_IDENTITY_HELPER = fileURLToPath(
+  new URL("../../dist/native/process_identity", import.meta.url),
+);
 
 export type IngressAction = "created" | "prompted";
 export type IngressStatus =
@@ -143,6 +147,15 @@ export class BridgeStateLockTimeoutError extends Error {
   constructor() {
     super("Timed out acquiring bridge state lock");
     this.name = "BridgeStateLockTimeoutError";
+  }
+}
+
+class DarwinProcessIdentityHelperUnavailableError extends Error {
+  constructor() {
+    super(
+      "macOS process identity helper is unavailable; run npm run native:build (Xcode Command Line Tools are required)",
+    );
+    this.name = "DarwinProcessIdentityHelperUnavailableError";
   }
 }
 
@@ -1081,15 +1094,23 @@ async function readProcessIdentity(
     return buildLinuxLockProcessIdentity(bootId, stat);
   }
   if (process.platform === "darwin") {
-    let launchctlOutput: string;
+    assertBeforeLockDeadline(deadline);
+    try {
+      await fs.access(DARWIN_PROCESS_IDENTITY_HELPER, fsConstants.X_OK);
+    } catch {
+      throw new DarwinProcessIdentityHelperUnavailableError();
+    }
+    assertBeforeLockDeadline(deadline);
+
+    let processStartOutput: string;
     let bootSessionOutput: string;
     try {
-      [launchctlOutput, bootSessionOutput] = await Promise.all([
+      [processStartOutput, bootSessionOutput] = await Promise.all([
         execFileBeforeLockDeadline(
-          "/bin/launchctl",
-          ["print", `pid/${pid}`],
+          DARWIN_PROCESS_IDENTITY_HELPER,
+          [String(pid)],
           deadline,
-          64 * 1024,
+          128,
         ),
         execFileBeforeLockDeadline(
           "/usr/sbin/sysctl",
@@ -1104,7 +1125,7 @@ async function readProcessIdentity(
     assertBeforeLockDeadline(deadline);
     return buildDarwinLockProcessIdentity(
       bootSessionOutput,
-      launchctlOutput,
+      processStartOutput,
     );
   }
   return undefined;
@@ -1136,13 +1157,15 @@ export function parseBootSessionUuid(output: string): string | undefined {
     : undefined;
 }
 
-export function parseDarwinProcessUniqueId(
+export function parseDarwinProcessStartTime(
   output: string,
 ): string | undefined {
-  const matches = [
-    ...output.matchAll(/^[\t ]*uniqueid = ([1-9]\d{0,19})[\t ]*$/gm),
-  ];
-  return matches.length === 1 ? matches[0]![1] : undefined;
+  const value = output.trim();
+  const match = /^([1-9]\d{0,19}):(0|[1-9]\d{0,5})$/.exec(value);
+  if (match === null || Number(match[2]) >= 1_000_000) {
+    return undefined;
+  }
+  return `${match[1]}:${match[2]}`;
 }
 
 export function parseLinuxProcessStartTicks(
@@ -1177,13 +1200,13 @@ export function buildLinuxLockProcessIdentity(
 /** @internal Pure constructor kept exported for cross-platform lock tests. */
 export function buildDarwinLockProcessIdentity(
   bootSessionOutput: string,
-  launchctlOutput: string,
+  processStartOutput: string,
 ): string | undefined {
   const bootSessionUuid = parseBootSessionUuid(bootSessionOutput);
-  const processUniqueId = parseDarwinProcessUniqueId(launchctlOutput);
-  return bootSessionUuid === undefined || processUniqueId === undefined
+  const processStartTime = parseDarwinProcessStartTime(processStartOutput);
+  return bootSessionUuid === undefined || processStartTime === undefined
     ? undefined
-    : `darwin-boot:${bootSessionUuid}:proc-uniqueid:${processUniqueId}`;
+    : `darwin-boot:${bootSessionUuid}:proc-start:${processStartTime}`;
 }
 
 function assertBeforeLockDeadline(deadline: number): void {

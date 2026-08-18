@@ -7,7 +7,7 @@ import {
   buildLinuxLockProcessIdentity,
   JsonBridgeStateStore,
   parseBootSessionUuid,
-  parseDarwinProcessUniqueId,
+  parseDarwinProcessStartTime,
   parseLinuxProcessStartTicks,
   type IngressEventIdentity,
   type JsonBridgeStateStoreOptions,
@@ -161,13 +161,11 @@ describe("JsonBridgeStateStore", () => {
       parseBootSessionUuid("24F0C7A0-3DD9-4B33-869C-8F07D374EBD8\n"),
     ).toBe("24f0c7a0-3dd9-4b33-869c-8f07d374ebd8");
     expect(parseBootSessionUuid("secret\nnot-a-uuid\n")).toBeUndefined();
-    expect(
-      parseDarwinProcessUniqueId("\tpid = 42\n\tuniqueid = 862743\n"),
-    ).toBe("862743");
-    expect(
-      parseDarwinProcessUniqueId("uniqueid = 1\nuniqueid = 2\n"),
-    ).toBeUndefined();
-    expect(parseDarwinProcessUniqueId("uniqueid = 12secret\n")).toBeUndefined();
+    expect(parseDarwinProcessStartTime("1724000000:862743\n")).toBe(
+      "1724000000:862743",
+    );
+    expect(parseDarwinProcessStartTime("1724000000:1000000\n")).toBeUndefined();
+    expect(parseDarwinProcessStartTime("1724000000:12secret\n")).toBeUndefined();
     expect(
       parseLinuxProcessStartTicks(
         "123 (node worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20",
@@ -176,7 +174,7 @@ describe("JsonBridgeStateStore", () => {
     expect(parseLinuxProcessStartTicks("123 (node) S too-short")).toBeUndefined();
   });
 
-  it("scopes Linux start ticks to a boot and Darwin PIDs to a launchd uniqueid", () => {
+  it("scopes Linux start ticks and Darwin microsecond start times to a boot", () => {
     const bootA = "24F0C7A0-3DD9-4B33-869C-8F07D374EBD8";
     const bootB = "79326562-1A4C-42A2-AC6D-00478B65895D";
     const stat =
@@ -190,14 +188,14 @@ describe("JsonBridgeStateStore", () => {
 
     const darwinFirst = buildDarwinLockProcessIdentity(
       bootA,
-      "\tpid = 123\n\tuniqueid = 862743\n",
+      "1724000000:862743\n",
     );
     const darwinRecycled = buildDarwinLockProcessIdentity(
       bootA,
-      "\tpid = 123\n\tuniqueid = 862744\n",
+      "1724000000:862744\n",
     );
     expect(darwinFirst).toBe(
-      "darwin-boot:24f0c7a0-3dd9-4b33-869c-8f07d374ebd8:proc-uniqueid:862743",
+      "darwin-boot:24f0c7a0-3dd9-4b33-869c-8f07d374ebd8:proc-start:1724000000:862743",
     );
     expect(darwinRecycled).not.toBe(darwinFirst);
   });
@@ -226,7 +224,7 @@ describe("JsonBridgeStateStore", () => {
     }
     if (process.platform === "darwin") {
       expect(persistedIdentity).toMatch(
-        /^darwin-boot:[0-9a-f-]{36}:proc-uniqueid:[1-9]\d*$/,
+        /^darwin-boot:[0-9a-f-]{36}:proc-start:[1-9]\d*:\d+$/,
       );
     } else if (process.platform === "linux") {
       expect(persistedIdentity).toMatch(
