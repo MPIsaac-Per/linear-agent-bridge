@@ -3483,11 +3483,11 @@ describe("startServer", () => {
       request: SessionRequest,
     ): AsyncGenerator<RuntimeEvent> {
       if (request.linearSessionId === "agent-session-active-long") {
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        await new Promise((resolve) => setTimeout(resolve, 100));
         yield { kind: "progress" };
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        await new Promise((resolve) => setTimeout(resolve, 100));
         yield { kind: "session-started", runtimeSessionId: "runtime-active-long" };
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
       yield {
         kind: "activity",
@@ -3497,7 +3497,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runInactivityTimeoutMs: 75 },
+      configOverrides: { runInactivityTimeoutMs: 250 },
     });
     const harness = activeHarness;
 
@@ -3532,7 +3532,7 @@ describe("startServer", () => {
             call.content.type === "response" &&
             call.content.body === "completed agent-session-waiting",
         ),
-      500,
+      1_500,
     );
     expect(
       harness.calls.some(

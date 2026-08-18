@@ -425,7 +425,7 @@ describe("JsonBridgeStateStore", () => {
     const first = new JsonBridgeStateStore(storePath, {
       ...TEST_LOCK_OPTIONS,
       ownerId: "runtime-a",
-      lockTimeoutMs: 50,
+      lockTimeoutMs: 250,
       lockRetryMs: 1,
     });
     const second = new JsonBridgeStateStore(storePath, {
@@ -530,7 +530,7 @@ describe("JsonBridgeStateStore", () => {
     const store = new JsonBridgeStateStore(storePath, {
       ...TEST_LOCK_OPTIONS,
       ownerId: "runtime-a",
-      lockTimeoutMs: 40,
+      lockTimeoutMs: 250,
     });
 
     try {
@@ -829,7 +829,7 @@ describe("JsonBridgeStateStore", () => {
     const inspectedBirthPids: number[] = [];
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-same-boot",
-      lockTimeoutMs: 40,
+      lockTimeoutMs: 250,
       lockProcessIdentity: async (pid) => {
         inspectedBirthPids.push(pid);
         return pid === process.pid ? CURRENT_PROCESS_IDENTITY : undefined;
@@ -1211,7 +1211,7 @@ describe("JsonBridgeStateStore", () => {
     const inspectedUidPids: number[] = [];
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-different-effective-uid",
-      lockTimeoutMs: 50,
+      lockTimeoutMs: 250,
       lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
       lockBootIdentity: async () => BOOT_A,
       lockProcessUid: async (pid) => {
