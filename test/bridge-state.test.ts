@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildDarwinLockProcessIdentity,
   buildLinuxLockProcessIdentity,
+  darwinProcessRealUidArgs,
   JsonBridgeStateStore,
   parseBootSessionUuid,
-  parseDarwinProcessUid,
+  parseDarwinProcessRealUid,
   parseDarwinProcessStartTime,
   parseLinuxProcessRealUid,
   parseLinuxProcessStartTicks,
@@ -325,9 +326,17 @@ describe("JsonBridgeStateStore", () => {
       ),
     ).toBe(501);
     expect(parseLinuxProcessRealUid("Uid:\t501\t502\tsecret\t504\n")).toBeUndefined();
-    expect(parseDarwinProcessUid("  501\n")).toBe(501);
-    expect(parseDarwinProcessUid("501\nprivate-data\n")).toBeUndefined();
-    expect(parseDarwinProcessUid("4294967296\n")).toBeUndefined();
+    expect(darwinProcessRealUidArgs(123)).toEqual([
+      "-o",
+      "ruid=",
+      "-p",
+      "123",
+    ]);
+    expect(parseDarwinProcessRealUid("  501\n")).toBe(501);
+    expect(
+      parseDarwinProcessRealUid("501\nprivate-data\n"),
+    ).toBeUndefined();
+    expect(parseDarwinProcessRealUid("4294967296\n")).toBeUndefined();
   });
 
   it("scopes Linux start ticks and Darwin microsecond start times to a boot", () => {
@@ -600,6 +609,43 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.claimEvent(event())).rejects.toThrow(
       /Timed out acquiring bridge state lock/,
     );
+    expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+    await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
+  });
+
+  it("compares Darwin real uid to the recorded real uid when effective uid differs", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "matching-real-uid-owner";
+    const realUid = 501;
+    const effectiveUid = 0;
+    const uidByPsColumn: Record<string, number> = {
+      "ruid=": realUid,
+      "uid=": effectiveUid,
+    };
+    await writeLockOwner(lockPath, token, {
+      pid: process.pid,
+      hostname: os.hostname(),
+      processIdentity: CURRENT_PROCESS_IDENTITY,
+      uid: realUid,
+    });
+    const inspectedUidPids: number[] = [];
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-different-effective-uid",
+      lockTimeoutMs: 50,
+      lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async (pid) => {
+        inspectedUidPids.push(pid);
+        return uidByPsColumn[darwinProcessRealUidArgs(pid)[1]!];
+      },
+    });
+
+    await expect(store.claimEvent(event())).rejects.toThrow(
+      /Timed out acquiring bridge state lock/,
+    );
+    expect(inspectedUidPids.length).toBeGreaterThan(0);
+    expect(inspectedUidPids.every((pid) => pid === process.pid)).toBe(true);
     expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
   });

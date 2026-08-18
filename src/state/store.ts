@@ -1262,11 +1262,11 @@ async function readProcessUid(
     if (process.platform === "darwin") {
       output = await execFileBeforeLockDeadline(
         "/bin/ps",
-        ["-o", "uid=", "-p", String(pid)],
+        darwinProcessRealUidArgs(pid),
         deadline,
         128,
       );
-      return parseDarwinProcessUid(output);
+      return parseDarwinProcessRealUid(output);
     }
     return undefined;
   } catch (error) {
@@ -1396,7 +1396,12 @@ export function parseLinuxProcessRealUid(
   return matches.length === 1 ? parseNumericUid(matches[0]![1]!) : undefined;
 }
 
-export function parseDarwinProcessUid(output: string): number | undefined {
+/** @internal Pure argv constructor kept exported for cross-platform lock tests. */
+export function darwinProcessRealUidArgs(pid: number): string[] {
+  return ["-o", "ruid=", "-p", String(pid)];
+}
+
+export function parseDarwinProcessRealUid(output: string): number | undefined {
   return parseNumericUid(output.trim());
 }
 
