@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 const validEnv = {
@@ -207,5 +210,71 @@ describe("loadConfig", () => {
         INGRESS_RECOVERY_PREVIOUS_KEYS: recoveryKeys.slice(0, 5).join(","),
       }),
     ).toThrow("Invalid INGRESS_RECOVERY_PREVIOUS_KEYS");
+  });
+});
+
+describe("AGENT_OUTPUT_PATH", () => {
+  let tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs) {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+    tempDirs = [];
+  });
+
+  async function tempDir(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-output-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("omits the output path when unset, leaving today's behaviour exactly", () => {
+    const config = loadConfig({ ...validEnv });
+
+    expect("agentOutputPath" in config).toBe(false);
+  });
+
+  it("accepts an existing writable directory and resolves it absolutely", async () => {
+    const dir = await tempDir();
+
+    const config = loadConfig({ ...validEnv, AGENT_OUTPUT_PATH: dir });
+
+    expect(config.agentOutputPath).toBe(path.resolve(dir));
+  });
+
+  it("creates the output path when it does not exist yet", async () => {
+    const dir = await tempDir();
+    const target = path.join(dir, "nested", "artifacts");
+
+    const config = loadConfig({ ...validEnv, AGENT_OUTPUT_PATH: target });
+
+    expect(config.agentOutputPath).toBe(path.resolve(target));
+    await expect(fs.stat(target)).resolves.toMatchObject({});
+  });
+
+  it("rejects a path that exists but is not a directory", async () => {
+    const dir = await tempDir();
+    const target = path.join(dir, "not-a-directory");
+    await fs.writeFile(target, "");
+
+    expect(() => loadConfig({ ...validEnv, AGENT_OUTPUT_PATH: target })).toThrow(
+      /AGENT_OUTPUT_PATH.*expected a directory/,
+    );
+  });
+
+  it("rejects a directory it cannot write to, at startup rather than mid-turn", async () => {
+    const dir = await tempDir();
+    const target = path.join(dir, "read-only");
+    await fs.mkdir(target, { mode: 0o500 });
+
+    try {
+      expect(() =>
+        loadConfig({ ...validEnv, AGENT_OUTPUT_PATH: target }),
+      ).toThrow(/AGENT_OUTPUT_PATH.*not writable/);
+    } finally {
+      // Restore write so the fixture can clean itself up.
+      await fs.chmod(target, 0o700);
+    }
   });
 });

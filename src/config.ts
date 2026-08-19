@@ -1,3 +1,5 @@
+import { accessSync, constants, mkdirSync, statSync } from "node:fs";
+import * as path from "node:path";
 import { parseCanonicalRecoveryKey } from "./state/recovery-envelope.js";
 
 export interface Config {
@@ -18,6 +20,13 @@ export interface Config {
   reconcileLookbackMs: number;
   reconcileMaxSessions: number;
   agentSessionAckGraceMs: number;
+  /**
+   * Directory the agent may write to. Optional: unset means the runtime keeps
+   * today's behaviour and no output path is surfaced. Enforcement is the
+   * filesystem, never this value; surfacing it only saves the agent from
+   * discovering the boundary by hitting EACCES.
+   */
+  agentOutputPath?: string;
 }
 
 const DEFAULT_PORT = "3979";
@@ -94,6 +103,38 @@ function integerInRange(
  * in declared order: LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET,
  * LINEAR_WEBHOOK_SECRET, LINEAR_ACCESS_TOKEN, INGRESS_RECOVERY_KEY.
  */
+/**
+ * Validate the output path once, at startup, so a misconfiguration surfaces
+ * before a turn is accepted rather than half way through one.
+ */
+function resolveAgentOutputPath(value: string): string {
+  const resolved = path.resolve(value);
+  let stats;
+  try {
+    stats = statSync(resolved);
+  } catch {
+    try {
+      mkdirSync(resolved, { recursive: true, mode: 0o700 });
+    } catch {
+      throw new Error(
+        `Invalid AGENT_OUTPUT_PATH "${resolved}": could not be created`,
+      );
+    }
+    return resolved;
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(
+      `Invalid AGENT_OUTPUT_PATH "${resolved}": expected a directory`,
+    );
+  }
+  try {
+    accessSync(resolved, constants.W_OK);
+  } catch {
+    throw new Error(`Invalid AGENT_OUTPUT_PATH "${resolved}": not writable`);
+  }
+  return resolved;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const linearClientId = requireEnv(env, "LINEAR_CLIENT_ID");
   const linearClientSecret = requireEnv(env, "LINEAR_CLIENT_SECRET");
@@ -129,7 +170,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     inactivityTimeoutKey,
   );
 
+  const agentOutputPathRaw = env.AGENT_OUTPUT_PATH;
+
   return {
+    ...(agentOutputPathRaw !== undefined && agentOutputPathRaw !== ""
+      ? { agentOutputPath: resolveAgentOutputPath(agentOutputPathRaw) }
+      : {}),
     linearClientId,
     linearClientSecret,
     linearWebhookSecret,

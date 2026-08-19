@@ -19,6 +19,15 @@ Changes awaiting a tagged release remain under Unreleased.
   installer, logs to the journal, and requires root; macOS keeps the per-user
   launchd agent. `deploy/install.test.sh` runs every case against both fakes,
   rollback included.
+- `AGENT_OUTPUT_PATH`, an optional directory the agent may write to. Unset,
+  nothing changes. Set, it is validated at startup (exists or can be created,
+  is a directory, is writable) with a bounded diagnostic, and the runtime names
+  it once in the prompt so the agent knows where artifacts go rather than
+  discovering the boundary by hitting `EACCES`. Enforcement is the filesystem:
+  no tool or permission overrides are passed to the SDK, and a denied write
+  neither crashes the service nor triggers a retry. The README documents the
+  three-tier posture, the dedicated-account requirement, and the loss of
+  in-place editing that comes with it.
 
 ### Fixed
 

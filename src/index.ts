@@ -10,8 +10,14 @@ import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
 import type { AgentRuntime } from "./types.js";
 
-function buildRuntime(runtime: "claude" | "codex", kbPath: string): AgentRuntime {
-  return runtime === "claude" ? new ClaudeRuntime(kbPath) : new CodexRuntime();
+function buildRuntime(
+  runtime: "claude" | "codex",
+  kbPath: string,
+  agentOutputPath?: string,
+): AgentRuntime {
+  return runtime === "claude"
+    ? new ClaudeRuntime(kbPath, undefined, agentOutputPath)
+    : new CodexRuntime();
 }
 
 const config = loadConfig();
@@ -24,7 +30,7 @@ const oauth = new LinearOAuthTokenManager({
 await oauth.load();
 const server = startServer({
   config,
-  runtime: buildRuntime(config.runtime, config.kbPath),
+  runtime: buildRuntime(config.runtime, config.kbPath, config.agentOutputPath),
   linear: new LinearAgentClient(oauth),
   oauth,
   store: new JsonSessionStore(config.sessionStorePath),

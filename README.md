@@ -421,6 +421,50 @@ workspace steers an unattended agent session running with permissions
 bypassed in `KB_PATH`. Use it in workspaces you trust, and scope `KB_PATH`
 deliberately.
 
+### Confining what the agent can write
+
+A webhook-driven agent cannot answer a permission prompt, so unattended runs
+pass `permissionMode: "bypassPermissions"`. That is not changing. It means no
+prompt stands between the agent and the working directory, and for many
+operators `KB_PATH` is a knowledge base synced to other machines, where a
+mistaken write is recoverable by diff and a mistaken delete often is not.
+
+`AGENT_OUTPUT_PATH` makes a read-only working directory a supported posture. It
+is optional; unset, nothing changes. Set it and the runtime names the directory
+in its prompt so the agent knows where artifacts go instead of discovering the
+boundary by hitting `EACCES`.
+
+**The filesystem is the enforcement, not the setting.** Anything enforced inside
+the agent is advisory: a tool call, a subprocess, or a bug walks through it.
+Surfacing the path is for usability and nothing else. Three tiers:
+
+| Path | Access for the service account |
+| --- | --- |
+| Working directory content | read-only |
+| Agent tooling state inside the working directory | writable |
+| `AGENT_OUTPUT_PATH` | writable |
+
+The middle tier exists because agent tooling writes state inside the working
+directory, not only content. Verify the exact set against your installed SDK
+version rather than trusting a list that will age.
+
+To set it up: run the service as a dedicated account, not your login account
+and **not root**, since running as root defeats the entire model. Grant that
+account read on the working tree and write on the output path and the tooling
+state path. On Linux the installer creates that account for you; see the
+deployment section above.
+
+The trade is real and worth stating plainly. The agent can no longer edit an
+existing file, fix a typo, or maintain an index in place. Every change becomes
+a new artifact in the output path for a human to review and merge. If you want
+an agent that maintains its working tree, leave `AGENT_OUTPUT_PATH` unset.
+
+On the sync interaction: confining writes to one directory reduces the conflict
+surface to that directory, and it only conflicts if a human edits the same
+directory at the same time. A denied write is the agent's problem, not the
+service's. The bridge does not crash, does not retry, and reports a bounded
+error class.
+
 ## Billing note
 
 The Claude Agent SDK currently draws on Claude Code subscription
