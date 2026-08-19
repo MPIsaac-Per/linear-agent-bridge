@@ -56,10 +56,27 @@ Fill these fields before changing Linear:
 | --- | --- |
 | Public-edge owner | Named operator accountable for Funnel and DNS/TLS checks |
 | Serving host | Exact hostname running both the service and Funnel |
-| Canonical webhook URL | `https://<serving-host>.<tailnet>.ts.net/webhook` |
+| Canonical webhook URL | `https://<serving-host>.<tailnet>.ts.net/webhook`, including a port when Funnel is not on 443 |
 | Previous webhook URL | Exact URL currently saved in the Linear app |
 | Rollback owner | Operator authorized to restore the previous URL |
 | Cutover time | Scheduled time with time zone |
+
+### A port in the URL is easy to lose
+
+Funnel does not have to be on 443, and when it is not, the port is part of the
+URL. Two things follow.
+
+The provider's webhook field may drop or reject a non-default port. Check by
+saving, reloading the settings page, and reading the value back, rather than
+trusting the save. A URL that silently lost its port points at whatever else
+answers on 443, or at nothing.
+
+Delivery failures are logged only after retries are exhausted, so an empty
+failures panel does not mean delivery is working. It can equally mean attempts
+are still in flight. Confirm with a durable receipt on the serving host, not
+with the absence of a logged failure.
+
+Both cost time during the 2026-08-19 cutover.
 
 The URL is canonical only when `tailscale funnel status --json` contains
 exactly one public handler whose proxy is `http://127.0.0.1:<PORT>`. Do not
@@ -205,6 +222,12 @@ not prove a turn ran.
 | `stalled_agent_session` | Prompt lacks a durable claim after grace | Compare Linear history, watermarks, and receipt store | Fix ingress/reconciliation, then let semantic claims prevent duplication |
 
 ## Rollback
+
+Verify the previous URL still answers before relying on it. During the
+2026-08-19 cutover the previous host's Funnel still reported itself as on while
+its public path failed the TLS handshake, so rolling back to it would have moved
+delivery from one broken endpoint to another. A rollback target is only a
+rollback target once it has passed the signed public verification above.
 
 Rollback uses the exact previous webhook URL recorded above. Do not invent a
 new hostname during an incident.
