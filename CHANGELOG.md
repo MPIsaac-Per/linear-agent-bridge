@@ -44,8 +44,10 @@ Changes awaiting a tagged release remain under Unreleased.
   records and legacy caller UUIDs migrate through retained renderers and exact
   ID reconciliation.
 - Serialize durable runtime-session mappings and gate queued follow-ups behind
-  a bounded write/read handoff. A stuck prior rename releases the global queue
-  without letting the follow-up start a fresh runtime session.
+  a bounded persistence handoff. Slow reads detach from the runtime queue,
+  remain single-flight, and suppress recovery until their cached result is
+  ready; a never-settling read leaves the accepted turn recoverable and makes
+  shutdown report an incomplete persistence drain.
 - Add reader-first recovery-key rotation through up to four retained previous
   keys. The primary key writes new envelopes while the retained keyring reads
   outstanding envelopes from earlier deployments.

@@ -10,7 +10,21 @@ export interface SessionRecord {
   updatedAt: string;
 }
 
+export class SessionStoreReadPendingError extends Error {
+  constructor(readonly settlement: Promise<void>) {
+    super("Session store read is still pending");
+    this.name = "SessionStoreReadPendingError";
+  }
+}
+
 type SessionMap = Record<string, SessionRecord>;
+
+interface PendingSessionRead {
+  promise: Promise<SessionMap>;
+  settlement: Promise<void>;
+  detachedSessionIds: Set<string>;
+  generation: number;
+}
 
 /**
  * Maps Linear agent-session ids to runtime session ids so follow-up
@@ -21,6 +35,9 @@ export class JsonSessionStore {
   private readonly resolvedPath: string;
   private directoryReady: Promise<void> | undefined;
   private mutationTail: Promise<void> = Promise.resolve();
+  private readonly recoveredRecords = new Map<string, SessionRecord | null>();
+  private pendingRead: PendingSessionRead | undefined;
+  private snapshotGeneration = 0;
 
   constructor(pathname: string) {
     this.resolvedPath = path.resolve(pathname);
@@ -31,11 +48,12 @@ export class JsonSessionStore {
     signal?: AbortSignal,
   ): Promise<SessionRecord | undefined> {
     await beforeAbort(this.mutationTail, signal);
-    // A filesystem read has no cancellation primitive. Keep the caller
-    // attached through settlement so a timeout cannot spawn overlapping
-    // retries of the same uncancelled read.
-    const sessions = await this.readAll();
-    throwIfAborted(signal);
+    if (this.recoveredRecords.has(linearSessionId)) {
+      const recovered = this.recoveredRecords.get(linearSessionId);
+      this.recoveredRecords.delete(linearSessionId);
+      return recovered ?? undefined;
+    }
+    const sessions = await this.readSnapshotBeforeAbort(linearSessionId, signal);
     return sessions[linearSessionId];
   }
 
@@ -43,6 +61,8 @@ export class JsonSessionStore {
     if (!isSessionRecord(record.linearSessionId, record)) {
       return Promise.reject(new Error("Invalid session record"));
     }
+    this.recoveredRecords.clear();
+    this.snapshotGeneration += 1;
     const write = this.mutationTail.then(() => this.putSerialized(record, signal));
     this.mutationTail = write.then(
       () => undefined,
@@ -60,6 +80,62 @@ export class JsonSessionStore {
     throwIfAborted(signal);
     sessions[record.linearSessionId] = record;
     await this.writeAll(sessions, signal);
+  }
+
+  private async readSnapshotBeforeAbort(
+    linearSessionId: string,
+    signal?: AbortSignal,
+  ): Promise<SessionMap> {
+    const read = this.pendingRead ?? this.startSnapshotRead();
+    if (signalIsAborted(signal)) {
+      read.detachedSessionIds.add(linearSessionId);
+      void read.promise.catch(() => undefined);
+      throw new SessionStoreReadPendingError(read.settlement);
+    }
+    try {
+      return await beforeAbort(read.promise, signal);
+    } catch (error) {
+      if (signalIsAborted(signal)) {
+        read.detachedSessionIds.add(linearSessionId);
+        throw new SessionStoreReadPendingError(read.settlement);
+      }
+      throw error;
+    }
+  }
+
+  private startSnapshotRead(): PendingSessionRead {
+    const generation = this.snapshotGeneration;
+    const pending = {
+      promise: this.readAll(),
+      settlement: Promise.resolve(),
+      detachedSessionIds: new Set<string>(),
+      generation,
+    } satisfies PendingSessionRead;
+    pending.settlement = pending.promise.then(
+      (sessions) => {
+        if (
+          this.pendingRead === pending &&
+          this.snapshotGeneration === pending.generation
+        ) {
+          for (const linearSessionId of pending.detachedSessionIds) {
+            this.recoveredRecords.set(
+              linearSessionId,
+              sessions[linearSessionId] ?? null,
+            );
+          }
+        }
+        if (this.pendingRead === pending) {
+          this.pendingRead = undefined;
+        }
+      },
+      () => {
+        if (this.pendingRead === pending) {
+          this.pendingRead = undefined;
+        }
+      },
+    );
+    this.pendingRead = pending;
+    return pending;
   }
 
   /** Only a missing file reads as an empty store. */
@@ -174,9 +250,13 @@ export class JsonSessionStore {
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted === true) {
+  if (signal !== undefined && signalIsAborted(signal)) {
     throw signal.reason ?? new Error("Session store write aborted");
   }
+}
+
+function signalIsAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
 }
 
 function beforeAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

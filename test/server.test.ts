@@ -208,7 +208,7 @@ async function startTestServer(
     prepareOAuthTokenStore?: (storePath: string) => Promise<void>;
     shutdownRequestTimeoutMs?: number;
     shutdownPersistenceTimeoutMs?: number;
-    sessionWriteHandoffTimeoutMs?: number;
+    sessionPersistenceHandoffTimeoutMs?: number;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
@@ -278,8 +278,11 @@ async function startTestServer(
     ...(options.shutdownPersistenceTimeoutMs !== undefined
       ? { shutdownPersistenceTimeoutMs: options.shutdownPersistenceTimeoutMs }
       : {}),
-    ...(options.sessionWriteHandoffTimeoutMs !== undefined
-      ? { sessionWriteHandoffTimeoutMs: options.sessionWriteHandoffTimeoutMs }
+    ...(options.sessionPersistenceHandoffTimeoutMs !== undefined
+      ? {
+          sessionPersistenceHandoffTimeoutMs:
+            options.sessionPersistenceHandoffTimeoutMs,
+        }
       : {}),
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
@@ -4497,7 +4500,7 @@ describe("startServer", () => {
       activeHarness = await startTestServer(runtime, {
         removeTmpDirOnClose: false,
         configOverrides: { runInactivityTimeoutMs: 20 },
-        sessionWriteHandoffTimeoutMs: 250,
+        sessionPersistenceHandoffTimeoutMs: 250,
       });
       harness = activeHarness;
       const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
@@ -4607,7 +4610,7 @@ describe("startServer", () => {
       activeHarness = await startTestServer(runtime, {
         removeTmpDirOnClose: false,
         configOverrides: { runInactivityTimeoutMs: 20 },
-        sessionWriteHandoffTimeoutMs: 25,
+        sessionPersistenceHandoffTimeoutMs: 25,
         shutdownPersistenceTimeoutMs: 25,
       });
       harness = activeHarness;
@@ -4717,7 +4720,7 @@ describe("startServer", () => {
     }
   });
 
-  it("does not accumulate retries while a session read without pending writes is stalled", async () => {
+  it("reuses one slow session read after the handoff timeout and resumes exactly once", async () => {
     const readStarted = createDeferred<void>();
     const releaseRead = createDeferred<void>();
     const runtime = new FakeRuntime(async function* () {
@@ -4728,10 +4731,18 @@ describe("startServer", () => {
     try {
       activeHarness = await startTestServer(runtime, {
         removeTmpDirOnClose: false,
-        sessionWriteHandoffTimeoutMs: 25,
+        sessionPersistenceHandoffTimeoutMs: 25,
       });
       harness = activeHarness;
       const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const sessionId = "session-slow-session-read";
+      const runtimeSessionId = "runtime-slow-session-read";
+      await new JsonSessionStore(sessionStorePath).put({
+        linearSessionId: sessionId,
+        runtimeSessionId,
+        runtime: "fake",
+        updatedAt: new Date().toISOString(),
+      });
       const originalReadFile = fsPromises.readFile.bind(fsPromises);
       let sessionReads = 0;
       readSpy = vi.spyOn(fsPromises, "readFile").mockImplementation(
@@ -4746,14 +4757,14 @@ describe("startServer", () => {
       );
       const now = Date.now();
       const payload = {
-        webhookId: "webhook-stalled-session-read",
+        webhookId: "webhook-slow-session-read",
         type: "AgentSessionEvent",
         action: "prompted",
-        agentSession: { id: "session-stalled-session-read" },
+        agentSession: { id: sessionId },
         agentActivity: {
-          id: "activity-stalled-session-read",
+          id: "activity-slow-session-read",
           createdAt: new Date(now).toISOString(),
-          content: { type: "prompt", body: "wait for the one session read" },
+          content: { type: "prompt", body: "resume after the one slow read" },
         },
         webhookTimestamp: now,
       };
@@ -4771,26 +4782,153 @@ describe("startServer", () => {
         ).status,
       ).toBe(200);
       await readStarted.promise;
+      const queueReleased = createDeferred<void>();
+      void harness.queue.enqueue(async () => {
+        queueReleased.resolve();
+      });
+      await expect(
+        Promise.race([
+          queueReleased.promise,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("queue release timed out")), 500),
+          ),
+        ]),
+      ).resolves.toBeUndefined();
+      expect(sessionReads).toBe(1);
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt(payload.webhookId),
+      ).resolves.toMatchObject({ recoveryEnvelope: expect.any(Object) });
+
+      releaseRead.resolve();
+      await waitFor(() => runtime.requests.length === 1);
+      expect(runtime.requests[0]).toMatchObject({
+        linearSessionId: sessionId,
+        prompt: "resume after the one slow read",
+        resumeSessionId: runtimeSessionId,
+      });
+      await waitFor(async () =>
+        (await harness!.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(sessionReads).toBe(1);
+    } finally {
+      releaseRead.resolve();
+      readSpy?.mockRestore();
+      await activeHarness?.close().catch(() => undefined);
+      activeHarness = undefined;
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("releases the queue and reports incomplete close while one session read never settles", async () => {
+    const readStarted = createDeferred<void>();
+    const releaseRead = createDeferred<void>();
+    const readFinished = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        sessionPersistenceHandoffTimeoutMs: 25,
+        shutdownPersistenceTimeoutMs: 25,
+      });
+      harness = activeHarness;
+      const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const originalReadFile = fsPromises.readFile.bind(fsPromises);
+      let sessionReads = 0;
+      readSpy = vi.spyOn(fsPromises, "readFile").mockImplementation(
+        async (...args) => {
+          if (String(args[0]) === sessionStorePath) {
+            sessionReads += 1;
+            readStarted.resolve();
+            await releaseRead.promise;
+          }
+          try {
+            return await originalReadFile(...args);
+          } finally {
+            if (String(args[0]) === sessionStorePath) {
+              readFinished.resolve();
+            }
+          }
+        },
+      );
+      const now = Date.now();
+      const payload = {
+        webhookId: "webhook-never-session-read",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-never-session-read" },
+        agentActivity: {
+          id: "activity-never-session-read",
+          createdAt: new Date(now).toISOString(),
+          content: { type: "prompt", body: "keep this read recoverable" },
+        },
+        webhookTimestamp: now,
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await readStarted.promise;
+      const queueReleased = createDeferred<void>();
+      void harness.queue.enqueue(async () => {
+        queueReleased.resolve();
+      });
+      await expect(
+        Promise.race([
+          queueReleased.promise,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("queue release timed out")), 500),
+          ),
+        ]),
+      ).resolves.toBeUndefined();
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(sessionReads).toBe(1);
       expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt(payload.webhookId),
+      ).resolves.toMatchObject({ recoveryEnvelope: expect.any(Object) });
 
-      let closeSettled = false;
-      const closing = harness.close().then(() => {
-        closeSettled = true;
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(closeSettled).toBe(false);
-      releaseRead.resolve();
-      await closing;
+      await expect(
+        Promise.race([
+          harness.close(),
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("close did not settle")), 500),
+          ),
+        ]),
+      ).rejects.toThrow("Session persistence shutdown timed out");
       activeHarness = undefined;
       expect(sessionReads).toBe(1);
       expect(runtime.requests).toHaveLength(0);
       await expect(
         harness.bridgeState.getReceipt(payload.webhookId),
       ).resolves.toMatchObject({ recoveryEnvelope: expect.any(Object) });
+
+      releaseRead.resolve();
+      await readFinished.promise;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(sessionReads).toBe(1);
+      expect(runtime.requests).toHaveLength(0);
     } finally {
       releaseRead.resolve();
+      await activeHarness?.close().catch(() => undefined);
+      activeHarness = undefined;
       readSpy?.mockRestore();
       if (harness !== undefined) {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
@@ -4964,7 +5102,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runInactivityTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 250 },
       linearFetchImpl: (calls) =>
         (async (_url: RequestInfo | URL, init?: RequestInit) => {
           const parsed = JSON.parse(init?.body as string) as {
@@ -5028,7 +5166,7 @@ describe("startServer", () => {
         (call) =>
           call.agentSessionId === "agent-session-activity-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request was inactive for 30 ms and was stopped.",
+          call.content.body === "This request was inactive for 250 ms and was stopped.",
       ),
     );
 
@@ -5061,7 +5199,7 @@ describe("startServer", () => {
     });
 
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runInactivityTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 250 },
       linearFetchImpl: (calls) =>
         (async (_url: RequestInfo | URL, init?: RequestInit) => {
           const parsed = JSON.parse(init?.body as string) as {
@@ -5075,7 +5213,7 @@ describe("startServer", () => {
           });
           if (
             input.content.type === "error" &&
-            input.content.body === "This request was inactive for 30 ms and was stopped."
+            input.content.body === "This request was inactive for 250 ms and was stopped."
           ) {
             return await new Promise<Response>(() => {});
           }
@@ -5114,18 +5252,25 @@ describe("startServer", () => {
           runtime.requests.length === 2 &&
           harness.calls.some(
             (call) =>
+              call.agentSessionId === "agent-session-hard-timeout" &&
+              call.content.type === "error" &&
+              call.content.body ===
+                "This request was inactive for 250 ms and was stopped.",
+          ) &&
+          harness.calls.some(
+            (call) =>
               call.agentSessionId === "agent-session-queued" &&
               call.content.type === "response" &&
               call.content.body === "queued turn completed",
           ),
-        250,
+        2_000,
       );
 
       const timeoutCalls = harness.calls.filter(
         (call) =>
           call.agentSessionId === "agent-session-hard-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request was inactive for 30 ms and was stopped.",
+          call.content.body === "This request was inactive for 250 ms and was stopped.",
       );
       expect(timeoutCalls).toHaveLength(1);
 
@@ -5143,7 +5288,7 @@ describe("startServer", () => {
           (call) =>
             call.agentSessionId === "agent-session-hard-timeout" &&
             call.content.type === "error" &&
-            call.content.body === "This request was inactive for 30 ms and was stopped.",
+            call.content.body === "This request was inactive for 250 ms and was stopped.",
         ),
       ).toHaveLength(1);
     } finally {
@@ -5169,7 +5314,7 @@ describe("startServer", () => {
       },
     };
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runInactivityTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 250 },
     });
     const harness = activeHarness;
 
@@ -5198,7 +5343,7 @@ describe("startServer", () => {
         ).toBe(200);
       }
 
-      await waitFor(() => order.includes("started:agent-session-close-next"), 250);
+      await waitFor(() => order.includes("started:agent-session-close-next"), 2_000);
       expect(order).toEqual([
         "started:agent-session-close-first",
         "closed:agent-session-close-first",
@@ -5227,7 +5372,7 @@ describe("startServer", () => {
     };
     const runtime = new ClaudeRuntime("/tmp/kb-unused", queryFn);
     activeHarness = await startTestServer(runtime, {
-      configOverrides: { runInactivityTimeoutMs: 30 },
+      configOverrides: { runInactivityTimeoutMs: 250 },
     });
     const harness = activeHarness;
 
@@ -5256,7 +5401,7 @@ describe("startServer", () => {
         ).toBe(200);
       }
 
-      await waitFor(() => order.includes("started:claude-close-next"), 250);
+      await waitFor(() => order.includes("started:claude-close-next"), 2_000);
       expect(order).toEqual([
         "started:claude-close-first",
         "closed:claude-close-first",

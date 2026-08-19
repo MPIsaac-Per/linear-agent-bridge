@@ -22,7 +22,11 @@ import type {
   LinearOAuthTokenManager,
   LinearOAuthTokenResponse,
 } from "./linear/oauth.js";
-import type { JsonSessionStore, SessionRecord } from "./sessions/store.js";
+import {
+  SessionStoreReadPendingError,
+  type JsonSessionStore,
+  type SessionRecord,
+} from "./sessions/store.js";
 import type {
   BridgeStateStore,
   IngressEventIdentity,
@@ -98,7 +102,7 @@ const STOPPED_RESPONSE_ACTIVITY: PreIntentActivityDefinition = {
 const ACTIVITY_RECONCILIATION_ATTEMPTS = 4;
 const DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS = 1_000;
 const DEFAULT_PERSISTENCE_SHUTDOWN_TIMEOUT_MS = 1_000;
-const DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS = 1_000;
+const DEFAULT_SESSION_PERSISTENCE_HANDOFF_TIMEOUT_MS = 1_000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 type TerminalTransition =
   | { kind: "completed_without_runtime" }
@@ -112,6 +116,7 @@ interface InternalServerDeps extends ServerDeps {
   processingInFlight: Set<Promise<void>>;
   requestsInFlight: Set<Promise<void>>;
   sessionWritesInFlight: Set<Promise<void>>;
+  sessionReadsInFlight: Set<Promise<void>>;
   closing: boolean;
   recoveryInFlight?: Promise<void> | undefined;
   recoveryRequested: boolean;
@@ -161,7 +166,7 @@ export interface ServerDeps {
   /** Bounded grace period for session renames already in flight at shutdown. */
   shutdownPersistenceTimeoutMs?: number;
   /** Bounded queue handoff and session lookup wait after runtime cancellation. */
-  sessionWriteHandoffTimeoutMs?: number;
+  sessionPersistenceHandoffTimeoutMs?: number;
 }
 
 class OAuthStateStore {
@@ -190,7 +195,7 @@ class OAuthStateStore {
 }
 
 class SessionPersistenceHandoffError extends Error {
-  constructor() {
+  constructor(readonly settlement?: Promise<void>) {
     super("Session persistence handoff timed out");
     this.name = "SessionPersistenceHandoffError";
   }
@@ -243,6 +248,7 @@ export function startServer(deps: ServerDeps): {
     processingInFlight: new Set<Promise<void>>(),
     requestsInFlight: new Set<Promise<void>>(),
     sessionWritesInFlight: new Set<Promise<void>>(),
+    sessionReadsInFlight: new Set<Promise<void>>(),
     closing: false,
     recoveryRequested: false,
     recoveryBlocked: false,
@@ -431,7 +437,10 @@ export function startServer(deps: ServerDeps): {
         await listenerShutdown;
         await Promise.allSettled([...internalDeps.processingInFlight]);
         const sessionWritesDrained = await settlePromisesWithin(
-          [...internalDeps.sessionWritesInFlight],
+          [
+            ...internalDeps.sessionWritesInFlight,
+            ...internalDeps.sessionReadsInFlight,
+          ],
           deps.shutdownPersistenceTimeoutMs ??
             DEFAULT_PERSISTENCE_SHUTDOWN_TIMEOUT_MS,
         );
@@ -814,7 +823,6 @@ async function processClaimedEvent(
       return "settled";
     }
     if (error instanceof PreRuntimeClaimReleasedError) {
-      void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
       return "retryable";
     }
     console.error(
@@ -1309,10 +1317,13 @@ async function releasePreIntentForRecovery(
   if (released || !deps.closing) {
     if (
       cause instanceof SessionPersistenceHandoffError &&
-      deps.sessionWritesInFlight.size > 0
+      (cause.settlement !== undefined || deps.sessionWritesInFlight.size > 0)
     ) {
-      const pendingWrites = [...deps.sessionWritesInFlight];
-      void Promise.allSettled(pendingWrites).then(() => {
+      const pendingPersistence = [
+        ...deps.sessionWritesInFlight,
+        ...(cause.settlement === undefined ? [] : [cause.settlement]),
+      ];
+      void Promise.allSettled(pendingPersistence).then(() => {
         if (!deps.closing) {
           void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
         }
@@ -1578,8 +1589,8 @@ async function runSessionTask(
   controller?.signal.removeEventListener("abort", onControllerAbort);
   await settlePromisesWithin(
     [...deps.sessionWritesInFlight],
-    deps.sessionWriteHandoffTimeoutMs ??
-      DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS,
+    deps.sessionPersistenceHandoffTimeoutMs ??
+      DEFAULT_SESSION_PERSISTENCE_HANDOFF_TIMEOUT_MS,
   );
 
   if (
@@ -1649,19 +1660,32 @@ async function getStoredSessionForQueuedTurn(
       timeoutController.abort(
         new SessionPersistenceHandoffError(),
       ),
-    deps.sessionWriteHandoffTimeoutMs ??
-      DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS,
+    deps.sessionPersistenceHandoffTimeoutMs ??
+      DEFAULT_SESSION_PERSISTENCE_HANDOFF_TIMEOUT_MS,
   );
   timeout.unref?.();
   try {
-    return await deps.store.get(
-      linearSessionId,
-      AbortSignal.any([
-        runSignal,
-        deps.shutdownController.signal,
-        timeoutController.signal,
-      ]),
-    );
+    try {
+      return await deps.store.get(
+        linearSessionId,
+        AbortSignal.any([
+          runSignal,
+          deps.shutdownController.signal,
+          timeoutController.signal,
+        ]),
+      );
+    } catch (error) {
+      if (error instanceof SessionStoreReadPendingError) {
+        const settlement = error.settlement;
+        deps.sessionReadsInFlight.add(settlement);
+        const forgetRead = (): void => {
+          deps.sessionReadsInFlight.delete(settlement);
+        };
+        void settlement.then(forgetRead, forgetRead);
+        throw new SessionPersistenceHandoffError(settlement);
+      }
+      throw error;
+    }
   } finally {
     clearTimeout(timeout);
   }
