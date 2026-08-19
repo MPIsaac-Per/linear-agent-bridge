@@ -34,6 +34,14 @@ const TEST_UID = process.getuid?.() ?? 501;
 const CURRENT_PROCESS_IDENTITY = `linux-boot:${BOOT_A}:proc-start:100`;
 const RECOVERY_KEY_A = "A".repeat(43);
 const RECOVERY_KEY_B = Buffer.alloc(32, 1).toString("base64url");
+// Reclaim-path tests assert what reclamation does, never how fast. The path
+// itself is slow and variable: readdir, read, identity lookups that can spawn a
+// process, rmdir, and directory syncs. A tight budget makes the runner's speed
+// the subject, which is how these went intermittently red on CI while passing
+// on an unloaded machine. None of the tests using this assert a timing
+// relationship, so the budget is incidental and is sized to stay out of the way.
+const RECLAIM_TEST_TIMEOUT_MS = 5_000;
+
 const TEST_LOCK_OPTIONS = {
   lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
   lockBootIdentity: async () => BOOT_A,
@@ -470,7 +478,7 @@ describe("JsonBridgeStateStore", () => {
     let bootLookups = 0;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-reboot",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
       lockProcessIdentity: async () =>
         `linux-boot:${BOOT_B}:proc-start:300`,
       lockBootIdentity: async () => {
@@ -1144,7 +1152,7 @@ describe("JsonBridgeStateStore", () => {
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-reboot",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
       lockProcessIdentity,
       lockBootIdentity,
       lockProcessUid,
@@ -1178,7 +1186,7 @@ describe("JsonBridgeStateStore", () => {
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-different-user",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
       lockProcessIdentity,
       lockBootIdentity: async () => BOOT_A,
       lockProcessUid: async (pid) => {
@@ -1258,7 +1266,7 @@ describe("JsonBridgeStateStore", () => {
       CURRENT_PROCESS_IDENTITY;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-recycle",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
       lockProcessIdentity,
       lockBootIdentity: async () => BOOT_A,
       lockProcessUid: async () => TEST_UID,
@@ -1286,7 +1294,7 @@ describe("JsonBridgeStateStore", () => {
     };
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-exit",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
       lockProcessIdentity,
     });
 
@@ -1385,7 +1393,7 @@ describe("JsonBridgeStateStore", () => {
 
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-after-crash",
-      lockTimeoutMs: 250,
+      lockTimeoutMs: RECLAIM_TEST_TIMEOUT_MS,
     });
     await expect(store.claimEvent(event())).resolves.toMatchObject({
       disposition: "claimed",
