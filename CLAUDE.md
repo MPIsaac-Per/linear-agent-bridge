@@ -69,6 +69,18 @@ refreshes it after an authenticated request returns 401.
   fields sit at the payload top level; prompted ordering uses the required
   `agentActivity.createdAt`; the HMAC covers the raw body and `webhookTimestamp`
   rides inside the JSON.
+- **Per-delivery identity is the `Linear-Delivery` header, never `webhookId`.**
+  Linear defines `webhookId` as "ID uniquely identifying this webhook", the
+  configuration, so it repeats on every delivery that webhook sends. The header
+  is "a UUID (v4) that uniquely identifies this payload". Keying a durable
+  receipt on `webhookId` lets the first delivery take the slot and rejects every
+  later one as a conflicting replay, which is exactly what happened once ingress
+  started working on 2026-08-19. Verified against live deliveries the same day.
+- The comment that opens an AgentSession never becomes an activity on it. Its
+  text arrives only in the `created` webhook payload, and a session whose
+  `created` webhook was lost reports zero activities indefinitely. Reconciliation
+  can therefore detect a lost opening but can never replay it; there is nothing
+  to read. Do not design recovery that assumes otherwise.
 
 ## Gates (every commit)
 
