@@ -79,15 +79,15 @@ if [ ! -f .env ] || [ -L .env ]; then
 	echo "Missing or unsafe .env; copy .env.example to a regular file and fill it in (see README)" >&2
 	exit 1
 fi
-ENV_OWNER=$(stat -f '%u' .env 2>/dev/null || stat -c '%u' .env 2>/dev/null || true)
+ENV_OWNER=$(stat -c '%u' .env 2>/dev/null || stat -f '%u' .env 2>/dev/null || true)
 if [ "$ENV_OWNER" != "$(id -u)" ]; then
 	echo ".env must be owned by the user installing the service" >&2
 	exit 1
 fi
-ENV_MODE=$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env 2>/dev/null || true)
+ENV_MODE=$(stat -c '%a' .env 2>/dev/null || stat -f '%Lp' .env 2>/dev/null || true)
 if [ "$ENV_MODE" != "600" ]; then
 	chmod 600 .env
-	ENV_MODE=$(stat -f '%Lp' .env 2>/dev/null || stat -c '%a' .env 2>/dev/null || true)
+	ENV_MODE=$(stat -c '%a' .env 2>/dev/null || stat -f '%Lp' .env 2>/dev/null || true)
 	if [ "$ENV_MODE" != "600" ]; then
 		echo "Could not set .env permissions to 0600" >&2
 		exit 1
