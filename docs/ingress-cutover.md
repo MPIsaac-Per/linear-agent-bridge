@@ -118,6 +118,18 @@ only adopts a watermark, so historical prompts are never replayed as new turns.
 prompt produces the bounded `stalled_agent_session` warning. That warning is
 rate-limited to once per session every 15 minutes.
 
+## Reverify anything checked before 2026-08-19
+
+A pass from a host inside the tailnet used to mean nothing. The verifier
+resolved the hostname with the system resolver, so on any tailnet-joined
+machine every probe travelled the overlay path: the node answered with a valid
+certificate and correct status codes while public ingress was down. The natural
+place to run it is the machine you just installed on, which is exactly the
+machine that could not test the public path.
+
+If you relied on a verification recorded before this change, run it again. It
+did not prove what it appeared to prove.
+
 ## Signed public verification
 
 Run the verifier only with the canonical, credential-free HTTPS URL ending in

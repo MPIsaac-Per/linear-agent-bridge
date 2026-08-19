@@ -265,6 +265,23 @@ Set `WEBHOOK_URL` to the printed credential-free HTTPS URL, keep
 then requires the same correctly signed non-AgentSession request to return 200.
 It does not print the secret, signature, or body.
 
+Every probe is forced onto an address returned by a public resolver rather than
+the system one, and the report names the address each probe used. This matters
+on any machine joined to the same overlay network as the service, which is
+usually the machine you just installed on. There, the system resolver returns
+the node's private address, the node terminates TLS locally with a valid
+certificate, and all three probes pass while public ingress is down. Set
+`VERIFY_INGRESS_RESOLVERS` to override the resolvers, comma-separated; the
+default is `1.1.1.1,8.8.8.8`, two of them so one provider outage does not read
+as a broken ingress. When the system and public answers differ, the split is
+reported first, because that difference is the whole problem. When no
+configured resolver answers, the verifier exits nonzero and says the public
+path was not tested rather than quietly falling back and reporting success.
+
+A second host on a different network is a stronger check still, since it
+exercises the path a real client takes end to end. That is worth doing by hand
+where you have one; it is deliberately not built into the script.
+
 The HTTP server binds only to `127.0.0.1`. `deploy/tcp_forward.py` is retained
 only as a bounded, loopback-bound diagnostic for a private last hop. On a
 separate ingress host, first establish an SSH local tunnel to the bridge host's
