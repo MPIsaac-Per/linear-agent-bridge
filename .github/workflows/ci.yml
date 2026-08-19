@@ -28,10 +28,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check deployment syntax
+        run: |
+          bash -n deploy/install.sh deploy/run.sh deploy/verify-ingress.sh
+          node --check deploy/parse-funnel-status.mjs
+          python3 -m py_compile deploy/tcp_forward.py test/test_tcp_forward.py
+
+      - name: Test diagnostic forwarder
+        run: python3 -m unittest discover -s test -p 'test_tcp_forward.py'
+
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test
+      - name: MPI-1448 lost-prompt/later-stop regression
+        run: npm test -- --run test/server.test.ts -t 'MPI-1448:'
+
+      - name: Test complete suite
         run: npm test
 
       - name: Test macOS installer transaction

@@ -68,8 +68,8 @@ while a differing result is forwarded.
 - On macOS, Xcode Command Line Tools (`xcode-select --install`). The build uses
   the supported libproc API to compile a small local process-identity helper.
 - A Linear workspace where you can create OAuth applications.
-- A public HTTPS route to the service (tailscale funnel, cloudflared, or
-  any reverse proxy).
+- A public HTTPS route to the loopback-bound service. The supported macOS
+  topology uses Tailscale Funnel directly on the bridge host.
 
 ## Setup
 
@@ -236,18 +236,37 @@ reviewing the deduplication and activity IDs it contains.
 ### 4. Expose the webhook
 
 On macOS, `./deploy/install.sh` builds the service, installs a launchd
-user agent (so the SDK sees your Claude Code credentials), opens a
-tailscale funnel, and prints the webhook URL to paste into the app config.
-It validates the complete application configuration before stopping an
-existing service. Health is polled for up to ten seconds after restart. A
-failed health check exits nonzero and restores the prior build and launchd
-files; the message reports whether the restored service answered its health
-probe. Secrets are loaded from `.env`, not passed in command arguments.
+user agent (so the SDK sees your Claude Code credentials), verifies
+`http://127.0.0.1:<PORT>/healthz`, opens a Tailscale Funnel directly to that
+loopback listener, verifies the exact route in Funnel status JSON, and prints
+the canonical webhook URL to paste into the app config. It validates the
+complete application configuration before stopping an existing service. Health
+is polled for up to ten seconds after restart. A failed health check exits
+nonzero and restores the prior build and launchd files; the message reports
+whether the restored service answered its health probe. Before mutation it
+accepts only an empty public Funnel state or the single existing exact target;
+unrelated or ambiguous public routes are left untouched. It fails closed if
+local health, Funnel setup, or route discovery fails. `SKIP_FUNNEL=1` is an
+explicit local-only installation mode. It completes the build, launchd setup,
+and loopback health check without discovering, inspecting, or changing
+Tailscale state. Secrets are loaded from `.env`, not passed in command
+arguments.
 
-Any other HTTPS ingress works; the service only needs POST /webhook
-reachable. If your TLS terminator runs on a different host,
-`deploy/tcp_forward.py` is a dependency-free TCP forwarder to bridge the
-last hop over a private network.
+Set `WEBHOOK_URL` to the printed credential-free HTTPS URL, keep
+`LINEAR_WEBHOOK_SECRET` in the environment, and run
+`./deploy/verify-ingress.sh` before changing Linear. The verifier probes public
+`GET /healthz`, requires an unsigned harmless `POST /webhook` to return 401,
+then requires the same correctly signed non-AgentSession request to return 200.
+It does not print the secret, signature, or body.
+
+The HTTP server binds only to `127.0.0.1`. `deploy/tcp_forward.py` is retained
+only as a bounded, loopback-bound diagnostic for a private last hop. On a
+separate ingress host, first establish an SSH local tunnel to the bridge host's
+`127.0.0.1:<PORT>` listener, then point the forwarder at that local tunnel
+endpoint. The forwarder rejects a bridge private address as its upstream. It
+is not a supported production ingress. See
+[the ingress cutover runbook](docs/ingress-cutover.md) for ownership fields,
+tracing, failure diagnosis, the live checklist, and rollback.
 
 ### 5. Talk to it
 
@@ -331,7 +350,7 @@ session takes.
 
 ## Security notes
 
-The webhook endpoint verifies signatures, rejects stale timestamps, and does
+The loopback-only webhook endpoint verifies signatures, rejects stale timestamps, and does
 not return 200 for a valid agent event unless its receipt and claim are durable.
 Marker-free accepted turns retain encrypted prompt material until the dispatch
 marker is durable. Bounded action, identity, sequence, timestamp, `keyId`, and

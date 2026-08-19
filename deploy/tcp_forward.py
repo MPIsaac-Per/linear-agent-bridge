@@ -1,43 +1,101 @@
 #!/usr/bin/env python3
-"""Tiny TCP forwarder: listen on 127.0.0.1:LISTEN_PORT, pipe to HOST:PORT.
+"""Diagnostic-only TCP forwarder bound to 127.0.0.1.
 
-Useful when the bridge host can't terminate public TLS itself (for
-example, a brand-new `tailscale funnel` that can't mint a certificate):
-run this on any box that already has a working public HTTPS ingress and
-point it at the bridge over your private network:
-ingress :8443 -> 127.0.0.1:8899 -> (private net) -> bridge host :3979.
+Use temporarily on a separate HTTPS-ingress host after establishing a local
+SSH tunnel to the bridge host's loopback-only listener:
 
-Usage: tcp_forward.py <listen_port> <target_host> <target_port>
+ssh -N -T -o ExitOnForwardFailure=yes \\
+    -L 127.0.0.1:9900:127.0.0.1:3979 bridge-host
+tcp_forward.py 8899 127.0.0.1 9900
+
+The diagnostic path is ingress -> 127.0.0.1:8899 -> tcp_forward.py ->
+127.0.0.1:9900 -> SSH tunnel -> bridge 127.0.0.1:3979. Never target the
+bridge's private address because the bridge does not listen on that interface.
+
+Usage: tcp_forward.py <listen_port> 127.0.0.1 <local_tunnel_port>
 """
 import asyncio
+import secrets
 import sys
 
+CONNECT_TIMEOUT_SECONDS = 10
+IDLE_TIMEOUT_SECONDS = 300
 
-async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+
+def lifecycle(connection_id: str, event: str, detail: str = "") -> None:
+    suffix = f" {detail}" if detail else ""
+    print(f"connection={connection_id} event={event}{suffix}", flush=True)
+
+
+async def pipe(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    direction: str,
+) -> str:
     try:
         while True:
-            data = await reader.read(65536)
+            data = await asyncio.wait_for(
+                reader.read(65536), timeout=IDLE_TIMEOUT_SECONDS
+            )
             if not data:
-                break
+                return f"{direction}_eof"
             writer.write(data)
             await writer.drain()
+    except asyncio.TimeoutError:
+        return f"{direction}_idle_timeout"
     except (ConnectionResetError, BrokenPipeError):
+        return f"{direction}_reset"
+
+
+async def close_writer(writer: asyncio.StreamWriter) -> None:
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
         pass
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
 
 
 async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter) -> None:
+    connection_id = secrets.token_hex(8)
+    lifecycle(connection_id, "start")
     try:
-        remote_r, remote_w = await asyncio.open_connection(TARGET_HOST, TARGET_PORT)
-    except OSError:
-        client_w.close()
+        remote_r, remote_w = await asyncio.wait_for(
+            asyncio.open_connection(TARGET_HOST, TARGET_PORT),
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, OSError) as error:
+        lifecycle(connection_id, "upstream_failure", f"error={type(error).__name__}")
+        await close_writer(client_w)
+        lifecycle(connection_id, "close", "reason=upstream_failure")
         return
-    await asyncio.gather(pipe(client_r, remote_w), pipe(remote_r, client_w))
+    lifecycle(connection_id, "upstream_connected")
+
+    client_to_upstream = asyncio.create_task(
+        pipe(client_r, remote_w, "client")
+    )
+    upstream_to_client = asyncio.create_task(
+        pipe(remote_r, client_w, "upstream")
+    )
+    tasks = {client_to_upstream, upstream_to_client}
+    reason = "pipe_failure"
+    try:
+        done, _pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        reason = next(iter(done)).result()
+    except asyncio.CancelledError:
+        reason = "cancelled"
+        raise
+    except Exception as error:
+        lifecycle(connection_id, "pipe_failure", f"error={type(error).__name__}")
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await close_writer(remote_w)
+        await close_writer(client_w)
+        lifecycle(connection_id, "close", f"reason={reason}")
 
 
 async def main() -> None:
@@ -47,6 +105,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[2] != "127.0.0.1":
+        print(
+            "tcp_forward.py requires a local tunnel endpoint at 127.0.0.1",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     LISTEN_PORT = int(sys.argv[1])
     TARGET_HOST = sys.argv[2]
     TARGET_PORT = int(sys.argv[3])

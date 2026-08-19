@@ -57,7 +57,7 @@ function sign(body: string, secret: string): string {
 }
 
 function serverUrl(port: number, pathName: string): string {
-  return `http://[::1]:${port}${pathName}`;
+  return `http://127.0.0.1:${port}${pathName}`;
 }
 
 function createDeferred<T>(): {
@@ -182,6 +182,7 @@ async function waitFor(
 interface Harness {
   port: number;
   ready: Promise<void>;
+  host: string;
   close: () => Promise<void>;
   tmpDir: string;
   calls: LinearCall[];
@@ -287,8 +288,8 @@ async function startTestServer(
     options.tokenFetchImpl ?? (async () => jsonResponse({ access_token: "unused" })),
   );
 
-  let resolveListening!: (port: number) => void;
-  const listening = new Promise<number>((resolve) => {
+  let resolveListening!: (address: { port: number; host: string }) => void;
+  const listening = new Promise<{ port: number; host: string }>((resolve) => {
     resolveListening = resolve;
   });
   let resolveAuthorizationUrl!: (url: string) => void;
@@ -318,7 +319,7 @@ async function startTestServer(
     bridgeState,
     queue,
     tokenFetch: tokenFetch as unknown as FetchFn,
-    onListening: resolveListening,
+    onListening: (port, host) => resolveListening({ port, host }),
     onOAuthAuthorizationUrl: resolveAuthorizationUrl,
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
@@ -339,11 +340,12 @@ async function startTestServer(
     }
     throw error;
   }
-  const port = await listening;
+  const { port, host } = await listening;
 
   return {
     port,
     ready: server.ready,
+    host,
     close: async () => {
       await server.close();
       // Drain session finalizers before removing the temp dir, or the store's
@@ -398,7 +400,7 @@ describe("startServer", () => {
     const occupied = createHttpServer();
     await new Promise<void>((resolve, reject) => {
       occupied.once("error", reject);
-      occupied.listen(0, resolve);
+      occupied.listen(0, "127.0.0.1", resolve);
     });
     const address = occupied.address();
     if (address === null || typeof address === "string") {
@@ -418,6 +420,57 @@ describe("startServer", () => {
         occupied.close((error) => (error === undefined ? resolve() : reject(error)));
       });
     }
+  });
+
+  it("binds the HTTP listener explicitly to IPv4 loopback", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+
+    expect(activeHarness.host).toBe("127.0.0.1");
+    const ipv4Response = await fetch(serverUrl(activeHarness.port, "/healthz"), {
+      headers: { connection: "close" },
+    });
+    expect(ipv4Response.status).toBe(200);
+    await ipv4Response.text();
+  });
+
+  it("rejects the verifier authentication control before accepting its signed harmless event", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const body = JSON.stringify({
+      type: "IngressVerificationEvent",
+      action: "verify",
+      webhookTimestamp: Date.now(),
+    });
+    const webhookUrl = serverUrl(harness.port, "/webhook");
+
+    const authenticationControl = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", connection: "close" },
+      body,
+    });
+    expect(authenticationControl.status).toBe(401);
+    await authenticationControl.text();
+
+    const signedProbe = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(body, WEBHOOK_SECRET),
+        connection: "close",
+      },
+      body,
+    });
+    expect(signedProbe.status).toBe(200);
+    await signedProbe.text();
+
+    expect(harness.calls).toEqual([]);
+    expect(runtime.lastRequest).toBeUndefined();
   });
 
   it("signed created event: acks 200, emits the liveness thought, forwards runtime activities in order, persists the session mapping", async () => {

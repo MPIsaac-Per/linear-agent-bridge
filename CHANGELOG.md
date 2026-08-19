@@ -9,6 +9,12 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ### Added
 
+- Add a deterministic signed public-ingress verifier, strict Funnel status
+  route parsing, deployment seam tests, and an operator cutover/rollback
+  runbook for the direct loopback-to-Funnel topology.
+- Add bounded lifecycle tracing, connection and idle timeouts, and half-close
+  cancellation to the diagnostic-only TCP forwarder.
+
 - Reconcile Linear AgentSession activities at startup and every minute so
   missed prompt and stop webhooks recover across process restarts. Scans cover
   every locally known session plus up to 250 recent sessions owned by the
@@ -46,6 +52,14 @@ Changes awaiting a tagged release remain under Unreleased.
   outstanding envelopes from earlier deployments.
 
 ### Changed
+
+- Bind the bridge HTTP listener explicitly to `127.0.0.1`. The macOS installer
+  now fails on local health or ingress setup errors, targets Funnel directly at
+  the loopback listener, and reports only the exact matching public webhook
+  route.
+- Extend CI with deployment syntax checks, diagnostic forwarder tests, and an
+  explicit MPI-1448 lost-prompt/later-stop regression gate before the complete
+  npm suite.
 
 - Rename the project from `linear-claude-bridge` to `linear-agent-bridge` to
   reflect its runtime-agnostic architecture. The macOS installer removes the
