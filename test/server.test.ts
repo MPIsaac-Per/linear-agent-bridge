@@ -1,10 +1,15 @@
 import { createHmac } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { promises as fsPromises } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startServer, type ServerDeps } from "../src/server.js";
+import {
+  awaitReadyOrShutdown,
+  installGracefulShutdown,
+} from "../src/shutdown.js";
 import type { Config } from "../src/config.js";
 import { LinearAgentClient, type FetchFn } from "../src/linear/client.js";
 import { LinearOAuthTokenManager } from "../src/linear/oauth.js";
@@ -177,6 +182,7 @@ interface Harness {
   queue: SerialQueue;
   activityIds: string[];
   tokenFetch: ReturnType<typeof vi.fn>;
+  oauth: LinearOAuthTokenManager;
   oauthTokenStorePath: string;
   authorizationUrl: Promise<string>;
 }
@@ -200,6 +206,7 @@ async function startTestServer(
     afterStart?: (server: ReturnType<typeof startServer>) => Promise<void>;
     linearUsesOAuth?: boolean;
     prepareOAuthTokenStore?: (storePath: string) => Promise<void>;
+    shutdownRequestTimeoutMs?: number;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
@@ -263,6 +270,9 @@ async function startTestServer(
     tokenFetch: tokenFetch as unknown as FetchFn,
     onListening: resolveListening,
     onOAuthAuthorizationUrl: resolveAuthorizationUrl,
+    ...(options.shutdownRequestTimeoutMs !== undefined
+      ? { shutdownRequestTimeoutMs: options.shutdownRequestTimeoutMs }
+      : {}),
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
       : {}),
@@ -303,6 +313,7 @@ async function startTestServer(
     queue,
     activityIds,
     tokenFetch,
+    oauth,
     oauthTokenStorePath,
     authorizationUrl,
   };
@@ -1066,7 +1077,7 @@ describe("startServer", () => {
     expect(runtime.requests).toHaveLength(0);
   });
 
-  it("closes promptly when startup recovery is stalled acquiring a refreshed OAuth token", async () => {
+  it("waits for an in-flight OAuth refresh to persist before close completes", async () => {
     const refreshStarted = createDeferred<void>();
     const finishRefresh = createDeferred<Response>();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1126,18 +1137,34 @@ describe("startServer", () => {
       harness = activeHarness;
       await refreshStarted.promise;
 
-      const startedAt = Date.now();
-      await harness.close();
-      activeHarness = undefined;
-      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      let closeSettled = false;
+      const closing = harness.close().then(() => {
+        closeSettled = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeSettled).toBe(false);
       expect(runtime.requests).toHaveLength(0);
       expect(activityAttempts).toBe(1);
+
+      finishRefresh.resolve(
+        jsonResponse({
+          access_token: "fresh-access-token",
+          refresh_token: "fresh-refresh-token",
+          expires_in: 86_400,
+        }),
+      );
+      await closing;
+      activeHarness = undefined;
+      expect(closeSettled).toBe(true);
+      expect(await fsPromises.readFile(harness.oauthTokenStorePath, "utf8")).toContain(
+        "fresh-refresh-token",
+      );
+      expect(activityAttempts).toBe(1);
+      expect(runtime.requests).toHaveLength(0);
       const receiptAfterClose = await harness.bridgeState.getReceipt(
         "webhook-stalled-recovery-oauth",
       );
-      expect(receiptAfterClose).toMatchObject({
-        status: "claimed",
-      });
+      expect(receiptAfterClose).toMatchObject({ status: "claimed" });
       expect(receiptAfterClose).not.toHaveProperty("dispatchStartedAt");
       expect(receiptAfterClose).not.toHaveProperty("completedAt");
       expect(receiptAfterClose).not.toHaveProperty("failedAt");
@@ -1149,27 +1176,128 @@ describe("startServer", () => {
           call.join(" ").includes("recovery processing failed"),
         ),
       ).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
 
-      finishRefresh.resolve(
-        jsonResponse({
-          access_token: "fresh-access-token",
-          refresh_token: "fresh-refresh-token",
-          expires_in: 86_400,
-        }),
+  it("flushes a pending rotated OAuth pair before graceful close completes", async () => {
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        tokenFetchImpl: (async () =>
+          jsonResponse({
+            access_token: "rotated-close-access",
+            refresh_token: "rotated-close-refresh",
+            expires_in: 86_400,
+          })) as FetchFn,
+      });
+      harness = activeHarness;
+      await harness.oauth.install({
+        access_token: "initial-close-access",
+        refresh_token: "initial-close-refresh",
+        expires_in: 86_400,
+      });
+      (
+        harness.oauth as unknown as {
+          persistenceRetryDelayMs: number;
+        }
+      ).persistenceRetryDelayMs = 60_000;
+      const persistenceFailure = new Error("synthetic close token persistence failure");
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      vi.spyOn(fsPromises, "rename")
+        .mockRejectedValueOnce(persistenceFailure)
+        .mockImplementation(originalRename);
+      await expect(
+        harness.oauth.refreshAfterUnauthorized("initial-close-access"),
+      ).rejects.toBe(persistenceFailure);
+
+      await harness.close();
+      activeHarness = undefined;
+      const restarted = new LinearOAuthTokenManager({
+        clientId: "client-id-test",
+        clientSecret: "client-secret-test",
+        initialAccessToken: "unused",
+        storePath: harness.oauthTokenStorePath,
+      });
+      await expect(restarted.getAccessToken()).resolves.toBe(
+        "rotated-close-access",
       );
-      await waitFor(async () =>
-        (await fsPromises.readFile(harness!.oauthTokenStorePath, "utf8")).includes(
-          "fresh-refresh-token",
+    } finally {
+      vi.restoreAllMocks();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("exits after bounded signal shutdown when an OAuth refresh never settles", async () => {
+    const refreshStarted = createDeferred<void>();
+    const neverRefreshes = new Promise<Response>(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        tokenFetchImpl: (async () => {
+          refreshStarted.resolve();
+          return await neverRefreshes;
+        }) as FetchFn,
+      });
+      harness = activeHarness;
+      await harness.oauth.install({
+        access_token: "initial-never-settles-access",
+        refresh_token: "initial-never-settles-refresh",
+        expires_in: 86_400,
+      });
+      void harness.oauth
+        .refreshAfterUnauthorized("initial-never-settles-access")
+        .catch(() => undefined);
+      await refreshStarted.promise;
+      const originalFlush = harness.oauth.flushPendingPersistence.bind(
+        harness.oauth,
+      );
+      vi.spyOn(harness.oauth, "flushPendingPersistence").mockImplementation(
+        async () => originalFlush(25),
+      );
+      const signals = new EventEmitter();
+      const exitObserved = createDeferred<number>();
+      const closeSpy = vi.fn(harness.close);
+      installGracefulShutdown(
+        { close: closeSpy },
+        {
+          signalSource: signals,
+          exit: (code) => exitObserved.resolve(code),
+        },
+      );
+
+      signals.emit("SIGTERM");
+      signals.emit("SIGTERM");
+      await expect(
+        Promise.race([
+          exitObserved.promise,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("signal exit timed out")), 500),
+          ),
+        ]),
+      ).resolves.toBe(1);
+      activeHarness = undefined;
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(
+        errorSpy.mock.calls.some((call) =>
+          call.join(" ").includes("OAuth token flush failed"),
         ),
-      );
-      expect(activityAttempts).toBe(1);
-      expect(runtime.requests).toHaveLength(0);
-      const receiptAfterRefresh = await harness.bridgeState.getReceipt(
-        "webhook-stalled-recovery-oauth",
-      );
-      expect(receiptAfterRefresh).toMatchObject({ status: "claimed" });
-      expect(receiptAfterRefresh).not.toHaveProperty("completedAt");
-      expect(receiptAfterRefresh).not.toHaveProperty("failedAt");
+      ).toBe(true);
     } finally {
       errorSpy.mockRestore();
       if (harness !== undefined) {
@@ -1396,6 +1524,85 @@ describe("startServer", () => {
     } finally {
       releaseMarker.resolve();
       errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("rolls back a persisted runtime intent when SIGTERM starts graceful shutdown", async () => {
+    const markerEntered = createDeferred<void>();
+    const releaseMarker = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+      });
+      harness = activeHarness;
+      const originalMark = harness.bridgeState.markDispatchStarted.bind(
+        harness.bridgeState,
+      );
+      vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
+        async (webhookId) => {
+          const result = await originalMark(webhookId);
+          markerEntered.resolve();
+          await releaseMarker.promise;
+          return result;
+        },
+      );
+      const signals = new EventEmitter();
+      const exitCodes: number[] = [];
+      const closeSpy = vi.fn(harness.close);
+      const lifecycle = installGracefulShutdown(
+        { close: closeSpy },
+        { signalSource: signals, exit: (code) => exitCodes.push(code) },
+      );
+      const payload = {
+        webhookId: "webhook-sigterm-runtime-intent",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-sigterm-runtime-intent" },
+        promptContext: "SIGTERM must roll back before runtime",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await markerEntered.promise;
+
+      signals.emit("SIGTERM");
+      signals.emit("SIGTERM");
+      const closing = lifecycle.shutdown();
+      expect(lifecycle.shutdown()).toBe(closing);
+      releaseMarker.resolve();
+      await closing;
+      activeHarness = undefined;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(exitCodes).toEqual([0]);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(runtime.requests).toHaveLength(0);
+      const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
+      expect(receipt).toMatchObject({
+        status: "claimed",
+        recoveryEnvelope: expect.any(Object),
+      });
+      expect(receipt).not.toHaveProperty("dispatchStartedAt");
+      lifecycle.dispose();
+    } finally {
+      releaseMarker.resolve();
       if (harness !== undefined) {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
       }
@@ -1785,6 +1992,98 @@ describe("startServer", () => {
       ).toBe(false);
     } finally {
       openSpy?.mockRestore();
+      errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("handles startup-attempt rejection when close aborts OAuth backoff", async () => {
+    const oauthFailureObserved = createDeferred<void>();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    const hasRefreshTokenSpy = vi
+      .spyOn(LinearOAuthTokenManager.prototype, "hasRefreshToken")
+      .mockImplementationOnce(async () => {
+        oauthFailureObserved.resolve();
+        throw new Error("synthetic startup OAuth failure");
+      })
+      .mockResolvedValue(false);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        awaitReady: false,
+        removeTmpDirOnClose: false,
+      });
+      harness = activeHarness;
+      await oauthFailureObserved.promise;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      await harness.close();
+      activeHarness = undefined;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      hasRefreshTokenSpy.mockRestore();
+      errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("awaits graceful shutdown when SIGTERM arrives before readiness", async () => {
+    const oauthFailureObserved = createDeferred<void>();
+    const hasRefreshTokenSpy = vi
+      .spyOn(LinearOAuthTokenManager.prototype, "hasRefreshToken")
+      .mockImplementationOnce(async () => {
+        oauthFailureObserved.resolve();
+        throw new Error("synthetic pre-ready OAuth failure");
+      })
+      .mockResolvedValue(false);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        awaitReady: false,
+        removeTmpDirOnClose: false,
+      });
+      harness = activeHarness;
+      await oauthFailureObserved.promise;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const signals = new EventEmitter();
+      const exitCodes: number[] = [];
+      const closeSpy = vi.fn(harness.close);
+      const lifecycle = installGracefulShutdown(
+        { close: closeSpy },
+        {
+          signalSource: signals,
+          exit: (code) => exitCodes.push(code),
+        },
+      );
+      const readiness = awaitReadyOrShutdown(harness.ready, lifecycle);
+
+      signals.emit("SIGTERM");
+      signals.emit("SIGINT");
+      await expect(readiness).resolves.toBe(false);
+      activeHarness = undefined;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(exitCodes).toEqual([0]);
+    } finally {
+      hasRefreshTokenSpy.mockRestore();
       errorSpy.mockRestore();
       if (harness !== undefined) {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
@@ -4454,6 +4753,215 @@ describe("startServer", () => {
       });
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it("drains an accepted OAuth callback before the final shutdown token flush", async () => {
+    const callbackStarted = createDeferred<void>();
+    const finishTokenExchange = createDeferred<Response>();
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        tokenFetchImpl: (async () => {
+          callbackStarted.resolve();
+          return await finishTokenExchange.promise;
+        }) as FetchFn,
+      });
+      harness = activeHarness;
+      const state = new URL(await harness.authorizationUrl).searchParams.get(
+        "state",
+      );
+      const callback = fetch(
+        serverUrl(
+          harness.port,
+          `/oauth/callback?code=auth-code-during-close&state=${state}`,
+        ),
+      );
+      await callbackStarted.promise;
+
+      let closeSettled = false;
+      const closing = harness.close().then(() => {
+        closeSettled = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeSettled).toBe(false);
+
+      finishTokenExchange.resolve(
+        jsonResponse({
+          access_token: "callback-close-access",
+          refresh_token: "callback-close-refresh",
+          expires_in: 86_400,
+        }),
+      );
+      expect((await callback).status).toBe(200);
+      await closing;
+      activeHarness = undefined;
+
+      const restarted = new LinearOAuthTokenManager({
+        clientId: "client-id-test",
+        clientSecret: "client-secret-test",
+        initialAccessToken: "unused",
+        storePath: harness.oauthTokenStorePath,
+      });
+      await expect(restarted.getAccessToken()).resolves.toBe(
+        "callback-close-access",
+      );
+    } finally {
+      finishTokenExchange.resolve(
+        jsonResponse({
+          access_token: "callback-close-access",
+          refresh_token: "callback-close-refresh",
+          expires_in: 86_400,
+        }),
+      );
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("bounds signal shutdown when an accepted OAuth callback never settles", async () => {
+    const callbackStarted = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        shutdownRequestTimeoutMs: 25,
+        tokenFetchImpl: (async (_input, init) => {
+          callbackStarted.resolve();
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          });
+        }) as FetchFn,
+      });
+      harness = activeHarness;
+      const state = new URL(await harness.authorizationUrl).searchParams.get(
+        "state",
+      );
+      const callback = fetch(
+        serverUrl(
+          harness.port,
+          `/oauth/callback?code=auth-code-never-settles&state=${state}`,
+        ),
+      ).catch(() => undefined);
+      await callbackStarted.promise;
+      const signals = new EventEmitter();
+      const exitObserved = createDeferred<number>();
+      const closeSpy = vi.fn(harness.close);
+      installGracefulShutdown(
+        { close: closeSpy },
+        {
+          signalSource: signals,
+          exit: (code) => exitObserved.resolve(code),
+        },
+      );
+
+      signals.emit("SIGTERM");
+      signals.emit("SIGTERM");
+      await expect(
+        Promise.race([
+          exitObserved.promise,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("signal exit timed out")), 500),
+          ),
+        ]),
+      ).resolves.toBe(0);
+      activeHarness = undefined;
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+
+      await callback;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(
+        fsPromises.readFile(harness.oauthTokenStorePath, "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(
+        logSpy.mock.calls.some((call) =>
+          call.join(" ").includes("OAuth token pair installed"),
+        ),
+      ).toBe(false);
+      expect(
+        errorSpy.mock.calls.some((call) =>
+          call.join(" ").includes("OAuth token exchange failed"),
+        ),
+      ).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("persists a successful OAuth callback response that arrives at shutdown abort", async () => {
+    const callbackStarted = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        shutdownRequestTimeoutMs: 25,
+        tokenFetchImpl: (async (_input, init) => {
+          callbackStarted.resolve();
+          return await new Promise<Response>((resolve) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () =>
+                resolve(
+                  jsonResponse({
+                    access_token: "abort-race-access",
+                    refresh_token: "abort-race-refresh",
+                    expires_in: 86_400,
+                  }),
+                ),
+              { once: true },
+            );
+          });
+        }) as FetchFn,
+      });
+      harness = activeHarness;
+      const state = new URL(await harness.authorizationUrl).searchParams.get(
+        "state",
+      );
+      const callback = fetch(
+        serverUrl(
+          harness.port,
+          `/oauth/callback?code=auth-code-abort-race&state=${state}`,
+        ),
+      ).catch(() => undefined);
+      await callbackStarted.promise;
+
+      await harness.close();
+      activeHarness = undefined;
+      await callback;
+      const restarted = new LinearOAuthTokenManager({
+        clientId: "client-id-test",
+        clientSecret: "client-secret-test",
+        initialAccessToken: "unused",
+        storePath: harness.oauthTokenStorePath,
+      });
+      await expect(restarted.getAccessToken()).resolves.toBe(
+        "abort-race-access",
+      );
+    } finally {
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
     }
   });
 

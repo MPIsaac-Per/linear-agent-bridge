@@ -33,8 +33,9 @@ refreshes it after an authenticated request returns 401.
   apply inside runtime sessions automatically.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Persist the bounded receipt and semantic claim before ack; do all
-  external work after. Mark dispatch durably before the first external or
-  runtime side effect.
+  external work after. Persist a content-bound activity outbox before each
+  pre-runtime liveness or stop activity. Persist runtime-start intent
+  immediately before the first runtime iterator advance.
 - Tool results must close their matching Linear action. Stop signals abort
   active and queued turns for that session. `RUN_INACTIVITY_TIMEOUT_MS` bounds
   runtime silence, not total wall-clock duration; raw runtime progress resets
@@ -42,7 +43,8 @@ refreshes it after an authenticated request returns 401.
   turn immediately and never resets the watchdog.
 - Linear OAuth access tokens expire after 24 hours. Persist both replacement
   tokens atomically after every authorization and refresh. Never log either
-  token.
+  token. SIGINT and SIGTERM drain the server and make one bounded attempt to
+  persist pending or in-flight replacement tokens before process exit.
 - OAuth callbacks consume a random, expiring, one-time `state` issued only in
   the local service log. Never accept a bare authorization code.
 - Linear payload facts (verified against live payloads 2026-08-12): the

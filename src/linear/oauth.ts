@@ -6,6 +6,7 @@ import { discardResponseBody, type FetchFn } from "./client.js";
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
 const INITIAL_PERSISTENCE_RETRY_DELAY_MS = 100;
 const MAX_PERSISTENCE_RETRY_DELAY_MS = 30_000;
+const DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_MS = 1_000;
 
 export interface LinearOAuthTokenResponse {
   access_token?: string;
@@ -105,6 +106,38 @@ export class LinearOAuthTokenManager {
   async hasRefreshToken(): Promise<boolean> {
     await this.load();
     return this.refreshToken !== undefined;
+  }
+
+  async flushPendingPersistence(
+    timeoutMs = DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_MS,
+  ): Promise<void> {
+    const flush = (async () => {
+      await this.refreshPromise?.catch(() => undefined);
+      this.clearPendingRetry();
+      await this.serializeMutation(async () => {
+        const pending = this.pendingTokens;
+        if (pending !== undefined) {
+          await this.persistAndAdopt(pending);
+        }
+      });
+    })();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        flush,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Linear OAuth shutdown flush timed out")),
+            timeoutMs,
+          );
+          timeout.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   async install(response: LinearOAuthTokenResponse): Promise<void> {

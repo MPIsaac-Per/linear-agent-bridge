@@ -8,6 +8,10 @@ import { createIngressRecoveryKeyring } from "./state/recovery-envelope.js";
 import { SerialQueue } from "./queue.js";
 import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
+import {
+  awaitReadyOrShutdown,
+  installGracefulShutdown,
+} from "./shutdown.js";
 import type { AgentRuntime } from "./types.js";
 
 function buildRuntime(runtime: "claude" | "codex", kbPath: string): AgentRuntime {
@@ -36,5 +40,9 @@ const server = startServer({
   }),
   queue: new SerialQueue(),
 });
-await server.ready;
-console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);
+const shutdown = installGracefulShutdown(server);
+if (await awaitReadyOrShutdown(server.ready, shutdown)) {
+  console.log(
+    `linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`,
+  );
+}

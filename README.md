@@ -131,7 +131,9 @@ store on persistent local storage. Its file mode is `0600`, and `data/` is
 excluded from Git.
 
 OAuth tokens are adopted only after the rotating pair is written and synced;
-a failed persistence attempt keeps the pair pending and retries it. OAuth,
+a failed persistence attempt keeps the pair pending and retries it. Graceful
+SIGINT or SIGTERM shutdown waits within a bounded window for an in-flight
+refresh and flushes a pending replacement pair before process exit. OAuth,
 runtime-session mappings, and bridge state use owner-only temporary files,
 file sync, same-directory atomic rename, and directory sync. A missing store
 starts empty where allowed. Malformed or unreadable durable state fails closed
@@ -285,8 +287,10 @@ session takes.
   envelope. The runtime-start intent is written only after liveness and queue
   work, immediately before runtime invocation. A different process treats an
   intent-bearing receipt as `AmbiguousDispatch`; same-process stop or shutdown
-  before invocation can roll the intent back safely. Same-process duplicate
-  deliveries remain ordinary duplicates.
+  before invocation confirms the intent and rolls it back when durability can
+  be established. If final confirmation remains uncertain, the receipt stays
+  conservatively ambiguous. Same-process duplicate deliveries remain ordinary
+  duplicates.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.

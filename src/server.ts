@@ -61,6 +61,7 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
 const ACTIVITY_RECONCILIATION_ATTEMPTS = 4;
+const DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS = 1_000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 type TerminalTransition =
   | { kind: "completed_without_runtime" }
@@ -70,7 +71,9 @@ type TerminalTransition =
 interface InternalServerDeps extends ServerDeps {
   activeRuns: Map<string, Set<ActiveRun>>;
   shutdownController: AbortController;
+  requestShutdownController: AbortController;
   processingInFlight: Set<Promise<void>>;
+  requestsInFlight: Set<Promise<void>>;
   closing: boolean;
   recoveryInFlight?: Promise<void> | undefined;
   recoveryRequested: boolean;
@@ -115,6 +118,8 @@ export interface ServerDeps {
   onOAuthAuthorizationUrl?: (url: string) => void;
   /** Test seam for work that begins only after the HTTP acknowledgement. */
   schedulePostResponseWork?: (work: () => void) => void;
+  /** Bounded grace period for request handlers already accepted at shutdown. */
+  shutdownRequestTimeoutMs?: number;
 }
 
 class OAuthStateStore {
@@ -185,7 +190,9 @@ export function startServer(deps: ServerDeps): {
     ...deps,
     activeRuns: new Map<string, Set<ActiveRun>>(),
     shutdownController: new AbortController(),
+    requestShutdownController: new AbortController(),
     processingInFlight: new Set<Promise<void>>(),
+    requestsInFlight: new Set<Promise<void>>(),
     closing: false,
     recoveryRequested: false,
     recoveryBlocked: false,
@@ -194,15 +201,22 @@ export function startServer(deps: ServerDeps): {
     requestStartupRecovery: () => undefined,
   };
   const server = createServer((req, res) => {
-    handleRequest(req, res, internalDeps, oauthStates).catch((error: unknown) => {
-      console.error(
-        `[linear-agent-bridge] request handler failed: error=${boundedErrorClass(error)}`,
-      );
-      if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "text/plain" });
-      }
-      res.end();
-    });
+    const request = handleRequest(req, res, internalDeps, oauthStates).catch(
+      (error: unknown) => {
+        console.error(
+          `[linear-agent-bridge] request handler failed: error=${boundedErrorClass(error)}`,
+        );
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+        }
+        res.end();
+      },
+    );
+    internalDeps.requestsInFlight.add(request);
+    const forgetRequest = (): void => {
+      internalDeps.requestsInFlight.delete(request);
+    };
+    void request.then(forgetRequest, forgetRequest);
   });
 
   let resolveReady!: () => void;
@@ -234,6 +248,28 @@ export function startServer(deps: ServerDeps): {
     resolveListenOutcome();
     rejectReady(new ServerListenError());
   });
+  let listenerShutdownPromise: Promise<void> | undefined;
+  const beginListenerShutdown = (): Promise<void> => {
+    if (listenerShutdownPromise === undefined) {
+      listenerShutdownPromise = (async () => {
+        await listenOutcome;
+        if (!server.listening) {
+          return;
+        }
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => {
+            if (err) {
+              reject(err);
+            } else {
+              resolve();
+            }
+          });
+          server.closeIdleConnections();
+        });
+      })();
+    }
+    return listenerShutdownPromise;
+  };
 
   let startupAttempt: Promise<void> | undefined;
   const requestStartupRecovery = (): void => {
@@ -287,11 +323,12 @@ export function startServer(deps: ServerDeps): {
       }
     })();
     startupAttempt = attempt;
-    void attempt.then(() => {
+    const clearStartupAttempt = (): void => {
       if (startupAttempt === attempt) {
         startupAttempt = undefined;
       }
-    });
+    };
+    void attempt.then(clearStartupAttempt, clearStartupAttempt);
   };
   internalDeps.requestStartupRecovery = requestStartupRecovery;
 
@@ -308,38 +345,63 @@ export function startServer(deps: ServerDeps): {
     requestStartupRecovery();
   });
 
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise === undefined) {
+      closePromise = (async () => {
+        internalDeps.closing = true;
+        rejectReady(new Error("Server shutting down"));
+        internalDeps.shutdownController.abort(new Error("Server shutting down"));
+        const listenerShutdown = beginListenerShutdown();
+        for (const runs of internalDeps.activeRuns.values()) {
+          for (const run of runs) {
+            run.controller.abort(new Error("Server shutting down"));
+          }
+        }
+        const requestsDrained = await settlePromisesWithin(
+          [...internalDeps.requestsInFlight],
+          deps.shutdownRequestTimeoutMs ?? DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS,
+        );
+        if (!requestsDrained) {
+          internalDeps.requestShutdownController.abort(
+            new Error("Server request shutdown timed out"),
+          );
+          const abortedRequestsDrained = await settlePromisesWithin(
+            [...internalDeps.requestsInFlight],
+            deps.shutdownRequestTimeoutMs ?? DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS,
+          );
+          if (abortedRequestsDrained) {
+            server.closeIdleConnections();
+          } else {
+            server.closeAllConnections();
+          }
+        } else {
+          server.closeIdleConnections();
+        }
+        await listenerShutdown;
+        await Promise.allSettled([...internalDeps.processingInFlight]);
+        await internalDeps.recoveryInFlight?.catch(() => undefined);
+        await startupAttempt?.catch(() => undefined);
+        await internalDeps.queue.enqueue(async () => {});
+        let oauthFlushError: unknown;
+        try {
+          await deps.oauth.flushPendingPersistence();
+        } catch (error) {
+          oauthFlushError = error;
+          console.error(
+            `[linear-agent-bridge] OAuth token flush failed: error=${boundedErrorClass(error)}`,
+          );
+        }
+        if (oauthFlushError !== undefined) {
+          throw oauthFlushError;
+        }
+      })();
+    }
+    return closePromise;
+  };
   return {
     ready,
-    async close(): Promise<void> {
-      internalDeps.closing = true;
-      rejectReady(new Error("Server shutting down"));
-      internalDeps.shutdownController.abort(new Error("Server shutting down"));
-      for (const runs of internalDeps.activeRuns.values()) {
-        for (const run of runs) {
-          run.controller.abort(new Error("Server shutting down"));
-        }
-      }
-      await Promise.allSettled([...internalDeps.processingInFlight]);
-      await internalDeps.recoveryInFlight?.catch(() => undefined);
-      await startupAttempt?.catch(() => undefined);
-      await internalDeps.queue.enqueue(async () => {});
-      await listenOutcome;
-      if (!server.listening) {
-        return;
-      }
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => {
-          if (err) {
-            reject(err);
-          } else {
-            resolve();
-          }
-        });
-        // Force-close idle keep-alive sockets so close() doesn't hang
-        // waiting for a client (e.g. undici's connection pool) to let go.
-        server.closeAllConnections();
-      });
-    },
+    close,
   };
 }
 
@@ -350,6 +412,12 @@ async function handleRequest(
   oauthStates: OAuthStateStore,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
+
+  if (deps.closing) {
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("server shutting down");
+    return;
+  }
 
   if (
     deps.recoveryBlocked &&
@@ -1735,7 +1803,7 @@ function formatDuration(milliseconds: number): string {
 async function handleOAuthCallback(
   url: URL,
   res: ServerResponse,
-  deps: ServerDeps,
+  deps: InternalServerDeps,
   oauthStates: OAuthStateStore,
 ): Promise<void> {
   const state = url.searchParams.get("state");
@@ -1753,6 +1821,7 @@ async function handleOAuthCallback(
   }
 
   const tokenFetch = deps.tokenFetch ?? globalThis.fetch;
+  const shutdownSignal = deps.requestShutdownController.signal;
   const body = new URLSearchParams({
     code,
     redirect_uri: OAUTH_REDIRECT_URI,
@@ -1766,6 +1835,7 @@ async function handleOAuthCallback(
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
+      signal: shutdownSignal,
     });
 
     if (!response.ok) {
@@ -1784,10 +1854,40 @@ async function handleOAuthCallback(
       "<html><body><p>Authorization complete. The agent will refresh its Linear access automatically.</p></body></html>",
     );
   } catch (err) {
+    if (shutdownSignal.aborted) {
+      if (!res.headersSent) {
+        res.writeHead(503, { "Content-Type": "text/plain" });
+      }
+      res.end("server shutting down");
+      return;
+    }
     console.error(
       `[linear-agent-bridge] OAuth token exchange failed: error=${boundedErrorClass(err)}`,
     );
     res.writeHead(500, { "Content-Type": "text/plain" });
     res.end("OAuth token exchange failed");
+  }
+}
+
+async function settlePromisesWithin(
+  promises: readonly Promise<unknown>[],
+  timeoutMs: number,
+): Promise<boolean> {
+  if (promises.length === 0) {
+    return true;
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.allSettled(promises).then(() => true),
+      new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
   }
 }
