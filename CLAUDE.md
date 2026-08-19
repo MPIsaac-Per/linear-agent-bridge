@@ -7,10 +7,14 @@ working directory it runs in (CLAUDE.md stack, MCP servers).
 
 ## Architecture
 
-Linear webhook (AgentSessionEvent) -> src/server.ts -> SerialQueue ->
-AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities back via
-src/linear/client.ts (agentActivityCreate). Session mapping persists in
-JsonSessionStore so `prompted` events resume the same runtime session.
+Linear webhook (AgentSessionEvent) -> src/server.ts -> JsonBridgeStateStore ->
+SerialQueue -> AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities
+back via src/linear/client.ts (agentActivityCreate). Durable receipts and
+semantic claims prevent duplicate dispatch across delivery and process
+retries. A claim can transfer after restart only until its durable dispatch
+marker is set; later cross-process retries remain ambiguous and undispatched.
+Session mapping persists in JsonSessionStore so `prompted` events
+resume the same runtime session.
 LinearOAuthTokenManager persists Linear's rotating OAuth token pair and
 refreshes it after an authenticated request returns 401.
 
@@ -28,7 +32,9 @@ refreshes it after an authenticated request returns 401.
 - The runtime runs with cwd=KB_PATH; that directory's own CLAUDE.md rules
   apply inside runtime sessions automatically.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
-  `created`. Ack first, work after.
+  `created`. Persist the bounded receipt and semantic claim before ack; do all
+  external work after. Mark dispatch durably before the first external or
+  runtime side effect.
 - Tool results must close their matching Linear action. Stop signals abort
   active and queued turns for that session. `RUN_INACTIVITY_TIMEOUT_MS` bounds
   runtime silence, not total wall-clock duration; raw runtime progress resets

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
-import type { FetchFn } from "./client.js";
+import { discardResponseBody, type FetchFn } from "./client.js";
 
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
 
@@ -128,9 +128,9 @@ export class LinearOAuthTokenManager {
       body: body.toString(),
     });
     if (!response.ok) {
-      const text = await response.text();
+      await discardResponseBody(response);
       throw new Error(
-        `Linear OAuth token refresh failed: ${response.status} ${response.statusText} — ${text}`,
+        `Linear OAuth token refresh failed: ${response.status} ${response.statusText}`,
       );
     }
 

@@ -20,15 +20,7 @@ export function verifyWebhook(
   secret: string,
   now: number = Date.now(),
 ): boolean {
-  if (signatureHeader === undefined) {
-    return false;
-  }
-
-  const expectedHex = createHmac("sha256", secret).update(rawBody).digest("hex");
-  const expected = Buffer.from(expectedHex, "utf8");
-  const actual = Buffer.from(signatureHeader, "utf8");
-
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+  if (!verifyWebhookSignature(rawBody, signatureHeader, secret)) {
     return false;
   }
 
@@ -39,14 +31,35 @@ export function verifyWebhook(
     return false;
   }
 
+  return hasFreshWebhookTimestamp(payload, now);
+}
+
+/** Verify only the HMAC so callers can emit a static parse diagnostic next. */
+export function verifyWebhookSignature(
+  rawBody: Buffer,
+  signatureHeader: string | undefined,
+  secret: string,
+): boolean {
+  if (signatureHeader === undefined) {
+    return false;
+  }
+  const expectedHex = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const expected = Buffer.from(expectedHex, "utf8");
+  const actual = Buffer.from(signatureHeader, "utf8");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+/** Validate the parsed replay-protection timestamp without inspecting content. */
+export function hasFreshWebhookTimestamp(
+  payload: unknown,
+  now: number = Date.now(),
+): boolean {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     return false;
   }
-
   const webhookTimestamp = (payload as Record<string, unknown>).webhookTimestamp;
-  if (typeof webhookTimestamp !== "number") {
-    return false;
-  }
-
-  return Math.abs(now - webhookTimestamp) <= STALE_THRESHOLD_MS;
+  return (
+    typeof webhookTimestamp === "number" &&
+    Math.abs(now - webhookTimestamp) <= STALE_THRESHOLD_MS
+  );
 }

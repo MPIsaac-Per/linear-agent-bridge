@@ -7,11 +7,40 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Persist bounded webhook receipts, semantic execution claims, and
+  caller-generated Linear activity UUIDs before acknowledging valid agent
+  events. Delivery retries deduplicate by `webhookId`; created and prompted
+  turns claim `created:<agentSession.id>` and `agentActivity.id` respectively.
+  Terminal entries expire after seven days and are capped at 10,000 while
+  active claims are preserved.
+- Mark dispatch durably before any external or runtime side effect. A replacement
+  process safely reclaims a claim when dispatch never began; retries after the
+  marker persist an `AmbiguousDispatch` outcome and remain undispatched.
+- Encrypt the bounded recovery payload for each marker-free accepted turn with
+  a required AES-256-GCM ingress key. Startup replays recoverable work before
+  becoming healthy, and dispatch-marker persistence removes the envelope.
+  Bounded routing metadata remains plaintext: action, session/webhook/execution
+  IDs, recovery sequence, event timestamp, envelope `keyId`, and stop-fence
+  provenance. Prompt, issue, and comment text, raw signal, and stop/body
+  semantics remain encrypted. The envelope authenticates its payload and
+  routing association, not the state file as a whole.
+- Hard-cap marker-free accepted recovery events at 128. New ingress fails
+  closed with 503 at capacity; the separate receipt-retention cap remains
+  10,000 entries while active claims remain non-evictable.
+- Add reader-first recovery-key rotation through up to four retained previous
+  keys. The primary key writes new envelopes while the retained keyring reads
+  outstanding envelopes from earlier deployments.
+
 ### Changed
 
 - Rename the project from `linear-claude-bridge` to `linear-agent-bridge` to
   reflect its runtime-agnostic architecture. The macOS installer removes the
   legacy launchd job during upgrade so only one bridge process remains active.
+- Make the macOS installer validate configuration and recovery keys before any
+  launchd mutation, repair `.env` to mode `0600`, poll health with a bounded
+  deadline, and restore the prior build and launchd files when restart fails.
 - Publish non-empty Claude assistant text immediately when an `end_turn`
   message arrives, suppress an identical trailing success result, and retain a
   differing result as a second durable response.
@@ -26,6 +55,22 @@ Changes awaiting a tagged release remain under Unreleased.
   one bounded warning whenever present, with the new variable taking precedence.
 - Log bounded turn lifecycle records with session id, terminal reason, and
   queue size without including prompt or issue content.
+- Return a non-200 response when ingress state cannot be persisted, retain
+  durable received/claimed/completed/failed/superseded lifecycle metadata, and
+  leave ambiguous claims from another process undispatched for manual review.
+- Keep startup unhealthy when an older marker-free receipt lacks both recovery
+  fields, while allowing only an exact signed matching Linear redelivery to
+  attach its encrypted envelope and resume recovery. Asymmetric recovery state,
+  corrupted envelopes, missing reader keys, invalid signatures, and unrelated
+  events remain fail closed. Recovery ciphertext reveals approximate prompt
+  length but never stores prompt, issue, comment, signal, or body semantics in
+  plaintext.
+- Remove prompted activity serialization from empty-body diagnostics so logs
+  contain only bounded identifiers and status metadata.
+- Persist bounded HTTP status, result, disposition, and error-class outcome
+  metadata for valid receipts. Invalid JSON and invalid agent events emit only
+  static diagnostics, ingress failures log only static classes, and Linear
+  response bodies are no longer echoed into errors.
 
 ### Fixed
 

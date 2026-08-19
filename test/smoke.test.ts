@@ -8,6 +8,7 @@ describe("scaffold", () => {
       LINEAR_CLIENT_SECRET: "secret",
       LINEAR_WEBHOOK_SECRET: "whsec",
       LINEAR_ACCESS_TOKEN: "token",
+      INGRESS_RECOVERY_KEY: "A".repeat(43),
     });
 
     expect(config.linearClientId).toBe("id");

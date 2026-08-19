@@ -6,7 +6,11 @@ const validEnv = {
   LINEAR_CLIENT_SECRET: "client-secret",
   LINEAR_WEBHOOK_SECRET: "webhook-secret",
   LINEAR_ACCESS_TOKEN: "access-token",
+  INGRESS_RECOVERY_KEY: "A".repeat(43),
 };
+const recoveryKeys = Array.from({ length: 6 }, (_, index) =>
+  Buffer.alloc(32, index + 1).toString("base64url"),
+);
 
 describe("loadConfig", () => {
   it("loads all required fields plus defaults when only required vars are set", () => {
@@ -21,8 +25,11 @@ describe("loadConfig", () => {
       runtime: "claude",
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
+      bridgeStateStorePath: "./data/bridge-state.json",
       oauthTokenStorePath: "./data/oauth-tokens.json",
       runInactivityTimeoutMs: 300000,
+      ingressRecoveryKey: "A".repeat(43),
+      ingressRecoveryPreviousKeys: [],
     });
   });
 
@@ -33,6 +40,7 @@ describe("loadConfig", () => {
       RUNTIME: "codex",
       KB_PATH: "/tmp/kb",
       SESSION_STORE_PATH: "/tmp/sessions.json",
+      BRIDGE_STATE_STORE_PATH: "/tmp/bridge-state.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
       RUN_INACTIVITY_TIMEOUT_MS: "45000",
     });
@@ -41,6 +49,7 @@ describe("loadConfig", () => {
     expect(config.runtime).toBe("codex");
     expect(config.kbPath).toBe("/tmp/kb");
     expect(config.sessionStorePath).toBe("/tmp/sessions.json");
+    expect(config.bridgeStateStorePath).toBe("/tmp/bridge-state.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
     expect(config.runInactivityTimeoutMs).toBe(45000);
   });
@@ -50,6 +59,7 @@ describe("loadConfig", () => {
     ["LINEAR_CLIENT_SECRET"],
     ["LINEAR_WEBHOOK_SECRET"],
     ["LINEAR_ACCESS_TOKEN"],
+    ["INGRESS_RECOVERY_KEY"],
   ])("throws naming %s when missing", (missingKey) => {
     const env = { ...validEnv };
     delete (env as Record<string, string | undefined>)[missingKey];
@@ -116,5 +126,55 @@ describe("loadConfig", () => {
     const config = loadConfig({ ...validEnv, PORT: "5000" });
     expect(config.port).toBe(5000);
     expect(typeof config.port).toBe("number");
+  });
+
+  it("parses retained recovery keys in order", () => {
+    const config = loadConfig({
+      ...validEnv,
+      INGRESS_RECOVERY_PREVIOUS_KEYS: recoveryKeys.slice(0, 2).join(","),
+    });
+
+    expect(config.ingressRecoveryPreviousKeys).toEqual(
+      recoveryKeys.slice(0, 2),
+    );
+  });
+
+  it.each(["short", `${"A".repeat(43)}=`, "!".repeat(43)])(
+    "rejects a noncanonical primary recovery key without echoing it",
+    (invalidKey) => {
+      expect(() =>
+        loadConfig({ ...validEnv, INGRESS_RECOVERY_KEY: invalidKey }),
+      ).toThrow(
+        "Invalid INGRESS_RECOVERY_KEY: expected canonical 32-byte base64url",
+      );
+    },
+  );
+
+  it.each([
+    `${recoveryKeys[0]},`,
+    `,${recoveryKeys[0]}`,
+    `${recoveryKeys[0]},not-canonical`,
+  ])("rejects malformed or empty retained recovery key members", (value) => {
+    expect(() =>
+      loadConfig({ ...validEnv, INGRESS_RECOVERY_PREVIOUS_KEYS: value }),
+    ).toThrow("Invalid INGRESS_RECOVERY_PREVIOUS_KEYS");
+  });
+
+  it("rejects duplicate current and retained recovery keys", () => {
+    expect(() =>
+      loadConfig({
+        ...validEnv,
+        INGRESS_RECOVERY_PREVIOUS_KEYS: validEnv.INGRESS_RECOVERY_KEY,
+      }),
+    ).toThrow("Invalid INGRESS_RECOVERY_PREVIOUS_KEYS");
+  });
+
+  it("rejects more than four retained recovery keys", () => {
+    expect(() =>
+      loadConfig({
+        ...validEnv,
+        INGRESS_RECOVERY_PREVIOUS_KEYS: recoveryKeys.slice(0, 5).join(","),
+      }),
+    ).toThrow("Invalid INGRESS_RECOVERY_PREVIOUS_KEYS");
   });
 });
