@@ -141,7 +141,24 @@ export class ClaudeRuntime implements AgentRuntime {
   constructor(
     private readonly kbPath: string,
     private readonly queryFn: QueryFn = defaultQuery,
+    private readonly agentOutputPath?: string,
   ) {}
+
+  /**
+   * Name the writable directory in the prompt when one is configured.
+   *
+   * This is usability, not enforcement. The filesystem is what stops a write,
+   * and it stops it whether or not the agent was told; telling it only saves a
+   * turn spent discovering the boundary by hitting EACCES. Never pass tool or
+   * permission overrides to do this job: the repository CLAUDE.md forbids them,
+   * and anything enforced inside the agent is advisory anyway.
+   */
+  private composePrompt(prompt: string): string {
+    if (this.agentOutputPath === undefined) {
+      return prompt;
+    }
+    return `${prompt}\n\nWrite any files you produce to ${this.agentOutputPath}. The working directory may be read-only to this service, so a denied write there is expected rather than something to work around.`;
+  }
 
   forceCloseSession(request: SessionRequest): void {
     if (request.abortController !== undefined) {
@@ -172,7 +189,10 @@ export class ClaudeRuntime implements AgentRuntime {
     let pendingThought: RuntimeEvent | undefined;
     let durableAssistantResponseBody: string | undefined;
     const pendingToolUses = new Map<string, PendingToolUse>();
-    const query = this.queryFn({ prompt: request.prompt, options });
+    const query = this.queryFn({
+      prompt: this.composePrompt(request.prompt),
+      options,
+    });
     let queryClosed = false;
     const closeQuery = (): void => {
       if (!queryClosed && query.close !== undefined) {

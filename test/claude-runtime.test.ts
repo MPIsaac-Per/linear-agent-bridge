@@ -59,7 +59,9 @@ function assistantToolUse(
   input: Record<string, unknown>,
   toolUseId = "tool_1",
 ): SDKMessage {
-  return assistantMessage(sessionId, [{ type: "tool_use", id: toolUseId, name, input }]);
+  return assistantMessage(sessionId, [
+    { type: "tool_use", id: toolUseId, name, input },
+  ]);
 }
 
 function userToolResult(
@@ -72,7 +74,14 @@ function userToolResult(
     type: "user",
     message: {
       role: "user",
-      content: [{ type: "tool_result", tool_use_id: toolUseId, content, is_error: isError }],
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content,
+          is_error: isError,
+        },
+      ],
     },
     parent_tool_use_id: null,
     uuid: "00000000-0000-0000-0000-000000000003",
@@ -116,7 +125,10 @@ function resultError(sessionId: string, errors: string[]): SDKMessage {
   } as unknown as SDKMessage;
 }
 
-async function collect(request: SessionRequest, runtime: ClaudeRuntime): Promise<RuntimeEvent[]> {
+async function collect(
+  request: SessionRequest,
+  runtime: ClaudeRuntime,
+): Promise<RuntimeEvent[]> {
   const events: RuntimeEvent[] = [];
   for await (const event of runtime.runSession(request)) {
     if (event.kind !== "progress") {
@@ -135,11 +147,140 @@ describe("ClaudeRuntime", () => {
     expect(runtime.name).toBe("claude");
   });
 
+  it("survives a write the filesystem denied without crashing or retrying", async () => {
+    const sessionId = "sdk-session-denied-write";
+    let queryCalls = 0;
+    const stub = (() => {
+      queryCalls += 1;
+      return (async function* () {
+        yield systemInit(sessionId);
+        yield assistantToolUse(
+          sessionId,
+          "Write",
+          { file_path: "/srv/mpi-kb/notes.md" },
+          "tool-denied",
+        );
+        yield userToolResult(
+          sessionId,
+          "tool-denied",
+          "EACCES: permission denied, open '/srv/mpi-kb/notes.md'",
+          true,
+        );
+        yield resultSuccess(sessionId, "could not write there");
+      })();
+    }) as unknown as QueryFn;
+    const runtime = new ClaudeRuntime(KB_PATH, stub, "/srv/agent-out");
+
+    const events: RuntimeEvent[] = [];
+    for await (const event of runtime.runSession({
+      linearSessionId: "linear-denied-write",
+      prompt: "write it",
+    })) {
+      if (event.kind !== "progress") {
+        events.push(event);
+      }
+    }
+
+    // A denied write is the agent's problem to reason about, not the bridge's
+    // to recover from. One query, no retry, and the turn reaches its own end.
+    expect(queryCalls).toBe(1);
+    const activityTypes = events.flatMap((event) =>
+      event.kind === "activity" ? [event.activity.type] : [],
+    );
+    // The denied write renders as an action result, not as a turn-level error.
+    expect(activityTypes).not.toContain("error");
+    expect(activityTypes).toContain("response");
+    // A runtime done event ends the turn; the denied write did not abort it.
+    expect(events.at(-1)).toMatchObject({ kind: "done" });
+  });
+
+  it("names the output path in the prompt exactly once when one is configured", async () => {
+    const sessionId = "sdk-session-output-path";
+    const outputPath = "/srv/agent-out";
+    let seenPrompt = "";
+    const stub = ((args: { prompt: string; options: Options }) => {
+      seenPrompt = args.prompt;
+      return (async function* () {
+        yield systemInit(sessionId);
+        yield resultSuccess(sessionId, "done");
+      })();
+    }) as unknown as QueryFn;
+    const runtime = new ClaudeRuntime(KB_PATH, stub, outputPath);
+
+    for await (const _event of runtime.runSession({
+      linearSessionId: "linear-output-path",
+      prompt: "write the summary",
+    })) {
+      // drain
+    }
+
+    expect(seenPrompt).toContain("write the summary");
+    expect(seenPrompt).toContain(outputPath);
+    // Surfacing is for usability only. Saying it twice wastes context and
+    // invites the model to treat it as emphasis.
+    expect(seenPrompt.split(outputPath)).toHaveLength(2);
+  });
+
+  it("leaves the prompt untouched when no output path is configured", async () => {
+    const sessionId = "sdk-session-no-output-path";
+    let seenPrompt = "";
+    const stub = ((args: { prompt: string; options: Options }) => {
+      seenPrompt = args.prompt;
+      return (async function* () {
+        yield systemInit(sessionId);
+        yield resultSuccess(sessionId, "done");
+      })();
+    }) as unknown as QueryFn;
+    const runtime = new ClaudeRuntime(KB_PATH, stub);
+
+    for await (const _event of runtime.runSession({
+      linearSessionId: "linear-no-output-path",
+      prompt: "write the summary",
+    })) {
+      // drain
+    }
+
+    expect(seenPrompt).toBe("write the summary");
+  });
+
+  it("does not pass tool or permission overrides alongside the output path", async () => {
+    const sessionId = "sdk-session-no-overrides";
+    let seenOptions: Options | undefined;
+    const stub = ((args: { prompt: string; options: Options }) => {
+      seenOptions = args.options;
+      return (async function* () {
+        yield systemInit(sessionId);
+        yield resultSuccess(sessionId, "done");
+      })();
+    }) as unknown as QueryFn;
+    const runtime = new ClaudeRuntime(KB_PATH, stub, "/srv/agent-out");
+
+    for await (const _event of runtime.runSession({
+      linearSessionId: "linear-no-overrides",
+      prompt: "hello",
+    })) {
+      // drain
+    }
+
+    // The repository CLAUDE.md forbids both, and the boundary is the
+    // filesystem regardless of what the SDK is told.
+    expect(seenOptions).toBeDefined();
+    expect("allowedTools" in (seenOptions ?? {})).toBe(false);
+    expect("disallowedTools" in (seenOptions ?? {})).toBe(false);
+    expect("model" in (seenOptions ?? {})).toBe(false);
+    expect(seenOptions?.permissionMode).toBe("bypassPermissions");
+  });
+
   it("emits non-rendering progress before mapping every raw SDK message", async () => {
     const sessionId = "sdk-session-progress";
     async function* stub(): AsyncGenerator<SDKMessage> {
       yield systemInit(sessionId);
-      yield assistantToolUse(sessionId, "Read", { file_path: "/tmp/x.md" }, "tool-progress");
+      yield assistantToolUse(
+        sessionId,
+        "Read",
+        { file_path: "/tmp/x.md" },
+        "tool-progress",
+      );
       yield userToolResult(sessionId, "tool-progress", "contents");
       yield resultSuccess(sessionId, "done");
     }
@@ -159,7 +300,11 @@ describe("ClaudeRuntime", () => {
       { kind: "progress" },
       {
         kind: "activity",
-        activity: { type: "action", action: "Read", parameter: '{"file_path":"/tmp/x.md"}' },
+        activity: {
+          type: "action",
+          action: "Read",
+          parameter: '{"file_path":"/tmp/x.md"}',
+        },
       },
       { kind: "progress" },
       {
@@ -186,18 +331,31 @@ describe("ClaudeRuntime", () => {
       yield resultSuccess(sessionId, "Here is the answer");
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    const request: SessionRequest = { linearSessionId: "linear-1", prompt: "hello" };
+    const request: SessionRequest = {
+      linearSessionId: "linear-1",
+      prompt: "hello",
+    };
 
     const events = await collect(request, runtime);
 
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "thought", body: "Looking into it..." } },
       {
         kind: "activity",
-        activity: { type: "action", action: "Bash", parameter: '{"command":"ls -la"}' },
+        activity: { type: "thought", body: "Looking into it..." },
       },
-      { kind: "activity", activity: { type: "response", body: "Here is the answer" } },
+      {
+        kind: "activity",
+        activity: {
+          type: "action",
+          action: "Bash",
+          parameter: '{"command":"ls -la"}',
+        },
+      },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "Here is the answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -211,14 +369,23 @@ describe("ClaudeRuntime", () => {
       yield resultSuccess(sessionId, "The final answer");
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    const request: SessionRequest = { linearSessionId: "linear-dedupe", prompt: "hello" };
+    const request: SessionRequest = {
+      linearSessionId: "linear-dedupe",
+      prompt: "hello",
+    };
 
     const events = await collect(request, runtime);
 
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "thought", body: "Interim finding" } },
-      { kind: "activity", activity: { type: "response", body: "The final answer" } },
+      {
+        kind: "activity",
+        activity: { type: "thought", body: "Interim finding" },
+      },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The final answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -259,14 +426,20 @@ describe("ClaudeRuntime", () => {
     await streamOpenWait;
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The durable answer" },
+      },
     ]);
 
     release();
     await collection;
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The durable answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -294,7 +467,10 @@ describe("ClaudeRuntime", () => {
         kind: "activity",
         activity: { type: "thought", body: "Subagent intermediate result" },
       },
-      { kind: "activity", activity: { type: "response", body: "Top-level final answer" } },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "Top-level final answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -317,7 +493,10 @@ describe("ClaudeRuntime", () => {
     );
 
     expect(events).toEqual([
-      { kind: "activity", activity: { type: "response", body: "The durable answer" } },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The durable answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -340,8 +519,14 @@ describe("ClaudeRuntime", () => {
     );
 
     expect(events).toEqual([
-      { kind: "activity", activity: { type: "response", body: "The immediate answer" } },
-      { kind: "activity", activity: { type: "response", body: "The corrected answer" } },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The immediate answer" },
+      },
+      {
+        kind: "activity",
+        activity: { type: "response", body: "The corrected answer" },
+      },
       { kind: "done" },
     ]);
   });
@@ -384,19 +569,34 @@ describe("ClaudeRuntime", () => {
       yield systemInit(sessionId);
       yield assistantMessage(sessionId, [
         { type: "text", text: "Checking the file first" },
-        { type: "tool_use", id: "tool_2", name: "Read", input: { file_path: "/tmp/x.md" } },
+        {
+          type: "tool_use",
+          id: "tool_2",
+          name: "Read",
+          input: { file_path: "/tmp/x.md" },
+        },
       ]);
       yield resultSuccess(sessionId, "done");
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    const events = await collect({ linearSessionId: "linear-mixed", prompt: "hi" }, runtime);
+    const events = await collect(
+      { linearSessionId: "linear-mixed", prompt: "hi" },
+      runtime,
+    );
 
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "thought", body: "Checking the file first" } },
       {
         kind: "activity",
-        activity: { type: "action", action: "Read", parameter: '{"file_path":"/tmp/x.md"}' },
+        activity: { type: "thought", body: "Checking the file first" },
+      },
+      {
+        kind: "activity",
+        activity: {
+          type: "action",
+          action: "Read",
+          parameter: '{"file_path":"/tmp/x.md"}',
+        },
       },
       { kind: "activity", activity: { type: "response", body: "done" } },
       { kind: "done" },
@@ -407,7 +607,12 @@ describe("ClaudeRuntime", () => {
     const sessionId = "sdk-session-tool-result";
     async function* stub(): AsyncGenerator<SDKMessage> {
       yield systemInit(sessionId);
-      yield assistantToolUse(sessionId, "Bash", { command: "printf hello" }, "tool-1");
+      yield assistantToolUse(
+        sessionId,
+        "Bash",
+        { command: "printf hello" },
+        "tool-1",
+      );
       yield userToolResult(sessionId, "tool-1", "hello");
       yield resultSuccess(sessionId, "done");
     }
@@ -433,7 +638,12 @@ describe("ClaudeRuntime", () => {
     const sessionId = "sdk-session-tool-error";
     async function* stub(): AsyncGenerator<SDKMessage> {
       yield systemInit(sessionId);
-      yield assistantToolUse(sessionId, "WebFetch", { url: "https://example.com" }, "tool-err");
+      yield assistantToolUse(
+        sessionId,
+        "WebFetch",
+        { url: "https://example.com" },
+        "tool-err",
+      );
       yield userToolResult(sessionId, "tool-err", "request timed out", true);
       yield resultSuccess(sessionId, "Could not fetch that page.");
     }
@@ -462,11 +672,17 @@ describe("ClaudeRuntime", () => {
       yield resultError(sessionId, ["max turns exceeded"]);
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    const events = await collect({ linearSessionId: "linear-err", prompt: "hi" }, runtime);
+    const events = await collect(
+      { linearSessionId: "linear-err", prompt: "hi" },
+      runtime,
+    );
 
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "error", body: "max turns exceeded" } },
+      {
+        kind: "activity",
+        activity: { type: "error", body: "max turns exceeded" },
+      },
       { kind: "done" },
     ]);
   });
@@ -480,14 +696,18 @@ describe("ClaudeRuntime", () => {
       yield resultSuccess(sessionId, "done");
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    const events = await collect({ linearSessionId: "linear-long", prompt: "hi" }, runtime);
+    const events = await collect(
+      { linearSessionId: "linear-long", prompt: "hi" },
+      runtime,
+    );
 
     const action = events.find(
       (e): e is Extract<RuntimeEvent, { kind: "activity" }> =>
         e.kind === "activity" && e.activity.type === "action",
     );
     expect(action).toBeDefined();
-    const parameter = action!.activity.type === "action" ? action!.activity.parameter : "";
+    const parameter =
+      action!.activity.type === "action" ? action!.activity.parameter : "";
     expect(parameter.includes("\n")).toBe(false);
     expect(parameter.length).toBeLessThanOrEqual(203);
     expect(parameter.endsWith("...")).toBe(true);
@@ -505,7 +725,11 @@ describe("ClaudeRuntime", () => {
     }
     const runtimeWith = new ClaudeRuntime(KB_PATH, stubWith as QueryFn);
     await collect(
-      { linearSessionId: "l1", prompt: "hi", resumeSessionId: "prior-runtime-session" },
+      {
+        linearSessionId: "l1",
+        prompt: "hi",
+        resumeSessionId: "prior-runtime-session",
+      },
       runtimeWith,
     );
     expect(capturedWithResume?.resume).toBe("prior-runtime-session");
@@ -696,7 +920,10 @@ describe("ClaudeRuntime", () => {
       yield resultSuccess("s-prompt", "done");
     }
     const runtime = new ClaudeRuntime(KB_PATH, stub as QueryFn);
-    await collect({ linearSessionId: "l4", prompt: "what is the weather" }, runtime);
+    await collect(
+      { linearSessionId: "l4", prompt: "what is the weather" },
+      runtime,
+    );
 
     expect(capturedPrompt).toBe("what is the weather");
   });
@@ -712,7 +939,10 @@ describe("ClaudeRuntime", () => {
     const events: RuntimeEvent[] = [];
 
     await expect(async () => {
-      for await (const event of runtime.runSession({ linearSessionId: "l5", prompt: "hi" })) {
+      for await (const event of runtime.runSession({
+        linearSessionId: "l5",
+        prompt: "hi",
+      })) {
         if (event.kind !== "progress") {
           events.push(event);
         }
@@ -721,8 +951,14 @@ describe("ClaudeRuntime", () => {
 
     expect(events).toEqual([
       { kind: "session-started", runtimeSessionId: sessionId },
-      { kind: "activity", activity: { type: "thought", body: "working on it" } },
-      { kind: "activity", activity: { type: "error", body: "stream exploded" } },
+      {
+        kind: "activity",
+        activity: { type: "thought", body: "working on it" },
+      },
+      {
+        kind: "activity",
+        activity: { type: "error", body: "stream exploded" },
+      },
     ]);
   });
 });
