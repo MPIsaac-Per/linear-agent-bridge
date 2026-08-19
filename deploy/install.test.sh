@@ -97,18 +97,18 @@ count=$((count + 1))
 printf '%s\n' "$count" > "$INSTALL_TEST_CURL_COUNT"
 case "${INSTALL_TEST_HEALTH_MODE:-healthy}" in
 	healthy)
-		printf '%s\n' '{"ok":true}'
+		printf '%s\n' 'ok'
 		;;
 	delayed)
 		if [ "$count" -ge 3 ]; then
-			printf '%s\n' '{"ok":true}'
+			printf '%s\n' 'ok'
 		else
 			exit 22
 		fi
 		;;
 	prehealthy_then_down)
 		if [ "$count" -eq 1 ]; then
-			printf '%s\n' '{"ok":true}'
+			printf '%s\n' 'ok'
 		else
 			exit 22
 		fi
@@ -173,6 +173,7 @@ run_installer() {
 		PATH="$fixture/bin:/usr/bin:/bin" \
 		INSTALL_TEST_LAUNCHCTL_LOG="$fixture/launchctl.log" \
 		INSTALL_TEST_CURL_COUNT="$fixture/curl.count" \
+		SKIP_FUNNEL=1 \
 		"$@" \
 		./deploy/install.sh
 	)
@@ -261,7 +262,7 @@ test_success_waits_for_bounded_health_check() {
 	output=$(run_installer "$fixture" env INSTALL_TEST_HEALTH_MODE=delayed 2>&1)
 
 	[ "$(cat "$fixture/curl.count")" -eq 3 ] || fail "installer did not stop polling after health succeeded"
-	assert_contains "$output" 'Health check: {"ok":true}'
+	assert_contains "$output" 'Health check: ok'
 }
 
 test_failed_restart_rolls_back_working_service() {
