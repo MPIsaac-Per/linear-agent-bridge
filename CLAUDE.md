@@ -76,6 +76,15 @@ refreshes it after an authenticated request returns 401.
   receipt on `webhookId` lets the first delivery take the slot and rejects every
   later one as a conflicting replay, which is exactly what happened once ingress
   started working on 2026-08-19. Verified against live deliveries the same day.
+- A queued session and a lost one look identical from Linear for the first
+  minute. The discriminator is the liveness activity: a session the bridge
+  accepted posts one within seconds, and a session whose webhook never arrived
+  posts nothing ever. Check for it before concluding a message was lost.
+- `LINEAR_ACCESS_TOKEN` is a bootstrap value only. Once the OAuth callback has
+  run, the rotating pair in `OAUTH_TOKEN_STORE_PATH` supersedes it and the env
+  value is never used again. It stays required so the service can boot before
+  first authorization, so a stale one is expected rather than a defect; keep it
+  an obvious placeholder so nobody debugs against it.
 - The comment that opens an AgentSession never becomes an activity on it. Its
   text arrives only in the `created` webhook payload, and a session whose
   `created` webhook was lost reports zero activities indefinitely. Reconciliation
