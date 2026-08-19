@@ -653,6 +653,37 @@ describe("LinearAgentClient reconciliation reads", () => {
     expect(third.variables.after).toBe("activities-page-3");
   });
 
+  it("declares the activity lookback with the scalar Linear's filter expects", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-scalar",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await client.listAgentSessionActivities("session-scalar", {
+      lookbackAfter: "2026-08-11T12:00:00.000Z",
+    });
+
+    // Linear's createdAt comparator takes DateTimeOrDuration. Declaring
+    // DateTime! is accepted by every mock and rejected by the real API with a
+    // 400, which silently disables reconciliation in production.
+    const sent = JSON.parse(fetchFn.mock.calls[0]?.[1]?.body as string) as {
+      query: string;
+    };
+    expect(sent.query).toContain("$lookbackAfter: DateTimeOrDuration!");
+    expect(sent.query).not.toContain("$lookbackAfter: DateTime!");
+  });
+
   it("retains a same-millisecond activity whose id sorts below the watermark", async () => {
     const fetchFn = vi.fn().mockResolvedValueOnce(
       jsonResponse({
