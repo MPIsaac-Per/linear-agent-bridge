@@ -32,7 +32,9 @@ const AGENT_SESSION_ACTIVITIES_QUERY = `
     $sessionId: String!
     $first: Int!
     $after: String
-    $lookbackAfter: DateTime!
+    # Linear's createdAt comparator takes DateTimeOrDuration, not DateTime.
+    # Declaring DateTime! makes the server reject the whole query with a 400.
+    $lookbackAfter: DateTimeOrDuration!
   ) {
     agentSession(id: $sessionId) {
       id
