@@ -300,3 +300,22 @@ describe("SHUTDOWN_TIMEOUT_MS", () => {
     ).toThrow(/SHUTDOWN_TIMEOUT_MS/);
   });
 });
+
+describe("RECONCILE_LOOKBACK_MS against durable state retention", () => {
+  it("accepts a lookback at the retention boundary", () => {
+    const sevenDays = String(7 * 24 * 60 * 60 * 1000);
+
+    expect(
+      loadConfig({ ...validEnv, RECONCILE_LOOKBACK_MS: sevenDays })
+        .reconcileLookbackMs,
+    ).toBe(Number(sevenDays));
+  });
+
+  it("rejects a lookback longer than retention, which would age out the claim recovery deduplicates against", () => {
+    const eightDays = String(8 * 24 * 60 * 60 * 1000);
+
+    expect(() =>
+      loadConfig({ ...validEnv, RECONCILE_LOOKBACK_MS: eightDays }),
+    ).toThrow(/RECONCILE_LOOKBACK_MS.*retention/);
+  });
+});

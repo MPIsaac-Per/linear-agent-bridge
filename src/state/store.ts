@@ -173,6 +173,12 @@ export interface BridgeStateStore {
   ): Promise<RecoverableIngressEvent[]>;
   getOrCreateActivityId(executionId: string, activityKey: string): Promise<string>;
   supersedeEvent(webhookId: string, supersededByWebhookId: string): Promise<void>;
+  /**
+   * Stamp the watching-since marker if it is unset and return it either way.
+   * Idempotent: a restart never re-stamps, so sessions created before this
+   * bridge ever ran stay history for the life of the state file.
+   */
+  ensureWatchingSince(): Promise<string>;
   listKnownSessionIds(): Promise<string[]>;
   getReconciliationState(
     linearSessionId: string,
@@ -208,6 +214,14 @@ interface PersistedSessionReconciliationState extends SessionReconciliationState
 
 interface PersistedBridgeState {
   version: 1;
+  /**
+   * When this bridge first started watching, written once and never rewritten.
+   *
+   * Without it, a session whose opening webhook was lost is indistinguishable
+   * from one that simply predates the bridge, and reconciliation has to treat
+   * both as history. See MPI-1463.
+   */
+  watchingSince?: string | undefined;
   receipts: Record<string, IngressReceipt>;
   claims: Record<string, IngressClaim>;
   nextRecoverySequence?: number | undefined;
@@ -1068,6 +1082,22 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       result: "dispatch_started",
       disposition: "claimed",
     };
+  }
+
+  async ensureWatchingSince(): Promise<string> {
+    const existing = (await this.readState()).watchingSince;
+    if (existing !== undefined) {
+      return existing;
+    }
+    return this.mutate(async () => {
+      const state = await this.readState();
+      // Re-read under the lock: a concurrent run may have stamped it.
+      if (state.watchingSince === undefined) {
+        state.watchingSince = this.timestamp();
+        await this.writeState(state);
+      }
+      return state.watchingSince;
+    });
   }
 
   async listKnownSessionIds(): Promise<string[]> {

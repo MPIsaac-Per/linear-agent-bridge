@@ -42,6 +42,15 @@ refreshes it after an authenticated request returns 401.
   runtime silence, not total wall-clock duration; raw runtime progress resets
   the watchdog without rendering in Linear. A runtime `done` event ends the
   turn immediately and never resets the watchdog.
+- Reconciliation's first sighting of a session dispatches nothing, because
+  everything already in Linear predates the bridge knowing about it. The one
+  exception is a session Linear created after the durable `watchingSince`
+  marker, inside `RECONCILE_LOOKBACK_MS`, older than `AGENT_SESSION_ACK_GRACE_MS`,
+  and carrying no `created:<sessionId>` claim: that is a lost `created`
+  webhook, and its opening prompt is dispatched through the normal path. The
+  grace period is what stops recovery racing a webhook still in flight, and the
+  claim check is required because the two paths key their claims differently.
+  `watchingSince` is written once and never rewritten.
 - Every state mutation is owed one lock acquire attempt, including the owner
   probe that reclaims an abandoned lock, even when its budget is already spent.
   Directory sync and the owner write can consume a small budget on a loaded

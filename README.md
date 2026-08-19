@@ -421,6 +421,29 @@ workspace steers an unattended agent session running with permissions
 bypassed in `KB_PATH`. Use it in workspaces you trust, and scope `KB_PATH`
 deliberately.
 
+### Recovering a message that never arrived
+
+Reconciliation recovers a lost `prompted` webhook: the session already exists,
+the bridge has a watermark for it, and the missing prompt is dispatched once.
+
+The message that opens a session is different. On first sighting of a session,
+reconciliation deliberately dispatches nothing, because everything already in
+Linear predates the bridge knowing that session exists. Replaying it would turn
+an entire issue history into fresh turns.
+
+To tell a lost opening from ordinary history, the bridge records `watchingSince`
+once, the first time it reconciles. A session Linear created after that marker,
+which the bridge never claimed, is missed work rather than history, and its
+opening prompt is dispatched. Three bounds apply: the session must be inside
+`RECONCILE_LOOKBACK_MS`, so a long outage cannot replay a flood; it must be
+older than `AGENT_SESSION_ACK_GRACE_MS`, so a webhook still in flight is not
+raced; and it must carry no claim on `created:<sessionId>`, which is how a
+delivered opening is recognised.
+
+Sessions created before the marker stay history forever, including everything
+that predates your first upgrade to a version with this behaviour. `watchingSince`
+is never rewritten, so a restart does not make old sessions suddenly eligible.
+
 ### Confining what the agent can write
 
 A webhook-driven agent cannot answer a permission prompt, so unattended runs

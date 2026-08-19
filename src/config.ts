@@ -1,6 +1,7 @@
 import { accessSync, constants, mkdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { parseCanonicalRecoveryKey } from "./state/recovery-envelope.js";
+import { DEFAULT_RECEIPT_RETENTION_MS } from "./state/store.js";
 
 export interface Config {
   linearClientId: string;
@@ -175,6 +176,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
 
   const agentOutputPathRaw = env.AGENT_OUTPUT_PATH;
+  const reconcileLookbackMs = positiveInteger(
+    env.RECONCILE_LOOKBACK_MS ?? DEFAULT_RECONCILE_LOOKBACK_MS,
+    "RECONCILE_LOOKBACK_MS",
+  );
+  // Recovering a lost created webhook depends on the created claim still being
+  // there to deduplicate against. Retention shorter than the reconcile window
+  // would let that claim age out first, and recovery would then re-run an
+  // opening prompt that already ran.
+  if (reconcileLookbackMs > DEFAULT_RECEIPT_RETENTION_MS) {
+    throw new Error(
+      `Invalid RECONCILE_LOOKBACK_MS "${reconcileLookbackMs}": must not exceed durable state retention of ${DEFAULT_RECEIPT_RETENTION_MS}ms`,
+    );
+  }
+
   const shutdownTimeoutMs = positiveInteger(
     env.SHUTDOWN_TIMEOUT_MS ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
     "SHUTDOWN_TIMEOUT_MS",
@@ -207,10 +222,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       env.RECONCILE_INTERVAL_MS ?? DEFAULT_RECONCILE_INTERVAL_MS,
       "RECONCILE_INTERVAL_MS",
     ),
-    reconcileLookbackMs: positiveInteger(
-      env.RECONCILE_LOOKBACK_MS ?? DEFAULT_RECONCILE_LOOKBACK_MS,
-      "RECONCILE_LOOKBACK_MS",
-    ),
+    reconcileLookbackMs,
     reconcileMaxSessions: integerInRange(
       env.RECONCILE_MAX_SESSIONS ?? DEFAULT_RECONCILE_MAX_SESSIONS,
       "RECONCILE_MAX_SESSIONS",

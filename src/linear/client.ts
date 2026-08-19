@@ -38,6 +38,7 @@ const AGENT_SESSION_ACTIVITIES_QUERY = `
   ) {
     agentSession(id: $sessionId) {
       id
+      createdAt
       appUser { id }
       issue { identifier }
       activities(
@@ -105,6 +106,12 @@ export interface ReconciledAgentActivity extends ReconciliationCursor {
 
 export interface LinearAgentSessionActivities {
   id: string;
+  /**
+   * When Linear created the session. Compared against the durable watchingSince
+   * marker to tell a session the bridge simply never saw from one whose opening
+   * webhook was lost while it was running.
+   */
+  createdAt: string;
   appUserId: string;
   issueIdentifier?: string | undefined;
   activities: ReconciledAgentActivity[];
@@ -350,6 +357,8 @@ export class LinearAgentClient {
       );
       if (
         typeof rawSession?.id !== "string" ||
+        typeof rawSession.createdAt !== "string" ||
+        !Number.isFinite(Date.parse(rawSession.createdAt)) ||
         typeof appUser?.id !== "string" ||
         !Array.isArray(nodes)
       ) {
@@ -358,6 +367,7 @@ export class LinearAgentClient {
       const issueIdentifier = asRecord(rawSession.issue)?.identifier;
       session = {
         id: rawSession.id,
+        createdAt: rawSession.createdAt,
         appUserId: appUser.id,
         ...(typeof issueIdentifier === "string" ? { issueIdentifier } : {}),
       };
