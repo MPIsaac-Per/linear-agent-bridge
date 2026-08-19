@@ -241,22 +241,52 @@ reviewing the deduplication and activity IDs it contains.
 
 ### 4. Expose the webhook
 
-On macOS, `./deploy/install.sh` builds the service, installs a launchd
-user agent (so the SDK sees your Claude Code credentials), verifies
+`./deploy/install.sh` runs on macOS and Linux. It detects the platform and
+branches only where the service manager differs; the transaction around it is
+identical on both. It builds the service, installs it under launchd or systemd,
+verifies
 `http://127.0.0.1:<PORT>/healthz`, opens a Tailscale Funnel directly to that
 loopback listener, verifies the exact route in Funnel status JSON, and prints
 the canonical webhook URL to paste into the app config. It validates the
 complete application configuration before stopping an existing service. Health
 is polled for up to ten seconds after restart. A failed health check exits
-nonzero and restores the prior build and launchd files; the message reports
+nonzero and restores the prior build and service definition; the message reports
 whether the restored service answered its health probe. Before mutation it
 accepts only an empty public Funnel state or the single existing exact target;
 unrelated or ambiguous public routes are left untouched. It fails closed if
 local health, Funnel setup, or route discovery fails. `SKIP_FUNNEL=1` is an
-explicit local-only installation mode. It completes the build, launchd setup,
+explicit local-only installation mode. It completes the build, service setup,
 and loopback health check without discovering, inspecting, or changing
 Tailscale state. Secrets are loaded from `.env`, not passed in command
 arguments.
+
+The two platforms differ in three places, deliberately.
+
+**Where the service definition lives.** macOS renders a launchd user agent at
+`~/Library/LaunchAgents/com.linear-agent-bridge.plist`. Linux renders a systemd
+unit at `/etc/systemd/system/linear-agent-bridge.service`; override the
+directory with `SYSTEMD_UNIT_DIR`.
+
+**Which account runs it.** macOS runs the service as you, in your login session,
+so the Agent SDK finds your Claude Code credentials with no extra setup. Linux
+runs it as a dedicated system account, `linear-agent-bridge` by default and
+configurable with `SERVICE_USER`, created by the installer if absent. That
+account needs its own authenticated Claude Code login, and it is the boundary
+`AGENT_OUTPUT_PATH` relies on. macOS is the exception here on purpose: a
+dedicated account there means a system LaunchDaemon, sudo on every install, and
+a second login with no Keychain access, which buys little on a workstation.
+Because Linux manages a system account and a unit, the installer requires root
+there and says so rather than failing part-way.
+
+**Where the logs go.** macOS writes a combined log to
+`~/Library/Logs/linear-agent-bridge.log`. Linux writes to the journal; read it
+with `journalctl -u linear-agent-bridge`. Rollback messages name whichever
+applies.
+
+On Linux the installer also sets `.env` to 0640 owned by you with the service
+group, since the service account has to read it. That happens only after the
+configuration validates, so a failed install neither creates an account nor
+widens a secret.
 
 Set `WEBHOOK_URL` to the printed credential-free HTTPS URL, keep
 `LINEAR_WEBHOOK_SECRET` in the environment, and run

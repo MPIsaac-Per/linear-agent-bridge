@@ -55,7 +55,7 @@ Fill these fields before changing Linear:
 | Field | Required value |
 | --- | --- |
 | Public-edge owner | Named operator accountable for Funnel and DNS/TLS checks |
-| Serving host | Exact Mac hostname running both launchd and Funnel |
+| Serving host | Exact hostname running both the service and Funnel |
 | Canonical webhook URL | `https://<serving-host>.<tailnet>.ts.net/webhook` |
 | Previous webhook URL | Exact URL currently saved in the Linear app |
 | Rollback owner | Operator authorized to restore the previous URL |
@@ -74,9 +74,19 @@ the route it attempted to create. If cleanup also fails, it prints the exact
 
 ## Local service checks
 
+macOS:
+
 - launchd label: `com.linear-agent-bridge`
 - launchd plist: `~/Library/LaunchAgents/com.linear-agent-bridge.plist`
 - combined stdout/stderr log: `~/Library/Logs/linear-agent-bridge.log`
+- runs as the invoking user
+
+Linux:
+
+- systemd unit: `/etc/systemd/system/linear-agent-bridge.service`
+- status: `systemctl status linear-agent-bridge`
+- log: `journalctl -u linear-agent-bridge`
+- runs as the dedicated `linear-agent-bridge` account
 - listener: IPv4 loopback only, `127.0.0.1:<PORT>`
 - local liveness: `curl -q -fsS http://127.0.0.1:<PORT>/healthz`
 

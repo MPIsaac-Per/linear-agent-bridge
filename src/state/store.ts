@@ -1450,13 +1450,21 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         lockToken,
         guaranteedDeadline,
       );
-      let attempted = false;
+      // One attempt is owed, plus one more if that attempt reclaimed an
+      // abandoned lock: the reclaim exists to make an acquisition possible, and
+      // throwing it away wastes the probe. Two inside the guaranteed window,
+      // never more.
+      let guaranteedAttempts = 1;
+      let guaranteedRetryGranted = false;
       while (!acquired) {
-        if (attempted && Date.now() >= deadline) {
+        const withinGuarantee = guaranteedAttempts > 0;
+        if (!withinGuarantee && Date.now() >= deadline) {
           throw new BridgeStateLockTimeoutError();
         }
-        const attemptDeadline = attempted ? deadline : guaranteedDeadline;
-        attempted = true;
+        const attemptDeadline = withinGuarantee ? guaranteedDeadline : deadline;
+        if (withinGuarantee) {
+          guaranteedAttempts -= 1;
+        }
         try {
           await fs.rename(candidatePath, lockPath);
           // Winning the rename means the lock is held. Discarding that work to
@@ -1471,7 +1479,25 @@ export class JsonBridgeStateStore implements BridgeStateStore {
             throw error;
           }
           await this.removeAbandonedLock(lockPath, attemptDeadline);
-          if (Date.now() >= deadline) {
+          // The extra attempt is earned only when the probe actually cleared
+          // the lock. A live owner is still holding it, so retrying inside the
+          // guarantee would burn the budget on a race that cannot be won.
+          if (withinGuarantee && !guaranteedRetryGranted) {
+            let reclaimed = false;
+            try {
+              await fs.stat(lockPath);
+            } catch (statError) {
+              if (!isNodeError(statError, "ENOENT")) {
+                throw statError;
+              }
+              reclaimed = true;
+            }
+            if (reclaimed) {
+              guaranteedRetryGranted = true;
+              guaranteedAttempts = 1;
+            }
+          }
+          if (Date.now() >= attemptDeadline) {
             throw new BridgeStateLockTimeoutError();
           }
           await delay(this.lockRetryMs);

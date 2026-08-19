@@ -7,6 +7,19 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Linux deployment. `deploy/install.sh` detects the platform and branches only
+  at the service-manager boundary, rendering a systemd unit from the new
+  `deploy/systemd.service.template` alongside the existing launchd plist. The
+  transaction is unchanged on both: configuration preflight before any service
+  mutation, previous build and service definition preserved and restored on
+  failure, bounded health polling, and the same Funnel preflight. On Linux the
+  service runs as a dedicated `linear-agent-bridge` account created by the
+  installer, logs to the journal, and requires root; macOS keeps the per-user
+  launchd agent. `deploy/install.test.sh` runs every case against both fakes,
+  rollback included.
+
 ### Fixed
 
 - Guarantee one lock acquire attempt per state mutation. The retry loop checked

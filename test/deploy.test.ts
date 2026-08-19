@@ -258,6 +258,9 @@ async function runInstaller(
     ...process.env,
     HOME: homeDirectory,
     TMPDIR: tempDirectory,
+    // This harness fakes launchctl, so it drives the macOS branch wherever it
+    // runs. deploy/install.test.sh is what covers both service managers.
+    INSTALL_PLATFORM: "macos",
     PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
     TAILSCALE_BIN: path.join(binDirectory, "tailscale"),
     FAKE_INSTALL_LOG: callsPath,

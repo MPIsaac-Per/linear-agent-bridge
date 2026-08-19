@@ -781,10 +781,10 @@ describe("JsonBridgeStateStore", () => {
       lockTimeoutMs: 50,
       lockRetryMs: 100,
     });
-    const removeLock = setTimeout(() => {
-      void fs.rm(lockPath, { recursive: true, force: true });
-    }, 60);
-
+    // The owner stays live for the whole run. Releasing it on a timer used to
+    // be harmless, but a probe landing after that timer now finds the lock
+    // genuinely free and correctly takes it, so the timer was racing the
+    // premise rather than supporting it. Cleanup happens in finally.
     try {
       await expect(store.claimEvent(event())).rejects.toThrow(
         /Timed out acquiring bridge state lock/,
@@ -792,7 +792,6 @@ describe("JsonBridgeStateStore", () => {
       await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
       await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      clearTimeout(removeLock);
       await fs.rm(lockPath, { recursive: true, force: true });
     }
   });
@@ -873,6 +872,51 @@ describe("JsonBridgeStateStore", () => {
       await expect(fs.stat(`${storePath}.lock`)).rejects.toMatchObject({
         code: "ENOENT",
       });
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("reclaims an abandoned lock and takes it when the budget is already spent", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    // An empty lock directory is what an owner that died between creating the
+    // lock and writing its owner file leaves behind. Nothing holds it. A plain
+    // rename would simply replace it, so the first attempt is forced to see the
+    // EEXIST a contended filesystem reports.
+    await fs.mkdir(lockPath, { mode: 0o700 });
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-reclaim",
+      lockTimeoutMs: 1_000,
+      lockRetryMs: 1,
+      ...TEST_LOCK_OPTIONS,
+    });
+    let renameAttempts = 0;
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi
+      .spyOn(fs, "rename")
+      .mockImplementation(async (from, to) => {
+        if (String(to) === lockPath) {
+          renameAttempts += 1;
+          if (renameAttempts === 1) {
+            throw Object.assign(new Error("lock directory exists"), {
+              code: "EEXIST",
+            });
+          }
+        }
+        await originalRename(from, to);
+      });
+
+    try {
+      // Clearing the stale lock and then giving up would leave this caller
+      // exactly as failed as before, having done the work that makes success
+      // possible for somebody else.
+      await expect(
+        withFileLock(store, async () => "mutated", Date.now() - 1),
+      ).resolves.toBe("mutated");
+      // The attempt that found the stale lock, then the one its reclaim earned.
+      expect(renameAttempts).toBe(2);
+      await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       renameSpy.mockRestore();
     }
