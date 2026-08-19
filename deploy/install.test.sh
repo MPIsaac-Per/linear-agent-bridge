@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SOURCE_INSTALL="$SCRIPT_DIR/install.sh"
 SOURCE_PLIST="$SCRIPT_DIR/launchd.plist.template"
+SOURCE_UNIT="$SCRIPT_DIR/systemd.service.template"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/linear-agent-bridge-install.XXXXXX")
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -17,7 +18,9 @@ fail() {
 assert_contains() {
 	local haystack=$1
 	local needle=$2
-	[[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle"
+	[[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle
+Actual output was:
+$haystack"
 }
 
 assert_not_contains() {
@@ -39,11 +42,14 @@ file_mode() {
 
 make_fixture() {
 	local name=$1
-	local fixture="$TEST_ROOT/$name"
-	mkdir -p "$fixture/repo/deploy" "$fixture/repo/dist" "$fixture/home" "$fixture/bin"
+	local platform=${2:-macos}
+	local fixture="$TEST_ROOT/$name-$platform"
+	mkdir -p "$fixture/repo/deploy" "$fixture/repo/dist" "$fixture/home" "$fixture/bin" "$fixture/units"
 	cp "$SOURCE_INSTALL" "$fixture/repo/deploy/install.sh"
 	cp "$SOURCE_PLIST" "$fixture/repo/deploy/launchd.plist.template"
+	cp "$SOURCE_UNIT" "$fixture/repo/deploy/systemd.service.template"
 	chmod +x "$fixture/repo/deploy/install.sh"
+	printf '%s' "$platform" > "$fixture/platform"
 	echo "old-dist" > "$fixture/repo/dist/version.txt"
 
 	cat > "$fixture/bin/npm" <<'EOF'
@@ -84,8 +90,50 @@ EOF
 	cat > "$fixture/bin/launchctl" <<'EOF'
 #!/bin/bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$INSTALL_TEST_LAUNCHCTL_LOG"
+printf '%s\n' "$*" >> "$INSTALL_TEST_SERVICE_LOG"
 EOF
+	cat > "$fixture/bin/systemctl" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$INSTALL_TEST_SERVICE_LOG"
+EOF
+	if [ "$platform" = linux ]; then
+	# The Linux path manages a system account and a unit, so it insists on root.
+	# The fixture supplies that rather than the installer offering a bypass:
+	# a privilege check with a test-only escape hatch is not a privilege check.
+	cat > "$fixture/bin/id" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+case "${1:-}" in
+	-u)
+		if [ -n "${2:-}" ]; then exit 1; fi
+		printf '0\n'
+		;;
+	-un)
+		printf 'root\n'
+		;;
+	*)
+		exit 1
+		;;
+esac
+EOF
+	cat > "$fixture/bin/getent" <<'EOF'
+#!/bin/bash
+exit 2
+EOF
+	cat > "$fixture/bin/groupadd" <<'EOF'
+#!/bin/bash
+printf 'groupadd %s\n' "$*" >> "$INSTALL_TEST_SERVICE_LOG"
+EOF
+	cat > "$fixture/bin/useradd" <<'EOF'
+#!/bin/bash
+printf 'useradd %s\n' "$*" >> "$INSTALL_TEST_SERVICE_LOG"
+EOF
+	cat > "$fixture/bin/chgrp" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+	fi
 	cat > "$fixture/bin/curl" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -125,28 +173,32 @@ EOF
 	cat > "$fixture/bin/stat" <<'EOF'
 #!/bin/bash
 set -euo pipefail
-if [ "$#" -ne 3 ] || [ "$1" != "-f" ]; then
-	echo "fixture stat supports only the macOS stat -f interface" >&2
+if [ "$#" -ne 3 ]; then
+	echo "fixture stat expects a format flag, a format and a path" >&2
 	exit 64
 fi
-if value=$(/usr/bin/stat -f "$2" "$3" 2>/dev/null); then
+case "$1" in
+	-c | -f) ;;
+	*)
+		echo "fixture stat supports only -c and -f" >&2
+		exit 64
+		;;
+esac
+if value=$(/usr/bin/stat "$1" "$2" "$3" 2>/dev/null); then
 	printf '%s\n' "$value"
-elif [ "$2" = '%u' ]; then
-	/usr/bin/stat -c '%u' "$3"
-elif [ "$2" = '%Lp' ]; then
-	/usr/bin/stat -c '%a' "$3"
-else
-	echo "unsupported fixture stat format" >&2
-	exit 64
+	exit 0
 fi
+# Translate between the two dialects so either host answers either question.
+case "$1$2" in
+	'-c%u' | '-f%u') /usr/bin/stat -c '%u' "$3" 2>/dev/null || /usr/bin/stat -f '%u' "$3" ;;
+	'-c%a' | '-f%Lp') /usr/bin/stat -c '%a' "$3" 2>/dev/null || /usr/bin/stat -f '%Lp' "$3" ;;
+	*)
+		echo "unsupported fixture stat format" >&2
+		exit 64
+		;;
+esac
 EOF
-	chmod +x \
-		"$fixture/bin/npm" \
-		"$fixture/bin/node" \
-		"$fixture/bin/launchctl" \
-		"$fixture/bin/curl" \
-		"$fixture/bin/sleep" \
-		"$fixture/bin/stat"
+	chmod +x "$fixture"/bin/*
 	printf '%s\n' "$fixture"
 }
 
@@ -167,21 +219,42 @@ EOF
 run_installer() {
 	local fixture=$1
 	shift
+	local platform
+	platform=$(cat "$fixture/platform")
 	(
 		cd "$fixture/repo"
 		HOME="$fixture/home" \
 		PATH="$fixture/bin:/usr/bin:/bin" \
-		INSTALL_TEST_LAUNCHCTL_LOG="$fixture/launchctl.log" \
+		INSTALL_TEST_SERVICE_LOG="$fixture/service.log" \
 		INSTALL_TEST_CURL_COUNT="$fixture/curl.count" \
+		INSTALL_PLATFORM="$platform" \
+		SYSTEMD_UNIT_DIR="$fixture/units" \
 		SKIP_FUNNEL=1 \
 		"$@" \
 		./deploy/install.sh
 	)
 }
 
+# The service definition the platform's manager reads.
+service_definition_path() {
+	local fixture=$1
+	if [ "$(cat "$fixture/platform")" = macos ]; then
+		printf '%s' "$fixture/home/Library/LaunchAgents/com.linear-agent-bridge.plist"
+	else
+		printf '%s' "$fixture/units/linear-agent-bridge.service"
+	fi
+}
+
+# .env stays owner-only on macOS. On Linux the service account has to read it,
+# so the boundary moves to the service group.
+expected_env_mode() {
+	if [ "$(cat "$1/platform")" = macos ]; then printf '600'; else printf '640'; fi
+}
+
 test_invalid_key_fails_before_service_mutation() {
+	local platform=$1
 	local fixture output status
-	fixture=$(make_fixture invalid-key)
+	fixture=$(make_fixture invalid-key "$platform")
 	write_valid_env "$fixture/repo/.env"
 	sed -i.bak 's/^INGRESS_RECOVERY_KEY=.*/INGRESS_RECOVERY_KEY=too-short/' "$fixture/repo/.env"
 	rm "$fixture/repo/.env.bak"
@@ -194,13 +267,14 @@ test_invalid_key_fails_before_service_mutation() {
 
 	[ "$status" -ne 0 ] || fail "invalid recovery key install succeeded"
 	assert_contains "$output" "INGRESS_RECOVERY_KEY"
-	[ ! -s "$fixture/launchctl.log" ] || fail "invalid config mutated launchd"
+	[ ! -s "$fixture/service.log" ] || fail "invalid config mutated the service manager"
 	[ "$(cat "$fixture/repo/dist/version.txt")" = "old-dist" ] || fail "failed preflight did not restore the prior build"
 }
 
 test_missing_config_fails_before_service_mutation() {
+	local platform=$1
 	local fixture output status
-	fixture=$(make_fixture missing-config)
+	fixture=$(make_fixture missing-config "$platform")
 	write_valid_env "$fixture/repo/.env"
 	sed -i.bak '/^LINEAR_CLIENT_SECRET=/d' "$fixture/repo/.env"
 	rm "$fixture/repo/.env.bak"
@@ -213,12 +287,13 @@ test_missing_config_fails_before_service_mutation() {
 
 	[ "$status" -ne 0 ] || fail "missing required config install succeeded"
 	assert_contains "$output" "LINEAR_CLIENT_SECRET"
-	[ ! -s "$fixture/launchctl.log" ] || fail "missing config mutated launchd"
+	[ ! -s "$fixture/service.log" ] || fail "missing config mutated the service manager"
 }
 
 test_invalid_previous_key_fails_before_service_mutation() {
+	local platform=$1
 	local fixture output status
-	fixture=$(make_fixture invalid-previous-key)
+	fixture=$(make_fixture invalid-previous-key "$platform")
 	write_valid_env "$fixture/repo/.env"
 	sed -i.bak 's/^INGRESS_RECOVERY_PREVIOUS_KEYS=.*/INGRESS_RECOVERY_PREVIOUS_KEYS=too-short/' "$fixture/repo/.env"
 	rm "$fixture/repo/.env.bak"
@@ -231,19 +306,20 @@ test_invalid_previous_key_fails_before_service_mutation() {
 
 	[ "$status" -ne 0 ] || fail "invalid previous recovery key install succeeded"
 	assert_contains "$output" "INGRESS_RECOVERY_PREVIOUS_KEYS"
-	[ ! -s "$fixture/launchctl.log" ] || fail "invalid previous key mutated launchd"
+	[ ! -s "$fixture/service.log" ] || fail "invalid previous key mutated the service manager"
 }
 
 test_repairs_env_permissions_without_exposing_secrets() {
+	local platform=$1
 	local fixture output command_log
-	fixture=$(make_fixture safe-config)
+	fixture=$(make_fixture safe-config "$platform")
 	write_valid_env "$fixture/repo/.env"
 	chmod 644 "$fixture/repo/.env"
 
 	output=$(run_installer "$fixture" env INSTALL_TEST_HEALTH_MODE=healthy 2>&1)
-	command_log=$(cat "$fixture/launchctl.log")
+	command_log=$(cat "$fixture/service.log")
 
-	[ "$(file_mode "$fixture/repo/.env")" = "600" ] || fail ".env permissions were not repaired"
+	[ "$(file_mode "$fixture/repo/.env")" = "$(expected_env_mode "$fixture")" ] || fail ".env permissions were not repaired"
 	assert_not_contains "$output" "client-secret-value"
 	assert_not_contains "$output" "webhook-secret-value"
 	assert_not_contains "$output" "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -252,8 +328,9 @@ test_repairs_env_permissions_without_exposing_secrets() {
 }
 
 test_success_waits_for_bounded_health_check() {
+	local platform=$1
 	local fixture output
-	fixture=$(make_fixture delayed-health)
+	fixture=$(make_fixture delayed-health "$platform")
 	write_valid_env "$fixture/repo/.env"
 	sed -i.bak 's/^INGRESS_RECOVERY_PREVIOUS_KEYS=.*/INGRESS_RECOVERY_PREVIOUS_KEYS=/' "$fixture/repo/.env"
 	rm "$fixture/repo/.env.bak"
@@ -266,41 +343,55 @@ test_success_waits_for_bounded_health_check() {
 }
 
 test_failed_restart_rolls_back_working_service() {
+	local platform=$1
 	local fixture output status command_log poll_count
-	fixture=$(make_fixture rollback)
+	fixture=$(make_fixture rollback "$platform")
 	write_valid_env "$fixture/repo/.env"
 	chmod 600 "$fixture/repo/.env"
-	mkdir -p "$fixture/home/Library/LaunchAgents"
-	echo "old-plist" > "$fixture/home/Library/LaunchAgents/com.linear-agent-bridge.plist"
+	local definition
+	definition=$(service_definition_path "$fixture")
+	mkdir -p "$(dirname "$definition")"
+	echo "old-definition" > "$definition"
 
 	set +e
 	output=$(run_installer "$fixture" env INSTALL_TEST_HEALTH_MODE=prehealthy_then_down 2>&1)
 	status=$?
 	set -e
-	command_log=$(cat "$fixture/launchctl.log")
+	command_log=$(cat "$fixture/service.log")
 	poll_count=$(cat "$fixture/curl.count")
 
 	[ "$status" -ne 0 ] || fail "unhealthy install exited successfully"
 	[ "$poll_count" -le 12 ] || fail "health polling was not bounded"
 	[ "$(cat "$fixture/repo/dist/version.txt")" = "old-dist" ] || fail "rollback did not restore the prior build"
-	[ "$(cat "$fixture/home/Library/LaunchAgents/com.linear-agent-bridge.plist")" = "old-plist" ] || fail "rollback did not restore the prior plist"
-	assert_contains "$command_log" "bootout"
-	[ "$(grep -c '^bootstrap ' "$fixture/launchctl.log")" -eq 2 ] || fail "rollback did not bootstrap the prior service"
+	[ "$(cat "$definition")" = "old-definition" ] || fail "rollback did not restore the prior service definition"
+	if [ "$platform" = macos ]; then
+		assert_contains "$command_log" "bootout"
+		[ "$(grep -c '^bootstrap ' "$fixture/service.log")" -eq 2 ] || fail "rollback did not bootstrap the prior service"
+	else
+		assert_contains "$command_log" "stop"
+		# Once for the failed candidate, once restoring the previous definition.
+		[ "$(grep -c '^restart ' "$fixture/service.log")" -eq 2 ] || fail "rollback did not restart the prior service"
+	fi
 	assert_contains "$output" "was healthy before install"
 }
 
 run_test() {
 	local name=$1
-	"$name"
+	local platform=$2
+	"$name" "$platform"
 	PASS_COUNT=$((PASS_COUNT + 1))
-	echo "ok $PASS_COUNT - ${name#test_}"
+	echo "ok $PASS_COUNT - ${name#test_} [$platform]"
 }
 
-run_test test_invalid_key_fails_before_service_mutation
-run_test test_missing_config_fails_before_service_mutation
-run_test test_invalid_previous_key_fails_before_service_mutation
-run_test test_repairs_env_permissions_without_exposing_secrets
-run_test test_success_waits_for_bounded_health_check
-run_test test_failed_restart_rolls_back_working_service
+# The same cases against both fakes. Config preflight, health polling and
+# rollback are the transaction, and the transaction is what must not drift.
+for install_platform in macos linux; do
+	run_test test_invalid_key_fails_before_service_mutation "$install_platform"
+	run_test test_missing_config_fails_before_service_mutation "$install_platform"
+	run_test test_invalid_previous_key_fails_before_service_mutation "$install_platform"
+	run_test test_repairs_env_permissions_without_exposing_secrets "$install_platform"
+	run_test test_success_waits_for_bounded_health_check "$install_platform"
+	run_test test_failed_restart_rolls_back_working_service "$install_platform"
+done
 
 echo "$PASS_COUNT installer tests passed"

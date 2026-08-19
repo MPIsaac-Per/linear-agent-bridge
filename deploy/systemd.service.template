@@ -1,0 +1,30 @@
+[Unit]
+Description=Linear agent bridge
+Documentation=https://github.com/MPIsaac-Per/linear-agent-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Least privilege: the runtime is invoked with permissions bypassed, so the
+# account boundary is the only thing standing between a mistaken tool call and
+# the operator's files. See MPI-1460.
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__REPO_DIR__
+ExecStart=__REPO_DIR__/deploy/run.sh
+Restart=always
+RestartSec=5
+# Group-readable, never group-writable, so a shared-read group grants exactly
+# that and nothing more.
+UMask=0027
+# Durable state lives outside the repository, owned by the service account.
+StateDirectory=linear-agent-bridge
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# stdout and stderr go to the journal. Read them with:
+#   journalctl -u linear-agent-bridge
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
