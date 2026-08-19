@@ -464,6 +464,20 @@ surface to that directory, and it only conflicts if a human edits the same
 directory at the same time. A denied write is the agent's problem, not the
 service's. The bridge does not crash, does not retry, and reports a bounded
 error class.
+## Shutdown
+
+The service handles `SIGINT` and `SIGTERM` and calls `server.close()` exactly
+once. That path is what sets `closing`, aborts the shutdown and reconciliation
+controllers, clears the reconciliation timer, waits for the queue boundary, and
+lets in-flight dispatch markers settle. It is routine rather than exceptional:
+the installer stops and restarts the service on every run.
+
+`SHUTDOWN_TIMEOUT_MS` bounds the close, defaulting to 10000. Ten seconds sits
+inside launchd's 20-second `SIGKILL` window; systemd's default
+`TimeoutStopSec` is far longer, so the same value is safe there. When the
+deadline elapses the process logs a bounded diagnostic and exits 1 rather than
+hanging. A second signal during shutdown does not start a second close and does
+not shorten the deadline.
 
 ## Billing note
 
