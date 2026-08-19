@@ -109,6 +109,11 @@ export interface ReconciliationCursor {
 }
 
 export interface SessionReconciliationState {
+  /**
+   * When reconciliation first observed this session. Absent means it has never
+   * been reconciled, so nothing in the activity window can be called missed.
+   */
+  initializedAt?: string | undefined;
   processedThrough?: ReconciliationCursor | undefined;
   stopFence?: ReconciliationCursor | undefined;
 }
@@ -166,6 +171,10 @@ export interface BridgeStateStore {
   getReconciliationState(
     linearSessionId: string,
   ): Promise<SessionReconciliationState>;
+  initializeReconciliationSession(
+    linearSessionId: string,
+    seenThrough?: ReconciliationCursor,
+  ): Promise<void>;
   recordStopFence(
     linearSessionId: string,
     cursor: ReconciliationCursor,
@@ -1076,6 +1085,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       return {};
     }
     return {
+      ...(persisted.initializedAt !== undefined
+        ? { initializedAt: persisted.initializedAt }
+        : {}),
       ...(persisted.processedThrough !== undefined
         ? { processedThrough: { ...persisted.processedThrough } }
         : {}),
@@ -1090,6 +1102,43 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     cursor: ReconciliationCursor,
   ): Promise<void> {
     return this.updateReconciliationCursor(linearSessionId, "stopFence", cursor);
+  }
+
+  /**
+   * Record that reconciliation has now seen this session, adopting the newest
+   * observed activity as the watermark. Everything already in Linear predates
+   * the bridge's knowledge of the session and must never be dispatched as
+   * missed work. Idempotent: a session already initialized is left alone.
+   */
+  initializeReconciliationSession(
+    linearSessionId: string,
+    seenThrough?: ReconciliationCursor,
+  ): Promise<void> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    if (seenThrough !== undefined) {
+      validateReconciliationCursor(seenThrough);
+    }
+
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const sessions = (state.reconciliationSessions ??= {});
+      const timestamp = this.timestamp();
+      const session = (sessions[linearSessionId] ??= { updatedAt: timestamp });
+      if (session.initializedAt !== undefined) {
+        return;
+      }
+      session.initializedAt = timestamp;
+      if (
+        seenThrough !== undefined &&
+        (session.processedThrough === undefined ||
+          compareCursors(seenThrough, session.processedThrough) > 0)
+      ) {
+        session.processedThrough = { ...seenThrough };
+      }
+      session.updatedAt = timestamp;
+      this.pruneReconciliationSessions(state);
+      await this.writeState(state);
+    });
   }
 
   markActivityProcessed(

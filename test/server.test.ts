@@ -368,6 +368,24 @@ async function startTestServer(
   };
 }
 
+/**
+ * Reconciliation never dispatches on its first sighting of a session: it has
+ * no basis for calling anything already in Linear "missed". Tests that assert
+ * recovery must therefore state that the bridge was already watching.
+ */
+function watchingSessions(
+  ...linearSessionIds: string[]
+): (storePath: string) => Promise<void> {
+  return async (storePath: string): Promise<void> => {
+    const prior = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-already-watching",
+    });
+    for (const linearSessionId of linearSessionIds) {
+      await prior.initializeReconciliationSession(linearSessionId);
+    }
+  };
+}
+
 let activeHarness: Harness | undefined;
 
 afterEach(async () => {
@@ -3260,6 +3278,7 @@ describe("startServer", () => {
     );
 
     activeHarness = await startTestServer(firstRuntime, {
+      prepareBridgeState: watchingSessions("session-restart-stop"),
       tmpDir: sharedTmpDir,
       removeTmpDirOnClose: false,
       reconciliationFetchImpl: reconciliationFetch,
@@ -3309,6 +3328,147 @@ describe("startServer", () => {
       "utf8",
     );
     expect(persisted).not.toContain("continue the implementation");
+  });
+
+  it("adopts a watermark without dispatching on a session it has never reconciled", async () => {
+    const promptCreatedAt = new Date().toISOString();
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-cold-start",
+                  updatedAt: promptCreatedAt,
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-cold-start",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-history-a",
+                  createdAt: promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "old prompt that must never replay",
+                  },
+                },
+                {
+                  id: "prompt-history-b",
+                  createdAt: new Date(Date.parse(promptCreatedAt) + 1000).toISOString(),
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "newer old prompt that must never replay",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+    const harness = activeHarness;
+
+    // Let several scans run. A first sighting must never dispatch history.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(runtime.requests).toHaveLength(0);
+
+    // The watermark adopts the newest activity seen, so later scans have a
+    // cursor to skip past instead of rediscovering the same backlog.
+    const state = await harness.bridgeState.getReconciliationState(
+      "session-cold-start",
+    );
+    expect(state.initializedAt).toEqual(expect.any(String));
+    expect(state.processedThrough).toMatchObject({ id: "prompt-history-b" });
+  });
+
+  it("bounds the activity window with the configured lookback", async () => {
+    const queries: string[] = [];
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as {
+        query: string;
+        variables?: { lookbackAfter?: string };
+      };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-lookback",
+                  updatedAt: new Date().toISOString(),
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      if (request.variables?.lookbackAfter !== undefined) {
+        queries.push(request.variables.lookbackAfter);
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-lookback",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    const before = Date.now();
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileLookbackMs: 3_600_000 },
+    });
+
+    await waitFor(() => queries.length > 0);
+    // RECONCILE_LOOKBACK_MS used to gate only which sessions were scanned,
+    // while the activity window was a hardcoded seven days.
+    // `before` is sampled just ahead of the server's own clock read, so allow
+    // a small slack either side of the configured window.
+    const age = before - Date.parse(queries[0]!);
+    expect(Math.abs(age - 3_600_000)).toBeLessThan(60_000);
   });
 
   it("dispatches a missed prompt once across repeated scans and converges a later real webhook", async () => {
@@ -3363,6 +3523,7 @@ describe("startServer", () => {
       yield { kind: "done" } as RuntimeEvent;
     });
     activeHarness = await startTestServer(runtime, {
+      prepareBridgeState: watchingSessions("session-missed-once"),
       reconciliationFetchImpl: reconciliationFetch,
       configOverrides: { reconcileIntervalMs: 20 },
     });
@@ -3455,11 +3616,17 @@ describe("startServer", () => {
     });
     activeHarness = await startTestServer(runtime, {
       reconciliationFetchImpl: reconciliationFetch,
-      configOverrides: { reconcileIntervalMs: 600000 },
+      configOverrides: {
+        reconcileIntervalMs: 600000,
+        // This case is about stop-fence ordering, not the lookback window;
+        // its fixtures are older than the 24h default.
+        reconcileLookbackMs: 7 * 24 * 60 * 60 * 1000,
+      },
       prepareBridgeState: async (storePath) => {
         const prior = new JsonBridgeStateStore(storePath, {
           ownerId: "runtime-before-restart",
         });
+        await prior.initializeReconciliationSession("session-resume-after-stop");
         await prior.recordStopFence("session-resume-after-stop", {
           id: "stop-before-resume",
           createdAt: stopCreatedAt,
@@ -3835,6 +4002,7 @@ describe("startServer", () => {
 
     try {
       activeHarness = await startTestServer(runtime, {
+        prepareBridgeState: watchingSessions("session-shutdown-mutation"),
         reconciliationFetchImpl: reconciliationFetch,
         linearFetchImpl: () =>
           (async (_url: RequestInfo | URL, init?: RequestInit) => {
@@ -3878,11 +4046,13 @@ describe("startServer", () => {
       await expect(
         harness.bridgeState.getReceipt("reconcile:prompt-shutdown-mutation"),
       ).resolves.toMatchObject({ status: "claimed" });
+      // The point is that a shutdown-aborted dispatch does not move the
+      // checkpoint. The session also carries an initialization marker.
       await expect(
         harness.bridgeState.getReconciliationState(
           "session-shutdown-mutation",
         ),
-      ).resolves.toEqual({});
+      ).resolves.not.toHaveProperty("processedThrough");
       const logged = errorSpy.mock.calls.flat().join("\n");
       expect(logged).not.toContain("reconciliation event failed");
       expect(logged).not.toContain("reconciliation failed");
@@ -4091,6 +4261,7 @@ describe("startServer", () => {
 
     try {
       activeHarness = await startTestServer(runtime, {
+        prepareBridgeState: watchingSessions("session-recovered-failure"),
         reconciliationFetchImpl: reconciliationFetch,
         linearFetchImpl: () =>
           (async () =>
@@ -4189,6 +4360,7 @@ describe("startServer", () => {
     });
     try {
       activeHarness = await startTestServer(runtime, {
+        prepareBridgeState: watchingSessions("session-claimed", "session-stalled"),
         reconciliationFetchImpl: reconciliationFetch,
         configOverrides: {
           reconcileIntervalMs: 600000,
@@ -4264,6 +4436,7 @@ describe("startServer", () => {
             ownerId: "runtime-before-restart",
             now: () => now - 60_000,
           });
+          await prior.initializeReconciliationSession("session-resume-after-stop");
           await prior.claimEvent({
             webhookId: "reconcile:prompt-claimed",
             executionId: "prompt-claimed",
