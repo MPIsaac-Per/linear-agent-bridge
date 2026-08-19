@@ -42,6 +42,14 @@ refreshes it after an authenticated request returns 401.
   runtime silence, not total wall-clock duration; raw runtime progress resets
   the watchdog without rendering in Linear. A runtime `done` event ends the
   turn immediately and never resets the watchdog.
+- Every state mutation is owed one lock acquire attempt, including the owner
+  probe that reclaims an abandoned lock, even when its budget is already spent.
+  Directory sync and the owner write can consume a small budget on a loaded
+  host; refusing to try there fails a mutation that would have succeeded and
+  leaves a stale lock in place. That attempt has its own bounded floor rather
+  than the caller's timeout, and winning the rename always runs the operation:
+  discarding a held lock to honour an expired deadline helps no other caller.
+  Later retries check the deadline as before.
 - Linear OAuth access tokens expire after 24 hours. Persist both replacement
   tokens atomically after every authorization and refresh. Never log either
   token.

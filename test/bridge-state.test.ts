@@ -86,6 +86,24 @@ async function writeLockOwner(
   );
 }
 
+// Drives the private lock acquisition directly so a test can hand it a deadline
+// that has already passed, which is what a loaded host produces once directory
+// sync and the owner write have eaten the caller's whole budget.
+function withFileLock<T>(
+  store: JsonBridgeStateStore,
+  operation: () => Promise<T>,
+  deadline: number,
+): Promise<T> {
+  return (
+    store as unknown as {
+      withFileLock: (
+        operation: () => Promise<T>,
+        deadline: number,
+      ) => Promise<T>;
+    }
+  ).withFileLock(operation, deadline);
+}
+
 type LockProcessIdentity = NonNullable<
   JsonBridgeStateStoreOptions["lockProcessIdentity"]
 >;
@@ -337,7 +355,10 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.claimEvent(event())).rejects.toThrow(
       /Timed out acquiring bridge state lock/,
     );
-    expect(Date.now() - startedAt).toBeLessThan(200);
+    // A stall reached inside the guaranteed attempt is bounded by the attempt
+    // floor, not by this store's lock budget, so the ceiling here is the floor
+    // plus room for a loaded host rather than a multiple of lockTimeoutMs.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
     expect(await fs.readdir(tmpDir)).toEqual([]);
 
@@ -375,7 +396,10 @@ describe("JsonBridgeStateStore", () => {
     await expect(store.claimEvent(event())).rejects.toThrow(
       /Timed out acquiring bridge state lock/,
     );
-    expect(Date.now() - startedAt).toBeLessThan(200);
+    // A stall reached inside the guaranteed attempt is bounded by the attempt
+    // floor, not by this store's lock budget, so the ceiling here is the floor
+    // plus room for a loaded host rather than a multiple of lockTimeoutMs.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
     await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
     expect(await fs.readdir(tmpDir)).toEqual(["bridge-state.json.lock"]);
     expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
@@ -416,9 +440,12 @@ describe("JsonBridgeStateStore", () => {
       },
     });
 
-    await expect(store.claimEvent(event())).rejects.toThrow(
-      /Timed out acquiring bridge state lock/,
-    );
+    // The deadline is supplied directly so the first boot lookup is reached on
+    // any load. Going through a mutation would race the admission check, and
+    // losing that race skips the lookup this test is counting.
+    await expect(
+      withFileLock(store, async () => undefined, Date.now() + 40),
+    ).rejects.toThrow(/Timed out acquiring bridge state lock/);
     await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
 
@@ -690,17 +717,24 @@ describe("JsonBridgeStateStore", () => {
     }
   });
 
-  it("releases an acquired lock without mutating when rename completes after the deadline", async () => {
+  it("mutates and releases the lock when the winning rename lands after the deadline", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const lockPath = `${storePath}.lock`;
+    // Two separate numbers doing two separate jobs: the store budget is the
+    // room the guaranteed attempt gets for setup, and the deadline below is the
+    // one the rename has to overshoot. Keeping them apart stops host load from
+    // deciding the outcome.
+    const guaranteedBudgetMs = 1_000;
+    const remainingBudgetMs = 5;
+    const renameDurationMs = 50;
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-a",
-      lockTimeoutMs: 25,
+      lockTimeoutMs: guaranteedBudgetMs,
     });
     const originalRename = fs.rename.bind(fs);
     const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
       if (String(to) === lockPath) {
-        const blockedUntil = Date.now() + 40;
+        const blockedUntil = Date.now() + renameDurationMs;
         while (Date.now() < blockedUntil) {
           // Model a filesystem rename that begins in time and completes too late.
         }
@@ -709,12 +743,113 @@ describe("JsonBridgeStateStore", () => {
     });
 
     try {
-      await expect(store.claimEvent(event())).rejects.toThrow(
-        /Timed out acquiring bridge state lock/,
-      );
-      await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
-      await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+      // Winning the rename means holding the lock. Throwing it away because the
+      // clock ran out would waste an acquisition no other caller could use, so
+      // the operation runs and the lock is released normally. The deadline is
+      // supplied directly rather than through a mutation, so the assertion
+      // rests on the rename duration alone and not on scheduling latency.
+      await expect(
+        withFileLock(
+          store,
+          async () => "mutated",
+          Date.now() + remainingBudgetMs,
+        ),
+      ).resolves.toBe("mutated");
       await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("completes the mutation when the budget is spent before the first acquire attempt", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-a",
+      // Sized so the guaranteed attempt has room to finish setup on a loaded
+      // host. What is under test is that the attempt happens at all; the
+      // already-spent budget is expressed by the deadline handed in below.
+      lockTimeoutMs: 1_000,
+      ...TEST_LOCK_OPTIONS,
+    });
+    let renameAttempts = 0;
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi
+      .spyOn(fs, "rename")
+      .mockImplementation(async (from, to) => {
+        if (String(to) === `${storePath}.lock`) {
+          renameAttempts += 1;
+        }
+        await originalRename(from, to);
+      });
+
+    try {
+      // A loaded host spends the whole budget on directory sync and the owner
+      // write, so the lock is first reached with nothing left. One attempt is
+      // still owed: the lock is free and this mutation would have succeeded.
+      await expect(
+        withFileLock(store, async () => "mutated", Date.now() - 1),
+      ).resolves.toBe("mutated");
+      expect(renameAttempts).toBe(1);
+      await expect(fs.stat(`${storePath}.lock`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("probes the lock owner once, then times out, when the budget is spent and the lock is held", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "live-owner-spent-budget";
+    await writeLockOwner(lockPath, token, {
+      pid: process.pid,
+      hostname: os.hostname(),
+      processIdentity: CURRENT_PROCESS_IDENTITY,
+      uid: TEST_UID,
+    });
+    const inspectedUidPids: number[] = [];
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-b",
+      lockTimeoutMs: 1_000,
+      lockRetryMs: 10,
+      lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async (pid) => {
+        inspectedUidPids.push(pid);
+        return TEST_UID;
+      },
+    });
+    let renameAttempts = 0;
+    let mutated = false;
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi
+      .spyOn(fs, "rename")
+      .mockImplementation(async (from, to) => {
+        if (String(to) === lockPath) {
+          renameAttempts += 1;
+        }
+        await originalRename(from, to);
+      });
+
+    try {
+      await expect(
+        withFileLock(
+          store,
+          async () => {
+            mutated = true;
+          },
+          Date.now() - 1,
+        ),
+      ).rejects.toThrow(/Timed out acquiring bridge state lock/);
+
+      // The owner probe is the part that reclaims an abandoned lock. Skipping
+      // it was why recovery never ran when the budget died during setup.
+      expect(inspectedUidPids).toEqual([process.pid]);
+      // Exactly one attempt: the guarantee does not turn into a retry loop.
+      expect(renameAttempts).toBe(1);
+      expect(mutated).toBe(false);
+      expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
     } finally {
       renameSpy.mockRestore();
     }

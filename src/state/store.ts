@@ -26,6 +26,12 @@ const MAX_ACTIVITY_KEY_LENGTH = 128;
 const MAX_ACTIVITY_IDS_PER_CLAIM = 10_000;
 const LOCK_RETRY_MS = 10;
 const LOCK_TIMEOUT_MS = 1_000;
+// Floor for the one acquire attempt every caller is owed. Deliberately not
+// derived from the caller's lock timeout: the whole reason the guarantee
+// exists is that a loaded host can burn a small budget on directory sync and
+// the owner write, so sizing the guarantee by that same small number would
+// starve it. Bounded well inside Linear's five-second delivery deadline.
+const GUARANTEED_LOCK_ATTEMPT_MS = 250;
 const MAX_PROCESS_IDENTITY_LENGTH = 512;
 const execFileAsync = promisify(execFile);
 const DARWIN_PROCESS_IDENTITY_HELPER = fileURLToPath(
@@ -1416,24 +1422,41 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   ): Promise<T> {
     const directory = path.dirname(this.statePath);
     const lockPath = `${this.statePath}.lock`;
-    await this.ensureDurableStateDirectory(directory, deadline);
+    // Setup plus one acquire attempt are owed even when the caller's budget is
+    // already spent. Directory sync and the owner write can consume all of it
+    // on a loaded host, and refusing to try then fails a mutation that would
+    // have succeeded while leaving an abandoned lock unreclaimed. The guarantee
+    // gets its own bounded floor, once, so overshoot stays capped and a
+    // genuinely stalled filesystem still times out.
+    const guaranteedDeadline = Math.max(
+      deadline,
+      Date.now() + GUARANTEED_LOCK_ATTEMPT_MS,
+    );
+    await this.ensureDurableStateDirectory(directory, guaranteedDeadline);
     const lockToken = randomUUID();
     const candidatePath = `${lockPath}.${lockToken}.candidate`;
     const candidateOwnerPath = path.join(candidatePath, `${lockToken}.json`);
     await fs.mkdir(candidatePath, { mode: 0o700 });
     let acquired = false;
     try {
-      await this.writeLockOwner(candidateOwnerPath, lockToken, deadline);
+      await this.writeLockOwner(
+        candidateOwnerPath,
+        lockToken,
+        guaranteedDeadline,
+      );
+      let attempted = false;
       while (!acquired) {
-        if (Date.now() >= deadline) {
+        if (attempted && Date.now() >= deadline) {
           throw new BridgeStateLockTimeoutError();
         }
+        const attemptDeadline = attempted ? deadline : guaranteedDeadline;
+        attempted = true;
         try {
           await fs.rename(candidatePath, lockPath);
+          // Winning the rename means the lock is held. Discarding that work to
+          // honour an expired deadline helps no other caller and is what turned
+          // a won race into a failed mutation.
           acquired = true;
-          if (Date.now() >= deadline) {
-            throw new BridgeStateLockTimeoutError();
-          }
         } catch (error) {
           if (
             !isNodeError(error, "EEXIST") &&
@@ -1441,7 +1464,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           ) {
             throw error;
           }
-          await this.removeAbandonedLock(lockPath, deadline);
+          await this.removeAbandonedLock(lockPath, attemptDeadline);
           if (Date.now() >= deadline) {
             throw new BridgeStateLockTimeoutError();
           }
