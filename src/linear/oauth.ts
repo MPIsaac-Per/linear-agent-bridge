@@ -72,8 +72,8 @@ export class LinearOAuthTokenManager {
     this.loaded = true;
   }
 
-  async getAccessToken(): Promise<string> {
-    await this.load();
+  async getAccessToken(signal?: AbortSignal): Promise<string> {
+    await waitForPromise(this.load(), signal);
     return this.accessToken;
   }
 
@@ -91,8 +91,11 @@ export class LinearOAuthTokenManager {
     await this.persist(tokens);
   }
 
-  async refreshAfterUnauthorized(failedAccessToken: string): Promise<string> {
-    await this.load();
+  async refreshAfterUnauthorized(
+    failedAccessToken: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    await waitForPromise(this.load(), signal);
 
     // Another caller may already have rotated the pair while this request was
     // in flight. Reuse that access token instead of consuming the new refresh
@@ -102,11 +105,14 @@ export class LinearOAuthTokenManager {
     }
 
     if (this.refreshPromise === undefined) {
+      // The shared refresh is intentionally not cancelled with an individual
+      // caller. Linear may already have consumed the rotating refresh token,
+      // so the replacement pair must still be installed and persisted.
       this.refreshPromise = this.refresh().finally(() => {
         this.refreshPromise = undefined;
       });
     }
-    return this.refreshPromise;
+    return await waitForPromise(this.refreshPromise, signal);
   }
 
   private async refresh(): Promise<string> {
@@ -151,6 +157,48 @@ export class LinearOAuthTokenManager {
       await fsPromises.rm(tempPath, { force: true });
     }
   }
+}
+
+function waitForPromise<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      complete();
+    };
+    const onAbort = (): void => {
+      finish(() => reject(abortReason(signal)));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+    if (signal.aborted) {
+      onAbort();
+    }
+  });
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) {
+    return signal.reason;
+  }
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 function parseTokenResponse(response: LinearOAuthTokenResponse): StoredOAuthTokens {

@@ -32,8 +32,10 @@ export type LinearAgentSessionEvent =
         id: string;
         createdAt?: string | undefined;
         body?: string | undefined;
-        content?: { type?: string; body?: string; signal?: string } | undefined;
-        signal?: string | undefined;
+        content?:
+          | { type?: string; body?: string; signal?: string | null }
+          | undefined;
+        signal?: string | null | undefined;
       };
     });
 

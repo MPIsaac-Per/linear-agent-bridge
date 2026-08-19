@@ -103,6 +103,16 @@ export interface IngressClaim {
   activityIds: Record<string, string>;
 }
 
+export interface ReconciliationCursor {
+  createdAt: string;
+  id: string;
+}
+
+export interface SessionReconciliationState {
+  processedThrough?: ReconciliationCursor | undefined;
+  stopFence?: ReconciliationCursor | undefined;
+}
+
 export type ClaimEventResult =
   | { disposition: "claimed"; receipt: IngressReceipt }
   | { disposition: "duplicate"; receipt: IngressReceipt }
@@ -131,6 +141,15 @@ export interface BridgeStateStore {
     recoveryPayload?: IngressRecoveryPayload,
     options?: { repairLegacyOnly?: boolean },
   ): Promise<ClaimEventResult>;
+  claimStopEvent(
+    identity: IngressEventIdentity,
+    cursor: ReconciliationCursor,
+    recoveryPayload?: IngressRecoveryPayload,
+  ): Promise<ClaimEventResult>;
+  beginEventDispatch(
+    webhookId: string,
+    cursor?: ReconciliationCursor,
+  ): Promise<DispatchStartDisposition>;
   markDispatchStarted(webhookId: string): Promise<DispatchStartDisposition>;
   releasePreDispatchClaim(webhookId: string): Promise<boolean>;
   completeEvent(webhookId: string): Promise<void>;
@@ -142,6 +161,34 @@ export interface BridgeStateStore {
     afterSequence?: number,
   ): Promise<RecoverableIngressEvent[]>;
   getOrCreateActivityId(executionId: string, activityKey: string): Promise<string>;
+  supersedeEvent(webhookId: string, supersededByWebhookId: string): Promise<void>;
+  listKnownSessionIds(): Promise<string[]>;
+  getReconciliationState(
+    linearSessionId: string,
+  ): Promise<SessionReconciliationState>;
+  recordStopFence(
+    linearSessionId: string,
+    cursor: ReconciliationCursor,
+  ): Promise<void>;
+  markActivityProcessed(
+    linearSessionId: string,
+    cursor: ReconciliationCursor,
+  ): Promise<void>;
+  claimStalledSessionWarning(
+    linearSessionId: string,
+    activityId: string,
+    minimumIntervalMs: number,
+  ): Promise<boolean>;
+}
+
+interface PersistedSessionReconciliationState extends SessionReconciliationState {
+  updatedAt: string;
+  stalledWarning?:
+    | {
+        activityId: string;
+        warnedAt: string;
+      }
+    | undefined;
 }
 
 interface PersistedBridgeState {
@@ -150,6 +197,9 @@ interface PersistedBridgeState {
   claims: Record<string, IngressClaim>;
   nextRecoverySequence?: number | undefined;
   recoveryStopFences?: Record<string, RecoveryStopFence> | undefined;
+  reconciliationSessions?:
+    | Record<string, PersistedSessionReconciliationState>
+    | undefined;
 }
 
 interface RecoveryStopFence {
@@ -324,182 +374,83 @@ export class JsonBridgeStateStore implements BridgeStateStore {
 
     return await this.mutateClaim(async () => {
       const state = await this.readState();
-      this.prune(state);
-      const existingReceipt = state.receipts[identity.webhookId];
-      if (
-        options.repairLegacyOnly === true &&
-        (existingReceipt === undefined ||
-          existingReceipt.recoveryEnvelope !== undefined ||
-          existingReceipt.recoverySequence !== undefined ||
-          existingReceipt.dispatchStartedAt !== undefined ||
-          (existingReceipt.status !== "received" &&
-            existingReceipt.status !== "claimed"))
-      ) {
-        throw new LegacyIngressRecoveryMismatchError();
-      }
-      if (existingReceipt !== undefined) {
-        assertSameIdentity(existingReceipt, identity);
-      } else {
-        const timestamp = this.timestamp();
-        let recovery: {
-          recoverySequence: number;
-          recoveryEnvelope: SealedIngressRecoveryEnvelope;
-        } | undefined;
-        if (recoveryPayload !== undefined) {
-          recovery = this.createRecoveryEnvelope(
-            state,
-            identity,
-            recoveryPayload,
-            true,
-          );
-          this.recordRecoveryStopFence(
-            state,
-            identity,
-            recoveryPayload,
-            recovery.recoverySequence,
-          );
-        }
-        state.receipts[identity.webhookId] = {
-          ...identity,
-          ...(recovery ?? {}),
-          status: "received",
-          receivedAt: timestamp,
-          updatedAt: timestamp,
-          outcome: {
-            httpStatus: 503,
-            result: "retry",
-            disposition: "received",
-            errorClass: "IngressPersistenceError",
-          },
-        };
-        await this.writeState(state);
-      }
-
-      const receipt = state.receipts[identity.webhookId]!;
-      if (
-        recoveryPayload !== undefined &&
-        receipt.recoveryEnvelope === undefined &&
-        (receipt.status === "received" ||
-          (receipt.status === "claimed" &&
-            receipt.dispatchStartedAt === undefined))
-      ) {
-        const recovery = this.createRecoveryEnvelope(
-          state,
-          identity,
-          recoveryPayload,
-          false,
-        );
-        Object.assign(receipt, recovery);
-        this.recordRecoveryStopFence(
-          state,
-          identity,
-          recoveryPayload,
-          recovery.recoverySequence,
-        );
-      }
-      if (existingReceipt !== undefined && receipt.status !== "received") {
-        return await this.resolveExistingReceipt(state, receipt);
-      }
-      const existingClaim = state.claims[identity.executionId];
-      const timestamp = this.timestamp();
-      if (existingClaim !== undefined) {
-        if (
-          existingClaim.status === "claimed" &&
-          existingClaim.ownerId !== this.ownerId &&
-          existingClaim.dispatchStartedAt === undefined
-        ) {
-          const priorReceipt = state.receipts[existingClaim.webhookId];
-          if (
-            priorReceipt !== undefined &&
-            priorReceipt.webhookId !== receipt.webhookId
-          ) {
-            priorReceipt.status = "superseded";
-            priorReceipt.supersededAt = timestamp;
-            priorReceipt.supersededByWebhookId = receipt.webhookId;
-            priorReceipt.updatedAt = timestamp;
-            clearRecoveryEnvelope(priorReceipt);
-            priorReceipt.outcome = {
-              httpStatus: 200,
-              result: "not_dispatched",
-              disposition: "superseded",
-            };
-          }
-
-          receipt.status = "claimed";
-          receipt.ownerId = this.ownerId;
-          receipt.claimedAt = timestamp;
-          receipt.updatedAt = timestamp;
-          receipt.outcome = acceptedOutcome();
-          existingClaim.webhookId = receipt.webhookId;
-          existingClaim.ownerId = this.ownerId;
-          existingClaim.claimedAt = timestamp;
-          existingClaim.updatedAt = timestamp;
-          delete existingClaim.dispatchStartedAt;
-          await this.writeState(state);
-          return { disposition: "claimed", receipt };
-        }
-
-        if (
-          existingClaim.status === "claimed" &&
-          existingClaim.ownerId !== this.ownerId &&
-          existingClaim.dispatchStartedAt !== undefined
-        ) {
-          receipt.status =
-            existingClaim.webhookId === identity.webhookId
-              ? "claimed"
-              : "superseded";
-          if (receipt.status === "superseded") {
-            receipt.supersededAt = timestamp;
-            receipt.supersededByWebhookId = existingClaim.webhookId;
-          }
-          receipt.updatedAt = timestamp;
-          clearRecoveryEnvelope(receipt);
-          receipt.outcome = ambiguousOutcome();
-          await this.writeState(state);
-          return { disposition: "ambiguous", receipt };
-        }
-
-        receipt.status = "superseded";
-        receipt.supersededAt = timestamp;
-        receipt.supersededByWebhookId = existingClaim.webhookId;
-        receipt.updatedAt = timestamp;
-        clearRecoveryEnvelope(receipt);
-        receipt.outcome = {
-          httpStatus: 200,
-          result: "not_dispatched",
-          disposition: "superseded",
-        };
-        this.prune(state);
-        await this.writeState(state);
-        return { disposition: "superseded", receipt };
-      }
-
-      receipt.status = "claimed";
-      receipt.ownerId = this.ownerId;
-      receipt.claimedAt = timestamp;
-      receipt.updatedAt = timestamp;
-      receipt.outcome = acceptedOutcome();
-      state.claims[identity.executionId] = {
-        executionId: identity.executionId,
-        webhookId: identity.webhookId,
-        linearSessionId: identity.linearSessionId,
-        action: identity.action,
-        status: "claimed",
-        ownerId: this.ownerId,
-        claimedAt: timestamp,
-        updatedAt: timestamp,
-        activityIds: {},
-      };
-      this.prune(state);
-      await this.writeState(state);
-      return { disposition: "claimed", receipt };
+      return await this.claimEventInState(
+        state,
+        identity,
+        recoveryPayload,
+        options,
+      );
     });
   }
 
-  markDispatchStarted(
+  async claimStopEvent(
+    identity: IngressEventIdentity,
+    cursor: ReconciliationCursor,
+    recoveryPayload?: IngressRecoveryPayload,
+  ): Promise<ClaimEventResult> {
+    validateIdentity(identity);
+    validateReconciliationCursor(cursor);
+    if (
+      identity.action !== "prompted" ||
+      identity.executionId !== cursor.id
+    ) {
+      throw new Error("A stop claim must use its activity id as executionId");
+    }
+
+    if (recoveryPayload !== undefined && this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+
+    return await this.mutateClaim(async () => {
+      const state = await this.readState();
+      const sessions = (state.reconciliationSessions ??= {});
+      const timestamp = this.timestamp();
+      const session = (sessions[identity.linearSessionId] ??= {
+        updatedAt: timestamp,
+      });
+      if (
+        session.stopFence !== undefined &&
+        compareCursors(cursor, session.stopFence) < 0
+      ) {
+        session.updatedAt = timestamp;
+        const claim = await this.claimEventInState(
+          state,
+          identity,
+          recoveryPayload,
+        );
+        if (claim.disposition !== "claimed") {
+          return claim;
+        }
+        this.supersedeOwnedActiveClaimInState(
+          state,
+          identity.webhookId,
+          `reconcile:${session.stopFence.id}`,
+        );
+        await this.writeState(state);
+        return {
+          disposition: "superseded",
+          receipt: state.receipts[identity.webhookId]!,
+        };
+      }
+      if (
+        session.stopFence === undefined ||
+        compareCursors(cursor, session.stopFence) > 0
+      ) {
+        session.stopFence = { ...cursor };
+        session.updatedAt = timestamp;
+      }
+      return await this.claimEventInState(state, identity, recoveryPayload);
+    });
+  }
+
+  beginEventDispatch(
     webhookId: string,
+    cursor?: ReconciliationCursor,
   ): Promise<DispatchStartDisposition> {
     validateIdentifier(webhookId, "webhookId");
+    if (cursor !== undefined) {
+      validateReconciliationCursor(cursor);
+    }
 
     return this.mutate(async () => {
       const state = await this.readState();
@@ -508,41 +459,233 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return "dispatch_started";
       }
-      const fence = state.recoveryStopFences?.[receipt.linearSessionId];
-      if (fence !== undefined && !isValidRecoveryStopFence(fence)) {
+      if (cursor !== undefined) {
+        if (receipt.action !== "prompted" || receipt.executionId !== cursor.id) {
+          throw new Error("A prompt dispatch cursor must identify its activity");
+        }
+      }
+      const recoveryFence = state.recoveryStopFences?.[receipt.linearSessionId];
+      if (recoveryFence !== undefined && !isValidRecoveryStopFence(recoveryFence)) {
         throw new IngressRecoveryEnvelopeError();
       }
       if (
-        fence !== undefined &&
-        fence.executionId !== receipt.executionId &&
-        this.receiptIsAtOrBeforeFence(receipt, fence)
+        recoveryFence !== undefined &&
+        recoveryFence.executionId !== receipt.executionId &&
+        this.receiptIsAtOrBeforeFence(receipt, recoveryFence)
       ) {
         this.supersedeOwnedActiveClaimInState(
           state,
           webhookId,
-          fence.webhookId,
+          recoveryFence.webhookId,
         );
         await this.writeState(state);
         this.locallyAcceptedPreDispatchClaims.delete(webhookId);
         return "superseded";
       }
-
-      const timestamp = this.timestamp();
-      claim.dispatchStartedAt = timestamp;
-      claim.updatedAt = timestamp;
-      receipt.dispatchStartedAt = timestamp;
-      receipt.updatedAt = timestamp;
-      delete receipt.recoverySequence;
-      delete receipt.recoveryEnvelope;
-      receipt.outcome = {
-        httpStatus: 200,
-        result: "dispatch_started",
-        disposition: "claimed",
-      };
+      if (cursor !== undefined) {
+        const fence = state.reconciliationSessions?.[receipt.linearSessionId]
+          ?.stopFence;
+        if (fence !== undefined && compareCursors(cursor, fence) <= 0) {
+          this.supersedeOwnedActiveClaimInState(
+            state,
+            webhookId,
+            `reconcile:${fence.id}`,
+          );
+          await this.writeState(state);
+          this.locallyAcceptedPreDispatchClaims.delete(webhookId);
+          return "superseded";
+        }
+      }
+      this.markDispatchStartedInState(claim, receipt);
       await this.writeState(state);
       this.locallyAcceptedPreDispatchClaims.delete(webhookId);
       return "dispatch_started";
     });
+  }
+
+  private async claimEventInState(
+    state: PersistedBridgeState,
+    identity: IngressEventIdentity,
+    recoveryPayload?: IngressRecoveryPayload,
+    options: { repairLegacyOnly?: boolean } = {},
+  ): Promise<ClaimEventResult> {
+    this.prune(state);
+    const existingReceipt = state.receipts[identity.webhookId];
+    if (
+      options.repairLegacyOnly === true &&
+      (existingReceipt === undefined ||
+        existingReceipt.recoveryEnvelope !== undefined ||
+        existingReceipt.recoverySequence !== undefined ||
+        existingReceipt.dispatchStartedAt !== undefined ||
+        (existingReceipt.status !== "received" &&
+          existingReceipt.status !== "claimed"))
+    ) {
+      throw new LegacyIngressRecoveryMismatchError();
+    }
+    if (existingReceipt !== undefined) {
+      assertSameIdentity(existingReceipt, identity);
+    } else {
+      const timestamp = this.timestamp();
+      let recovery:
+        | {
+            recoverySequence: number;
+            recoveryEnvelope: SealedIngressRecoveryEnvelope;
+          }
+        | undefined;
+      if (recoveryPayload !== undefined) {
+        recovery = this.createRecoveryEnvelope(
+          state,
+          identity,
+          recoveryPayload,
+          true,
+        );
+        this.recordRecoveryStopFence(
+          state,
+          identity,
+          recoveryPayload,
+          recovery.recoverySequence,
+        );
+      }
+      state.receipts[identity.webhookId] = {
+        ...identity,
+        ...(recovery ?? {}),
+        status: "received",
+        receivedAt: timestamp,
+        updatedAt: timestamp,
+        outcome: {
+          httpStatus: 503,
+          result: "retry",
+          disposition: "received",
+          errorClass: "IngressPersistenceError",
+        },
+      };
+      await this.writeState(state);
+    }
+
+    const receipt = state.receipts[identity.webhookId]!;
+    if (
+      recoveryPayload !== undefined &&
+      receipt.recoveryEnvelope === undefined &&
+      (receipt.status === "received" ||
+        (receipt.status === "claimed" &&
+          receipt.dispatchStartedAt === undefined))
+    ) {
+      const recovery = this.createRecoveryEnvelope(
+        state,
+        identity,
+        recoveryPayload,
+        false,
+      );
+      Object.assign(receipt, recovery);
+      this.recordRecoveryStopFence(
+        state,
+        identity,
+        recoveryPayload,
+        recovery.recoverySequence,
+      );
+    }
+    if (existingReceipt !== undefined && receipt.status !== "received") {
+      return await this.resolveExistingReceipt(state, receipt);
+    }
+    const existingClaim = state.claims[identity.executionId];
+    const timestamp = this.timestamp();
+    if (existingClaim !== undefined) {
+      if (
+        existingClaim.status === "claimed" &&
+        existingClaim.ownerId !== this.ownerId &&
+        existingClaim.dispatchStartedAt === undefined
+      ) {
+        const priorReceipt = state.receipts[existingClaim.webhookId];
+        if (
+          priorReceipt !== undefined &&
+          priorReceipt.webhookId !== receipt.webhookId
+        ) {
+          priorReceipt.status = "superseded";
+          priorReceipt.supersededAt = timestamp;
+          priorReceipt.supersededByWebhookId = receipt.webhookId;
+          priorReceipt.updatedAt = timestamp;
+          clearRecoveryEnvelope(priorReceipt);
+          priorReceipt.outcome = {
+            httpStatus: 200,
+            result: "not_dispatched",
+            disposition: "superseded",
+          };
+        }
+
+        receipt.status = "claimed";
+        receipt.ownerId = this.ownerId;
+        receipt.claimedAt = timestamp;
+        receipt.updatedAt = timestamp;
+        receipt.outcome = acceptedOutcome();
+        existingClaim.webhookId = receipt.webhookId;
+        existingClaim.ownerId = this.ownerId;
+        existingClaim.claimedAt = timestamp;
+        existingClaim.updatedAt = timestamp;
+        delete existingClaim.dispatchStartedAt;
+        await this.writeState(state);
+        return { disposition: "claimed", receipt };
+      }
+
+      if (
+        existingClaim.status === "claimed" &&
+        existingClaim.ownerId !== this.ownerId &&
+        existingClaim.dispatchStartedAt !== undefined
+      ) {
+        receipt.status =
+          existingClaim.webhookId === identity.webhookId
+            ? "claimed"
+            : "superseded";
+        if (receipt.status === "superseded") {
+          receipt.supersededAt = timestamp;
+          receipt.supersededByWebhookId = existingClaim.webhookId;
+        }
+        receipt.updatedAt = timestamp;
+        clearRecoveryEnvelope(receipt);
+        receipt.outcome = ambiguousOutcome();
+        await this.writeState(state);
+        return { disposition: "ambiguous", receipt };
+      }
+
+      receipt.status = "superseded";
+      receipt.supersededAt = timestamp;
+      receipt.supersededByWebhookId = existingClaim.webhookId;
+      receipt.updatedAt = timestamp;
+      clearRecoveryEnvelope(receipt);
+      receipt.outcome = {
+        httpStatus: 200,
+        result: "not_dispatched",
+        disposition: "superseded",
+      };
+      this.prune(state);
+      await this.writeState(state);
+      return { disposition: "superseded", receipt };
+    }
+
+    receipt.status = "claimed";
+    receipt.ownerId = this.ownerId;
+    receipt.claimedAt = timestamp;
+    receipt.updatedAt = timestamp;
+    receipt.outcome = acceptedOutcome();
+    state.claims[identity.executionId] = {
+      executionId: identity.executionId,
+      webhookId: identity.webhookId,
+      linearSessionId: identity.linearSessionId,
+      action: identity.action,
+      status: "claimed",
+      ownerId: this.ownerId,
+      claimedAt: timestamp,
+      updatedAt: timestamp,
+      activityIds: {},
+    };
+    this.prune(state);
+    await this.writeState(state);
+    return { disposition: "claimed", receipt };
+  }
+
+  markDispatchStarted(
+    webhookId: string,
+  ): Promise<DispatchStartDisposition> {
+    return this.beginEventDispatch(webhookId);
   }
 
   releasePreDispatchClaim(webhookId: string): Promise<boolean> {
@@ -870,6 +1013,148 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       claim.updatedAt = this.timestamp();
       await this.writeState(state);
       return activityId;
+    });
+  }
+
+  supersedeEvent(
+    webhookId: string,
+    supersededByWebhookId: string,
+  ): Promise<void> {
+    validateIdentifier(webhookId, "webhookId");
+    validateIdentifier(supersededByWebhookId, "supersededByWebhookId");
+
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const { claim, receipt } = this.ownedActiveClaim(state, webhookId);
+      if (claim.dispatchStartedAt !== undefined) {
+        throw new Error(`Dispatch already started for webhookId "${webhookId}"`);
+      }
+      this.supersedeOwnedActiveClaimInState(
+        state,
+        webhookId,
+        supersededByWebhookId,
+      );
+      await this.writeState(state);
+    });
+  }
+
+  private markDispatchStartedInState(
+    claim: IngressClaim,
+    receipt: IngressReceipt,
+  ): void {
+    const timestamp = this.timestamp();
+    claim.dispatchStartedAt = timestamp;
+    claim.updatedAt = timestamp;
+    receipt.dispatchStartedAt = timestamp;
+    receipt.updatedAt = timestamp;
+    clearRecoveryEnvelope(receipt);
+    receipt.outcome = {
+      httpStatus: 200,
+      result: "dispatch_started",
+      disposition: "claimed",
+    };
+  }
+
+  async listKnownSessionIds(): Promise<string[]> {
+    const state = await this.readState();
+    return [
+      ...new Set([
+        ...Object.values(state.claims).map((claim) => claim.linearSessionId),
+        ...Object.keys(state.reconciliationSessions ?? {}),
+      ]),
+    ].sort();
+  }
+
+  async getReconciliationState(
+    linearSessionId: string,
+  ): Promise<SessionReconciliationState> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    const persisted = (await this.readState()).reconciliationSessions?.[
+      linearSessionId
+    ];
+    if (persisted === undefined) {
+      return {};
+    }
+    return {
+      ...(persisted.processedThrough !== undefined
+        ? { processedThrough: { ...persisted.processedThrough } }
+        : {}),
+      ...(persisted.stopFence !== undefined
+        ? { stopFence: { ...persisted.stopFence } }
+        : {}),
+    };
+  }
+
+  recordStopFence(
+    linearSessionId: string,
+    cursor: ReconciliationCursor,
+  ): Promise<void> {
+    return this.updateReconciliationCursor(linearSessionId, "stopFence", cursor);
+  }
+
+  markActivityProcessed(
+    linearSessionId: string,
+    cursor: ReconciliationCursor,
+  ): Promise<void> {
+    return this.updateReconciliationCursor(
+      linearSessionId,
+      "processedThrough",
+      cursor,
+    );
+  }
+
+  claimStalledSessionWarning(
+    linearSessionId: string,
+    activityId: string,
+    minimumIntervalMs: number,
+  ): Promise<boolean> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    validateIdentifier(activityId, "activityId");
+    if (!Number.isInteger(minimumIntervalMs) || minimumIntervalMs <= 0) {
+      throw new Error("minimumIntervalMs must be a positive integer");
+    }
+
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const sessions = (state.reconciliationSessions ??= {});
+      const timestamp = this.timestamp();
+      const session = (sessions[linearSessionId] ??= { updatedAt: timestamp });
+      const previous = session.stalledWarning;
+      if (
+        previous !== undefined &&
+        this.now() - Date.parse(previous.warnedAt) < minimumIntervalMs
+      ) {
+        return false;
+      }
+      session.stalledWarning = { activityId, warnedAt: timestamp };
+      session.updatedAt = timestamp;
+      this.pruneReconciliationSessions(state);
+      await this.writeState(state);
+      return true;
+    });
+  }
+
+  private updateReconciliationCursor(
+    linearSessionId: string,
+    field: "processedThrough" | "stopFence",
+    cursor: ReconciliationCursor,
+  ): Promise<void> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    validateReconciliationCursor(cursor);
+
+    return this.mutate(async () => {
+      const state = await this.readState();
+      const sessions = (state.reconciliationSessions ??= {});
+      const timestamp = this.timestamp();
+      const session = (sessions[linearSessionId] ??= { updatedAt: timestamp });
+      const existing = session[field];
+      if (existing !== undefined && compareCursors(cursor, existing) <= 0) {
+        return;
+      }
+      session[field] = { ...cursor };
+      session.updatedAt = timestamp;
+      this.pruneReconciliationSessions(state);
+      await this.writeState(state);
     });
   }
 
@@ -1525,6 +1810,21 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (Object.keys(state.recoveryStopFences ?? {}).length === 0) {
       delete state.recoveryStopFences;
     }
+    this.pruneReconciliationSessions(state);
+  }
+
+  private pruneReconciliationSessions(state: PersistedBridgeState): void {
+    const sessions = state.reconciliationSessions;
+    if (sessions === undefined) {
+      return;
+    }
+    const ordered = Object.entries(sessions).sort(
+      ([, left], [, right]) => Date.parse(left.updatedAt) - Date.parse(right.updatedAt),
+    );
+    while (ordered.length > this.maxEntries) {
+      const [linearSessionId] = ordered.shift()!;
+      delete sessions[linearSessionId];
+    }
   }
 
   private timestamp(): string {
@@ -1533,7 +1833,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
 }
 
 function emptyState(): PersistedBridgeState {
-  return { version: 1, receipts: {}, claims: {} };
+  return { version: 1, receipts: {}, claims: {}, reconciliationSessions: {} };
 }
 
 function acceptedOutcome(): ReceiptOutcome {
@@ -1617,6 +1917,21 @@ function validateIdentity(identity: IngressEventIdentity): void {
   if (identity.action !== "created" && identity.action !== "prompted") {
     throw new Error(`Invalid action "${String(identity.action)}"`);
   }
+}
+
+function validateReconciliationCursor(cursor: ReconciliationCursor): void {
+  validateIdentifier(cursor.id, "activityId");
+  if (!Number.isFinite(Date.parse(cursor.createdAt))) {
+    throw new Error("createdAt must be an ISO-8601 timestamp");
+  }
+}
+
+export function compareCursors(
+  left: ReconciliationCursor,
+  right: ReconciliationCursor,
+): number {
+  const timeComparison = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+  return timeComparison === 0 ? left.id.localeCompare(right.id) : timeComparison;
 }
 
 function validateIdentifier(

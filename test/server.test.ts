@@ -44,6 +44,10 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     runInactivityTimeoutMs: 300000,
     ingressRecoveryKey: INGRESS_RECOVERY_KEY,
     ingressRecoveryPreviousKeys: [],
+    reconcileIntervalMs: 60000,
+    reconcileLookbackMs: 86400000,
+    reconcileMaxSessions: 250,
+    agentSessionAckGraceMs: 120000,
     ...overrides,
   };
 }
@@ -111,6 +115,7 @@ interface LinearCall {
 function fakeLinearFetch(calls: LinearCall[], activityIds: string[]): FetchFn {
   return (async (_url: RequestInfo | URL, init?: RequestInit) => {
     const parsed = JSON.parse(init?.body as string) as {
+      query: string;
       variables: {
         input: {
           id?: string;
@@ -120,6 +125,17 @@ function fakeLinearFetch(calls: LinearCall[], activityIds: string[]): FetchFn {
         };
       };
     };
+    if (parsed.query.includes("ReconciliationAgentSessions")) {
+      return jsonResponse({
+        data: {
+          viewer: { id: "app-user-test" },
+          agentSessions: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      });
+    }
     calls.push({
       agentSessionId: parsed.variables.input.agentSessionId,
       content: parsed.variables.input.content,
@@ -177,6 +193,7 @@ interface Harness {
   tokenFetch: ReturnType<typeof vi.fn>;
   oauthTokenStorePath: string;
   authorizationUrl: Promise<string>;
+  tmpDir: string;
 }
 
 async function startTestServer(
@@ -198,10 +215,51 @@ async function startTestServer(
     afterStart?: (server: ReturnType<typeof startServer>) => Promise<void>;
     linearUsesOAuth?: boolean;
     prepareOAuthTokenStore?: (storePath: string) => Promise<void>;
+    prepareOAuth?: (oauth: LinearOAuthTokenManager) => Promise<void>;
+    reconciliationFetchImpl?: FetchFn;
+    now?: () => number;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
   const activityIds: string[] = [];
+
+  const activityFetch =
+    options.linearFetchImpl?.(calls) ?? fakeLinearFetch(calls, activityIds);
+  const linearFetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const parsed = JSON.parse(init?.body as string) as { query?: string };
+    if (parsed.query?.includes("Reconciliation") === true) {
+      if (options.reconciliationFetchImpl !== undefined) {
+        return options.reconciliationFetchImpl(url, init);
+      }
+      if (parsed.query.includes("ReconciliationAgentSessionActivities")) {
+        const request = JSON.parse(init?.body as string) as {
+          variables: { sessionId: string };
+        };
+        return jsonResponse({
+          data: {
+            agentSession: {
+              id: request.variables.sessionId,
+              appUser: { id: "app-user-test" },
+              activities: {
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          viewer: { id: "app-user-test" },
+          agentSessions: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      });
+    }
+    return activityFetch(url, init);
+  }) as FetchFn;
 
   const tmpDir =
     options.tmpDir ??
@@ -246,9 +304,10 @@ async function startTestServer(
     storePath: oauthTokenStorePath,
     fetchFn: tokenFetch as unknown as FetchFn,
   });
+  await options.prepareOAuth?.(oauth);
   const linear = new LinearAgentClient(
     options.linearUsesOAuth === true ? oauth : "test-linear-token",
-    options.linearFetchImpl?.(calls) ?? fakeLinearFetch(calls, activityIds),
+    linearFetch,
   );
   const deps = {
     config: buildConfig({ port: 0, ...options.configOverrides }),
@@ -264,6 +323,7 @@ async function startTestServer(
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
       : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
   } as ServerDeps;
 
   const server = startServer(deps);
@@ -1186,14 +1246,14 @@ describe("startServer", () => {
         schedulePostResponseWork: (work) => pendingPostResponseWork.push(work),
       });
       harness = activeHarness;
-      const originalMark = harness.bridgeState.markDispatchStarted.bind(
+      const originalMark = harness.bridgeState.beginEventDispatch.bind(
         harness.bridgeState,
       );
-      vi.spyOn(harness.bridgeState, "markDispatchStarted").mockImplementation(
-        async (webhookId) => {
+      vi.spyOn(harness.bridgeState, "beginEventDispatch").mockImplementation(
+        async (webhookId, cursor) => {
           markerEntered.resolve();
           await releaseMarker.promise;
-          return await originalMark(webhookId);
+          return await originalMark(webhookId, cursor);
         },
       );
       const payload = {
@@ -1850,13 +1910,13 @@ describe("startServer", () => {
     try {
       activeHarness = await startTestServer(runtime);
       const harness = activeHarness;
-      const originalMarkDispatchStarted =
-        harness.bridgeState.markDispatchStarted.bind(harness.bridgeState);
+      const originalBeginEventDispatch =
+        harness.bridgeState.beginEventDispatch.bind(harness.bridgeState);
       const originalReleasePreDispatchClaim =
         harness.bridgeState.releasePreDispatchClaim.bind(harness.bridgeState);
       const markSpy = vi
-        .spyOn(harness.bridgeState, "markDispatchStarted")
-        .mockImplementation(originalMarkDispatchStarted);
+        .spyOn(harness.bridgeState, "beginEventDispatch")
+        .mockImplementation(originalBeginEventDispatch);
       const releaseSpy = vi
         .spyOn(harness.bridgeState, "releasePreDispatchClaim")
         .mockImplementation(originalReleasePreDispatchClaim);
@@ -2466,6 +2526,78 @@ describe("startServer", () => {
         agentActivity: { content: { type: "prompt", body: "hello" } },
         webhookTimestamp: Date.now(),
       },
+      {
+        webhookId: "webhook-missing-activity-created-at",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-missing-activity-created-at" },
+        agentActivity: {
+          id: "activity-missing-created-at",
+          content: { type: "prompt", body: "hello" },
+        },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-malformed-content",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-malformed-content" },
+        agentActivity: {
+          id: "activity-malformed-content",
+          createdAt: new Date().toISOString(),
+          content: "raw malformed content",
+        },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-malformed-content-body",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-malformed-content-body" },
+        agentActivity: {
+          id: "activity-malformed-content-body",
+          createdAt: new Date().toISOString(),
+          content: { type: "prompt", body: { raw: "secret" } },
+        },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-malformed-content-signal",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-malformed-content-signal" },
+        agentActivity: {
+          id: "activity-malformed-content-signal",
+          createdAt: new Date().toISOString(),
+          content: { type: "prompt", body: "hello", signal: false },
+        },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-malformed-body",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-malformed-body" },
+        agentActivity: {
+          id: "activity-malformed-body",
+          createdAt: new Date().toISOString(),
+          body: 42,
+        },
+        webhookTimestamp: Date.now(),
+      },
+      {
+        webhookId: "webhook-malformed-signal",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "agent-session-malformed-signal" },
+        agentActivity: {
+          id: "activity-malformed-signal",
+          createdAt: new Date().toISOString(),
+          body: "hello",
+          signal: { raw: "stop" },
+        },
+        webhookTimestamp: Date.now(),
+      },
     ];
 
     for (const payload of payloads) {
@@ -2610,6 +2742,7 @@ describe("startServer", () => {
       // Live payload shape (2026-08-12): text rides the content union.
       agentActivity: {
         id: "activity-prompted-2",
+        createdAt: new Date().toISOString(),
         content: { type: "prompt", body: "please continue" },
       },
       webhookTimestamp: Date.now(),
@@ -2639,6 +2772,44 @@ describe("startServer", () => {
     );
   });
 
+  it("accepts explicit null prompt signals from Linear as absent", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const payload = {
+      webhookId: "webhook-null-signals",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "agent-session-null-signals" },
+      agentActivity: {
+        id: "activity-null-signals",
+        createdAt: new Date().toISOString(),
+        signal: null,
+        content: { type: "prompt", body: "continue", signal: null },
+      },
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(body, WEBHOOK_SECRET),
+      },
+      body,
+    });
+
+    expect(response.status).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    expect(runtime.requests[0]).toMatchObject({
+      linearSessionId: "agent-session-null-signals",
+      prompt: "continue",
+    });
+  });
+
   it("never serializes a prompted activity or body into logs", async () => {
     const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
       yield { kind: "done" };
@@ -2655,6 +2826,7 @@ describe("startServer", () => {
         agentSession: { id: "agent-session-empty-prompt" },
         agentActivity: {
           id: "activity-empty-prompt",
+          createdAt: new Date().toISOString(),
           content: { type: "prompt", body: "" },
           privateMarker: "secret-activity-marker",
         },
@@ -2734,6 +2906,7 @@ describe("startServer", () => {
         agentSession: { id: "agent-session-stop" },
         agentActivity: {
           id: "activity-stop-prompted",
+          createdAt: new Date().toISOString(),
           content: { type: "prompt", body: "cancel this run", signal: "stop" },
         },
         webhookTimestamp: Date.now(),
@@ -2760,6 +2933,14 @@ describe("startServer", () => {
         (await harness.bridgeState.getReceipt("webhook-stop-prompted"))?.status ===
         "completed",
       );
+      await expect(
+        harness.bridgeState.getReconciliationState("agent-session-stop"),
+      ).resolves.toMatchObject({
+        stopFence: {
+          id: "activity-stop-prompted",
+          createdAt: stopPayload.agentActivity.createdAt,
+        },
+      });
     } finally {
       release.resolve();
     }
@@ -2808,6 +2989,7 @@ describe("startServer", () => {
       agentSession: { id: "agent-session-setup-race" },
       agentActivity: {
         id: "activity-setup-prompted",
+        createdAt: new Date().toISOString(),
         content: { type: "prompt", body: "continue the work" },
       },
       webhookTimestamp: Date.now(),
@@ -2822,6 +3004,12 @@ describe("startServer", () => {
       body: promptedBody,
     });
     await thoughtStarted.promise;
+    await expect(
+      harness.bridgeState.getReceipt("webhook-setup-prompted"),
+    ).resolves.toMatchObject({
+      status: "claimed",
+      dispatchStartedAt: expect.any(String),
+    });
 
     const stopPayload = {
       webhookId: "webhook-setup-stop",
@@ -2830,6 +3018,7 @@ describe("startServer", () => {
       agentSession: { id: "agent-session-setup-race" },
       agentActivity: {
         id: "activity-setup-stop",
+        createdAt: new Date(Date.now() + 1).toISOString(),
         content: { type: "prompt", body: "cancel this run", signal: "stop" },
       },
       webhookTimestamp: Date.now(),
@@ -2856,6 +3045,1194 @@ describe("startServer", () => {
       "completed",
     );
     expect(runtime.requests).toHaveLength(0);
+  });
+
+  it("a delayed stop older than the durable fence cannot abort newer resumed work", async () => {
+    const release = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      await release.promise;
+      yield { kind: "done" } as RuntimeEvent;
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, {
+            ownerId: "runtime-before-restart",
+          });
+          await prior.recordStopFence("session-stale-stop", {
+            id: "stop-newer-fence",
+            createdAt: "2026-08-18T12:02:00.000Z",
+          });
+        },
+      });
+      const harness = activeHarness;
+      const prompt = {
+        webhookId: "webhook-prompt-after-fence",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-stale-stop" },
+        agentActivity: {
+          id: "prompt-after-fence",
+          createdAt: "2026-08-18T12:03:00.000Z",
+          content: { type: "prompt", body: "resume newer work" },
+        },
+        webhookTimestamp: Date.now(),
+      };
+      const promptBody = JSON.stringify(prompt);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(promptBody, WEBHOOK_SECRET),
+            },
+            body: promptBody,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+
+      const staleStop = {
+        webhookId: "webhook-stale-stop",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-stale-stop" },
+        agentActivity: {
+          id: "stop-stale-delivery",
+          createdAt: "2026-08-18T12:01:00.000Z",
+          content: { type: "prompt", body: "stop", signal: "stop" },
+        },
+        webhookTimestamp: Date.now(),
+      };
+      const stopBody = JSON.stringify(staleStop);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+            },
+            body: stopBody,
+          })
+        ).status,
+      ).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(false);
+      expect(harness.calls).not.toContainEqual({
+        agentSessionId: "session-stale-stop",
+        content: { type: "response", body: "Stopped." },
+      });
+      await expect(
+        harness.bridgeState.getReceipt("webhook-stale-stop"),
+      ).resolves.toMatchObject({
+        status: "superseded",
+        supersededByWebhookId: "reconcile:stop-newer-fence",
+      });
+    } finally {
+      release.resolve();
+    }
+  });
+
+  it("MPI-1448: restart reconciliation applies a later stop before an unseen continuation and acknowledges it once", async () => {
+    const now = Date.now();
+    const continuationCreatedAt = new Date(now - 4 * 60_000).toISOString();
+    const stopCreatedAt = new Date(now - 3 * 60_000).toISOString();
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-restart-stop",
+                  updatedAt: new Date(now - 60_000).toISOString(),
+                  appUser: { id: "app-user-1" },
+                  issue: { identifier: "MPI-1448" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-restart-stop",
+            appUser: { id: "app-user-1" },
+            issue: { identifier: "MPI-1448" },
+            activities: {
+              nodes: [
+                {
+                  id: "stop-later",
+                  createdAt: stopCreatedAt,
+                  signal: "stop",
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "stop",
+                  },
+                },
+                {
+                  id: "continuation-older",
+                  createdAt: continuationCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "continue the implementation",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const firstRuntime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    const sharedTmpDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "server-restart-test-"),
+    );
+
+    activeHarness = await startTestServer(firstRuntime, {
+      tmpDir: sharedTmpDir,
+      removeTmpDirOnClose: false,
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 600000 },
+    });
+    const first = activeHarness;
+    await waitFor(() =>
+      first.calls.some(
+        (call) =>
+          call.content.type === "response" && call.content.body === "Stopped.",
+      ),
+    );
+    expect(firstRuntime.requests).toHaveLength(0);
+    expect(first.calls).toEqual([
+      {
+        agentSessionId: "session-restart-stop",
+        content: { type: "response", body: "Stopped." },
+      },
+    ]);
+    await expect(
+      first.bridgeState.getReceipt("reconcile:continuation-older"),
+    ).resolves.toMatchObject({ status: "superseded" });
+    await first.close();
+    activeHarness = undefined;
+
+    const secondRuntime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(secondRuntime, {
+      tmpDir: sharedTmpDir,
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 600000 },
+    });
+    const second = activeHarness;
+    await waitFor(async () => {
+      const state = await second.bridgeState.getReconciliationState(
+        "session-restart-stop",
+      );
+      return state.processedThrough?.id === "stop-later";
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(secondRuntime.requests).toHaveLength(0);
+    expect(second.calls).toHaveLength(0);
+
+    const persisted = await fsPromises.readFile(
+      path.join(sharedTmpDir, "bridge-state.json"),
+      "utf8",
+    );
+    expect(persisted).not.toContain("continue the implementation");
+  });
+
+  it("dispatches a missed prompt once across repeated scans and converges a later real webhook", async () => {
+    const promptCreatedAt = new Date().toISOString();
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-missed-once",
+                  updatedAt: promptCreatedAt,
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-missed-once",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-missed-once",
+                  createdAt: promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "recover this once",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+    const harness = activeHarness;
+    await waitFor(() => runtime.requests.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 65));
+    expect(runtime.requests).toHaveLength(1);
+
+    const lateWebhook = {
+      webhookId: "late-real-webhook",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "session-missed-once" },
+      agentActivity: {
+        id: "prompt-missed-once",
+        createdAt: promptCreatedAt,
+        content: { type: "prompt", body: "recover this once" },
+      },
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(lateWebhook);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(runtime.requests).toHaveLength(1);
+    await expect(
+      harness.bridgeState.getReceipt("late-real-webhook"),
+    ).resolves.toMatchObject({
+      status: "superseded",
+      supersededByWebhookId: "reconcile:prompt-missed-once",
+    });
+  });
+
+  it("runs a recovered prompt newer than the persisted stop fence", async () => {
+    const stopCreatedAt = "2026-08-18T12:00:00.000Z";
+    const promptCreatedAt = "2026-08-18T12:01:00.000Z";
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-resume-after-stop",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-after-stop",
+                  createdAt: promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "resume after stop",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 600000 },
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, {
+          ownerId: "runtime-before-restart",
+        });
+        await prior.recordStopFence("session-resume-after-stop", {
+          id: "stop-before-resume",
+          createdAt: stopCreatedAt,
+        });
+      },
+    });
+
+    await waitFor(() => runtime.requests.length === 1);
+    expect(runtime.requests[0]).toMatchObject({
+      linearSessionId: "session-resume-after-stop",
+      prompt: "resume after stop",
+    });
+  });
+
+  it("a recovered stop aborts matching active and queued work", async () => {
+    const release = createDeferred<void>();
+    let stopVisible = false;
+    const stopCreatedAt = new Date(Date.now() + 2_000).toISOString();
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as {
+        query: string;
+        variables?: { sessionId?: string };
+      };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: request.variables?.sessionId,
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: stopVisible
+                ? [
+                    {
+                      id: "recovered-stop",
+                      createdAt: stopCreatedAt,
+                      signal: "stop",
+                      user: { id: "human-1" },
+                      content: {
+                        __typename: "AgentActivityPromptContent",
+                        body: "stop",
+                      },
+                    },
+                  ]
+                : [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      await Promise.race([
+        release.promise,
+        new Promise<void>((resolve) => {
+          request.abortController?.signal.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        }),
+      ]);
+      yield { kind: "done" };
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        configOverrides: { reconcileIntervalMs: 20 },
+      });
+      const harness = activeHarness;
+      const created = {
+        webhookId: "active-before-recovered-stop",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-recovered-stop" },
+        promptContext: "active work",
+        webhookTimestamp: Date.now(),
+      };
+      const createdBody = JSON.stringify(created);
+      await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+        },
+        body: createdBody,
+      });
+      await waitFor(() => runtime.requests.length === 1);
+
+      const queuedCreatedAt = new Date(Date.now() + 1_000).toISOString();
+      const queued = {
+        webhookId: "queued-before-recovered-stop",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-recovered-stop" },
+        agentActivity: {
+          id: "queued-prompt-before-stop",
+          createdAt: queuedCreatedAt,
+          content: { type: "prompt", body: "queued work" },
+        },
+        webhookTimestamp: Date.now(),
+      };
+      const queuedBody = JSON.stringify(queued);
+      await fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(queuedBody, WEBHOOK_SECRET),
+        },
+        body: queuedBody,
+      });
+      await waitFor(() =>
+        harness.calls.some(
+          (call) =>
+            call.content.type === "thought" &&
+            call.content.body === "Working on it…",
+        ),
+      );
+
+      stopVisible = true;
+      await waitFor(() =>
+        harness.calls.some(
+          (call) =>
+            call.content.type === "response" && call.content.body === "Stopped.",
+        ),
+      );
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt("reconcile:recovered-stop"))
+          ?.status === "completed",
+      );
+
+      expect(runtime.requests).toHaveLength(1);
+      expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt("queued-before-recovered-stop"))
+          ?.status === "completed",
+      );
+    } finally {
+      release.resolve();
+    }
+  });
+
+  it("runs reconciliation on startup and a non-overlapping interval, then clears the timer", async () => {
+    const releaseFirst = createDeferred<void>();
+    let queries = 0;
+    const reconciliationFetch = (async () => {
+      queries += 1;
+      if (queries === 1) {
+        await releaseFirst.promise;
+      }
+      return jsonResponse({
+        data: {
+          viewer: { id: "app-user-1" },
+          agentSessions: {
+            nodes: [],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+    const harness = activeHarness;
+
+    await waitFor(() => queries === 1);
+    await new Promise((resolve) => setTimeout(resolve, 55));
+    expect(queries).toBe(1);
+    releaseFirst.resolve();
+    await waitFor(() => queries >= 2);
+
+    await harness.close();
+    activeHarness = undefined;
+    const afterClose = queries;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(queries).toBe(afterClose);
+  });
+
+  it("aborts an in-flight reconciliation read during shutdown", async () => {
+    let observedAbort = false;
+    let started = false;
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      started = true;
+      await new Promise<never>((_resolve, reject) => {
+        const signal = init?.signal;
+        const rejectAbort = (): void => {
+          observedAbort = true;
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (signal?.aborted === true) {
+          rejectAbort();
+        } else {
+          signal?.addEventListener("abort", rejectAbort, { once: true });
+        }
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      reconciliationFetchImpl: reconciliationFetch,
+    });
+    const harness = activeHarness;
+    await waitFor(() => started);
+
+    await harness.close();
+    activeHarness = undefined;
+    expect(observedAbort).toBe(true);
+  });
+
+  it("does not dispatch activities returned by an uncooperative fetch after shutdown", async () => {
+    const activityResponse = createDeferred<Response>();
+    let activitySignal: AbortSignal | null | undefined;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-shutdown-fetch",
+                  updatedAt: new Date().toISOString(),
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      activitySignal = init?.signal;
+      return await activityResponse.promise;
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        removeTmpDirOnClose: false,
+      });
+      const harness = activeHarness;
+      await waitFor(() => activitySignal !== undefined);
+
+      const closePromise = harness.close();
+      await waitFor(() => activitySignal?.aborted === true);
+      activityResponse.resolve(
+        jsonResponse({
+          data: {
+            agentSession: {
+              id: "session-shutdown-fetch",
+              appUser: { id: "app-user-1" },
+              activities: {
+                nodes: [
+                  {
+                    id: "prompt-after-shutdown",
+                    createdAt: new Date().toISOString(),
+                    signal: null,
+                    user: { id: "human-1" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      body: "must never dispatch",
+                    },
+                  },
+                ],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        }),
+      );
+      await closePromise;
+      activeHarness = undefined;
+
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt("reconcile:prompt-after-shutdown"),
+      ).resolves.toBeUndefined();
+      expect(errorSpy.mock.calls.flat().join("\n")).not.toContain(
+        "reconciliation failed",
+      );
+      await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("aborts a pending recovered liveness mutation so shutdown can complete", async () => {
+    const promptCreatedAt = new Date().toISOString();
+    const mutationStarted = createDeferred<void>();
+    const releaseMutation = createDeferred<Response>();
+    let mutationSignal: AbortSignal | null | undefined;
+    let closePromise: Promise<void> | undefined;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-shutdown-mutation",
+                  updatedAt: promptCreatedAt,
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-shutdown-mutation",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-shutdown-mutation",
+                  createdAt: promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "pending recovered liveness",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        linearFetchImpl: () =>
+          (async (_url: RequestInfo | URL, init?: RequestInit) => {
+            mutationSignal = init?.signal;
+            mutationStarted.resolve();
+            const abort = new Promise<Response>((_resolve, reject) => {
+              const rejectAbort = (): void => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              };
+              if (mutationSignal?.aborted === true) {
+                rejectAbort();
+              } else {
+                mutationSignal?.addEventListener("abort", rejectAbort, {
+                  once: true,
+                });
+              }
+            });
+            return await Promise.race([releaseMutation.promise, abort]);
+          }) as FetchFn,
+        removeTmpDirOnClose: false,
+      });
+      const harness = activeHarness;
+      await mutationStarted.promise;
+
+      closePromise = harness.close();
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      const closedPromptly = await Promise.race([
+        closePromise.then(() => true),
+        new Promise<false>((resolve) => {
+          closeTimer = setTimeout(() => resolve(false), 250);
+        }),
+      ]);
+      clearTimeout(closeTimer);
+      expect(closedPromptly).toBe(true);
+      activeHarness = undefined;
+
+      expect(mutationSignal?.aborted).toBe(true);
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt("reconcile:prompt-shutdown-mutation"),
+      ).resolves.toMatchObject({ status: "claimed" });
+      await expect(
+        harness.bridgeState.getReconciliationState(
+          "session-shutdown-mutation",
+        ),
+      ).resolves.toEqual({});
+      const logged = errorSpy.mock.calls.flat().join("\n");
+      expect(logged).not.toContain("reconciliation event failed");
+      expect(logged).not.toContain("reconciliation failed");
+      await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+    } finally {
+      releaseMutation.resolve(
+        jsonResponse({ data: { agentActivityCreate: { success: true } } }),
+      );
+      await closePromise?.catch(() => undefined);
+      activeHarness = undefined;
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("stops awaiting a shared OAuth refresh during reconciliation shutdown", async () => {
+    const refreshStarted = createDeferred<void>();
+    const releaseRefresh = createDeferred<Response>();
+    let closePromise: Promise<void> | undefined;
+    let harness: Harness | undefined;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        tokenFetchImpl: (async () => {
+          refreshStarted.resolve();
+          return await releaseRefresh.promise;
+        }) as FetchFn,
+        reconciliationFetchImpl: (async () =>
+          jsonResponse(
+            {},
+            { ok: false, status: 401, statusText: "Unauthorized" },
+          )) as FetchFn,
+        linearUsesOAuth: true,
+        prepareOAuth: async (oauth) => {
+          await oauth.install({
+            access_token: "expired-access",
+            refresh_token: "rotating-refresh",
+            expires_in: 0,
+          });
+        },
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, {
+            ownerId: "runtime-before-refresh-shutdown",
+          });
+          await prior.claimEvent({
+            webhookId: "known-before-refresh-shutdown",
+            executionId: "created:session-refresh-shutdown",
+            linearSessionId: "session-refresh-shutdown",
+            action: "created",
+          });
+          await prior.markDispatchStarted("known-before-refresh-shutdown");
+        },
+        removeTmpDirOnClose: false,
+      });
+      harness = activeHarness;
+      await refreshStarted.promise;
+
+      closePromise = harness.close();
+      let closeTimer: ReturnType<typeof setTimeout> | undefined;
+      const closedPromptly = await Promise.race([
+        closePromise.then(() => true),
+        new Promise<false>((resolve) => {
+          closeTimer = setTimeout(() => resolve(false), 250);
+        }),
+      ]);
+      clearTimeout(closeTimer);
+      expect(closedPromptly).toBe(true);
+      activeHarness = undefined;
+
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReconciliationState(
+          "session-refresh-shutdown",
+        ),
+      ).resolves.toEqual({});
+      const logged = errorSpy.mock.calls.flat().join("\n");
+      expect(logged).not.toContain("reconciliation event failed");
+      expect(logged).not.toContain("reconciliation failed");
+    } finally {
+      releaseRefresh.resolve(
+        jsonResponse({
+          access_token: "fresh-access",
+          refresh_token: "fresh-rotating-refresh",
+          expires_in: 86399,
+        }),
+      );
+      await closePromise?.catch(() => undefined);
+      activeHarness = undefined;
+      if (harness !== undefined) {
+        await waitFor(async () => {
+          try {
+            const persisted = JSON.parse(
+              await fsPromises.readFile(harness!.oauthTokenStorePath, "utf8"),
+            ) as { accessToken?: string };
+            return persisted.accessToken === "fresh-access";
+          } catch {
+            return false;
+          }
+        });
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("isolates reconciliation failures from health checks and webhook delivery", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: (async () => {
+          throw new Error("raw reconciliation response secret");
+        }) as FetchFn,
+      });
+      const harness = activeHarness;
+      await waitFor(() => errorSpy.mock.calls.length > 0);
+
+      expect((await fetch(serverUrl(harness.port, "/healthz"))).status).toBe(200);
+      const payload = {
+        webhookId: "webhook-after-reconciliation-failure",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-after-reconciliation-failure" },
+        promptContext: "still deliver this webhook",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain("reconciliation failed");
+      expect(logged).not.toContain("raw reconciliation response secret");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("terminalizes a recovered claimed event when dispatch setup fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promptCreatedAt = new Date().toISOString();
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-recovered-failure",
+                  updatedAt: promptCreatedAt,
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-recovered-failure",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-recovered-failure",
+                  createdAt: promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "raw prompt that must not be logged",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        linearFetchImpl: () =>
+          (async () =>
+            jsonResponse(
+              { errors: [{ message: "raw external response secret" }] },
+              { ok: false, status: 500, statusText: "Internal Server Error" },
+            )) as FetchFn,
+        configOverrides: { reconcileIntervalMs: 600000 },
+      });
+      const harness = activeHarness;
+
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(
+          "reconcile:prompt-recovered-failure",
+        ))?.status === "failed",
+      );
+      await expect(
+        harness.bridgeState.getClaim("prompt-recovered-failure"),
+      ).resolves.toMatchObject({ status: "failed" });
+      await waitFor(async () =>
+        (await harness.bridgeState.getReconciliationState(
+          "session-recovered-failure",
+        )).processedThrough?.id === "prompt-recovered-failure",
+      );
+      await expect(
+        harness.bridgeState.getReconciliationState(
+          "session-recovered-failure",
+        ),
+      ).resolves.toMatchObject({
+        processedThrough: {
+          id: "prompt-recovered-failure",
+          createdAt: promptCreatedAt,
+        },
+      });
+      expect(runtime.requests).toHaveLength(0);
+      const logged = errorSpy.mock.calls.flat().join("\n");
+      expect(logged).toContain("reconciliation processing failed");
+      expect(logged).not.toContain("raw external response secret");
+      expect(logged).not.toContain("raw prompt that must not be logged");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("logs one bounded stalled_agent_session diagnostic for an old unclaimed prompt", async () => {
+    const now = Date.parse("2026-08-18T12:05:00.000Z");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "session-stalled",
+                  updatedAt: "2026-08-18T12:04:00.000Z",
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-stalled",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-stalled",
+                  createdAt: "2026-08-18T12:02:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "raw-stalled-prompt-secret",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        configOverrides: {
+          reconcileIntervalMs: 600000,
+          agentSessionAckGraceMs: 120000,
+        },
+        now: () => now,
+      });
+      await waitFor(() => warnSpy.mock.calls.length === 1);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[linear-agent-bridge] stalled_agent_session session=session-stalled activity=prompt-stalled age_ms=180000",
+      );
+      expect(warnSpy.mock.calls.flat().join(" ")).not.toContain(
+        "raw-stalled-prompt-secret",
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn for an old prompt that already has a durable semantic claim", async () => {
+    const now = Date.parse("2026-08-18T12:05:00.000Z");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reconciliationFetch = (async (
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-claimed",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-claimed",
+                  createdAt: "2026-08-18T12:02:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "already claimed",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    try {
+      activeHarness = await startTestServer(runtime, {
+        reconciliationFetchImpl: reconciliationFetch,
+        bridgeStateOwnerId: "runtime-after-restart",
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, {
+            ownerId: "runtime-before-restart",
+            now: () => now - 60_000,
+          });
+          await prior.claimEvent({
+            webhookId: "reconcile:prompt-claimed",
+            executionId: "prompt-claimed",
+            linearSessionId: "session-claimed",
+            action: "prompted",
+          });
+          await prior.markDispatchStarted("reconcile:prompt-claimed");
+        },
+        configOverrides: { reconcileIntervalMs: 600000 },
+        now: () => now,
+      });
+      const harness = activeHarness;
+      await waitFor(async () => {
+        const state = await harness.bridgeState.getReconciliationState(
+          "session-claimed",
+        );
+        return state.processedThrough?.id === "prompt-claimed";
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("aborts a turn after the configured inactivity period and reports it", async () => {

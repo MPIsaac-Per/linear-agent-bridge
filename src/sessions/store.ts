@@ -31,6 +31,10 @@ export class JsonSessionStore {
     await this.writeAll(sessions);
   }
 
+  async listSessionIds(): Promise<string[]> {
+    return Object.keys(await this.readAll()).sort();
+  }
+
   /** Missing file or unparseable content both read as an empty store. */
   private async readAll(): Promise<SessionMap> {
     let raw: string;

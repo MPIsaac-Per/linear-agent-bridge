@@ -7,12 +7,14 @@ working directory it runs in (CLAUDE.md stack, MCP servers).
 
 ## Architecture
 
-Linear webhook (AgentSessionEvent) -> src/server.ts -> JsonBridgeStateStore ->
-SerialQueue -> AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities
-back via src/linear/client.ts (agentActivityCreate). Durable receipts and
-semantic claims prevent duplicate dispatch across delivery and process
-retries. A claim can transfer after restart only until its durable dispatch
-marker is set; later cross-process retries remain ambiguous and undispatched.
+Linear webhook (AgentSessionEvent) plus startup/interval activity
+reconciliation -> src/server.ts -> JsonBridgeStateStore -> SerialQueue ->
+AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities back via
+src/linear/client.ts (agentActivityCreate). Durable receipts, semantic claims,
+per-session watermarks, and stop fences prevent duplicate or post-stop dispatch
+across delivery and process retries. A claim can transfer after restart only
+until its durable dispatch marker is set; later cross-process retries remain
+ambiguous and undispatched.
 Session mapping persists in JsonSessionStore so `prompted` events
 resume the same runtime session.
 LinearOAuthTokenManager persists Linear's rotating OAuth token pair and
@@ -47,8 +49,9 @@ refreshes it after an authenticated request returns 401.
   the local service log. Never accept a bare authorization code.
 - Linear payload facts (verified against live payloads 2026-08-12): the
   prompted user text is `agentActivity.content.body`; AgentSessionEvent
-  fields sit at the payload top level; the HMAC covers the raw body and
-  `webhookTimestamp` rides inside the JSON.
+  fields sit at the payload top level; prompted ordering uses the required
+  `agentActivity.createdAt`; the HMAC covers the raw body and `webhookTimestamp`
+  rides inside the JSON.
 
 ## Gates (every commit)
 

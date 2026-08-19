@@ -9,6 +9,18 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ### Added
 
+- Reconcile Linear AgentSession activities at startup and every minute so
+  missed prompt and stop webhooks recover across process restarts. Scans cover
+  every locally known session plus up to 250 recent sessions owned by the
+  authenticated app user, paginate activities to durable watermarks with a
+  seven-day bound, and share webhook semantic claims and outbound idempotency.
+- Persist stop fences before cancellation or acknowledgement so a later stop
+  suppresses older unseen prompts while newer prompts can resume. Emit bounded
+  `stalled_agent_session` diagnostics after the configurable acknowledgement
+  grace period, rate-limited once per session every 15 minutes.
+- Add `RECONCILE_INTERVAL_MS`, `RECONCILE_LOOKBACK_MS`,
+  `RECONCILE_MAX_SESSIONS`, and `AGENT_SESSION_ACK_GRACE_MS` configuration.
+
 - Persist bounded webhook receipts, semantic execution claims, and
   caller-generated Linear activity UUIDs before acknowledging valid agent
   events. Delivery retries deduplicate by `webhookId`; created and prompted
@@ -73,6 +85,10 @@ Changes awaiting a tagged release remain under Unreleased.
   response bodies are no longer echoed into errors.
 
 ### Fixed
+
+- Prevent a missed continuation webhook from starting after a later stop when
+  the bridge restarts and recovers both activities through reconciliation
+  (MPI-1448).
 
 - Preserve and close the Claude Agent SDK `Query.close()` handle exactly once
   when stop, inactivity, or shutdown aborts an active turn, including through

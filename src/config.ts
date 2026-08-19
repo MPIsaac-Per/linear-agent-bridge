@@ -14,6 +14,10 @@ export interface Config {
   runInactivityTimeoutMs: number;
   ingressRecoveryKey: string;
   ingressRecoveryPreviousKeys: string[];
+  reconcileIntervalMs: number;
+  reconcileLookbackMs: number;
+  reconcileMaxSessions: number;
+  agentSessionAckGraceMs: number;
 }
 
 const DEFAULT_PORT = "3979";
@@ -22,6 +26,10 @@ const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
 const DEFAULT_BRIDGE_STATE_STORE_PATH = "./data/bridge-state.json";
 const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
 const DEFAULT_RUN_INACTIVITY_TIMEOUT_MS = "300000";
+const DEFAULT_RECONCILE_INTERVAL_MS = "60000";
+const DEFAULT_RECONCILE_LOOKBACK_MS = "86400000";
+const DEFAULT_RECONCILE_MAX_SESSIONS = "250";
+const DEFAULT_AGENT_SESSION_ACK_GRACE_MS = "120000";
 let warnedAboutDeprecatedRunTimeout = false;
 
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -63,6 +71,21 @@ function parseRecoveryKeys(
     );
   }
   return previous;
+}
+
+function integerInRange(
+  value: string,
+  key: string,
+  minimum: number,
+  maximum: number,
+): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(
+      `Invalid ${key} "${value}": expected an integer from ${minimum} to ${maximum}`,
+    );
+  }
+  return parsed;
 }
 
 /**
@@ -125,5 +148,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     runInactivityTimeoutMs,
     ingressRecoveryKey,
     ingressRecoveryPreviousKeys,
+    reconcileIntervalMs: positiveInteger(
+      env.RECONCILE_INTERVAL_MS ?? DEFAULT_RECONCILE_INTERVAL_MS,
+      "RECONCILE_INTERVAL_MS",
+    ),
+    reconcileLookbackMs: positiveInteger(
+      env.RECONCILE_LOOKBACK_MS ?? DEFAULT_RECONCILE_LOOKBACK_MS,
+      "RECONCILE_LOOKBACK_MS",
+    ),
+    reconcileMaxSessions: integerInRange(
+      env.RECONCILE_MAX_SESSIONS ?? DEFAULT_RECONCILE_MAX_SESSIONS,
+      "RECONCILE_MAX_SESSIONS",
+      1,
+      250,
+    ),
+    agentSessionAckGraceMs: positiveInteger(
+      env.AGENT_SESSION_ACK_GRACE_MS ?? DEFAULT_AGENT_SESSION_ACK_GRACE_MS,
+      "AGENT_SESSION_ACK_GRACE_MS",
+    ),
   };
 }

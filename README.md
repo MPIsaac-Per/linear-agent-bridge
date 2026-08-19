@@ -18,7 +18,7 @@ Runs on Claude Code subscription auth. No Anthropic API key.
 
 ```
 Linear (mention / delegate / follow-up prompt)
-  -> webhook: AgentSessionEvent (created | prompted)
+  -> webhook + reconciliation: AgentSessionEvent / AgentSession activities
   -> src/server.ts        verify HMAC, persist ingress, ack < 5s
   -> src/state/store.ts   durable receipt + semantic execution claim
   -> src/queue.ts         serial execution, concurrency 1
@@ -29,7 +29,8 @@ Linear (mention / delegate / follow-up prompt)
 Session mapping (Linear session id -> SDK session id), bounded webhook state,
 and Linear's rotating OAuth token pair persist in JSON files. Follow-up prompts
 resume the same conversation, webhook retries do not dispatch the same turn
-twice, accepted work survives a process exit before dispatch, and access
+twice, accepted work survives a process exit before dispatch, missed prompt and
+stop webhooks recover through reconciliation, and access
 refreshes without another browser authorization.
 
 For each valid agent event, the bridge durably persists a receipt keyed by
@@ -129,14 +130,15 @@ excluded from Git.
 `BRIDGE_STATE_STORE_PATH` defaults to `data/bridge-state.json`. Keep it on
 persistent local storage as well. It contains bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
-caller-generated activity UUIDs, and recovery ciphertext for accepted turns
-whose dispatch marker is absent. Plaintext recovery routing metadata includes
-the action, session/webhook/execution IDs, recovery sequence, event timestamp,
-envelope `keyId`, and stop-fence provenance. Prompt, issue, and comment text,
-the raw signal, and the stop/body semantics remain inside the encrypted
-envelope until the dispatch marker is committed. Ciphertext length still
-reveals an approximate prompt length, so protect the state file and its backups
-as sensitive data.
+caller-generated activity UUIDs, reconciliation watermarks, stop fences, and
+recovery ciphertext for accepted turns whose dispatch marker is absent.
+Plaintext recovery routing metadata includes the action,
+session/webhook/execution IDs, recovery sequence, event timestamp, envelope
+`keyId`, and stop-fence provenance. Prompt, issue, and comment text, the raw
+signal, and the stop/body semantics remain inside the encrypted envelope until
+the dispatch marker is committed. Ciphertext length still reveals an
+approximate prompt length, so protect the state file and its backups as
+sensitive data.
 
 AES-256-GCM authenticates each encrypted payload against its routing identity,
 sequence, and `keyId`. It does not authenticate the state file as a whole.
@@ -184,6 +186,15 @@ Remove retired keys from `INGRESS_RECOVERY_PREVIOUS_KEYS` and run the installer
 again only after that check prints `0`. Losing a key while one of its
 marker-free envelopes remains makes recovery unavailable and keeps the service
 unhealthy.
+
+Reconciliation runs once at startup and every `RECONCILE_INTERVAL_MS` (default
+`60000`). Each scan includes every locally known Linear session plus at most
+`RECONCILE_MAX_SESSIONS` (default `250`) app-owned sessions updated within
+`RECONCILE_LOOKBACK_MS` (default `86400000`, 24 hours). Session activities are
+read no further back than seven days and resume from a durable per-session
+watermark. `AGENT_SESSION_ACK_GRACE_MS` (default `120000`) controls when an old,
+unclaimed prompt produces a bounded `stalled_agent_session` diagnostic;
+repeats are limited to once per session every 15 minutes.
 
 #### Upgrading an existing installation
 
@@ -250,6 +261,9 @@ session takes.
   `agentActivity.content.body`, not `agentActivity.body`. Reading the
   wrong field yields an agent that answers "Standing by." to everything,
   because it is resumed with an empty prompt.
+- Prompted activity ordering uses `agentActivity.createdAt` and
+  `agentActivity.id`. The bridge rejects prompted payloads without a valid
+  activity timestamp rather than substituting webhook delivery time.
 - AgentSessionEvent payloads put their fields at the top level of the
   webhook body (no `data` wrapper, unlike data-change webhooks).
 - `webhookId` identifies a Linear delivery. The created semantic execution id
@@ -260,6 +274,15 @@ session takes.
   decrypting its bounded recovery envelope. Once the marker exists, a
   different process records `AmbiguousDispatch` and does not execute the turn
   again. Same-process duplicate deliveries remain ordinary duplicates.
+- On startup and every reconciliation interval, the bridge paginates recent
+  sessions for the authenticated app user and all locally known sessions, then
+  paginates typed Agent Activities to each durable watermark. Activities are
+  processed by `createdAt`, with `id` as the deterministic tie-breaker. A
+  fetched stop is claimed together with its durable fence before any older
+  unseen prompt can dispatch; prompts after the fence may resume normally.
+  Synthetic reconciliation delivery IDs are deterministic while
+  `agentActivity.id` remains the semantic execution identity, so a late real
+  webhook converges on the same claim.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.
@@ -293,6 +316,10 @@ session takes.
 - Invalid JSON and invalid agent-event diagnostics are static classes. Ingress
   failures log bounded error classes rather than raw errors, and Linear HTTP or
   GraphQL response bodies are not copied into thrown errors or logs.
+- Reconciliation failures are isolated per scan and session, never block the
+  HTTP listener or webhook path, and do not include prompt text or raw Linear
+  response bodies. Shutdown cancels an in-flight reconciliation read and
+  clears the interval timer.
 - `permissionMode: "bypassPermissions"` does nothing without
   `allowDangerouslySkipPermissions: true`; the SDK requires the pair.
 - Old Agent SDK versions (0.1.x) fail to resume sessions whose transcript

@@ -425,6 +425,386 @@ describe("LinearAgentClient.createActivity", () => {
   });
 });
 
+describe("LinearAgentClient reconciliation reads", () => {
+  it("paginates recent sessions, filters by the authenticated app user client-side, and caps results", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "foreign-session",
+                  updatedAt: "2026-08-18T11:59:00.000Z",
+                  appUser: { id: "another-app" },
+                },
+                {
+                  id: "owned-session-2",
+                  updatedAt: "2026-08-18T11:58:00.000Z",
+                  appUser: { id: "app-user-1" },
+                  issue: { identifier: "MPI-2" },
+                },
+              ],
+              pageInfo: { hasNextPage: true, endCursor: "sessions-page-2" },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: "owned-session-1",
+                  updatedAt: "2026-08-18T11:57:00.000Z",
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await expect(
+      client.listRecentAppOwnedSessions({
+        updatedAfter: "2026-08-17T12:00:00.000Z",
+        maxSessions: 2,
+      }),
+    ).resolves.toEqual([
+      {
+        id: "owned-session-2",
+        updatedAt: "2026-08-18T11:58:00.000Z",
+        appUserId: "app-user-1",
+        issueIdentifier: "MPI-2",
+      },
+      {
+        id: "owned-session-1",
+        updatedAt: "2026-08-18T11:57:00.000Z",
+        appUserId: "app-user-1",
+      },
+    ]);
+
+    const first = JSON.parse(fetchFn.mock.calls[0]?.[1]?.body as string);
+    const second = JSON.parse(fetchFn.mock.calls[1]?.[1]?.body as string);
+    expect(first.query).toContain("agentSessions(");
+    expect(first.query).not.toContain("agentSessions(filter:");
+    expect(first.variables).toEqual({ first: 50, after: null });
+    expect(second.variables).toEqual({ first: 50, after: "sessions-page-2" });
+  });
+
+  it("paginates one session's activities to its watermark and returns deterministic Linear order", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            agentSession: {
+              id: "session-1",
+              appUser: { id: "app-user-1" },
+              issue: { identifier: "MPI-1" },
+              activities: {
+                nodes: [
+                  {
+                    id: "prompt-c",
+                    createdAt: "2026-08-18T12:03:00.000Z",
+                    signal: null,
+                    user: { id: "human-1" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      body: "third",
+                    },
+                  },
+                  {
+                    id: "prompt-b",
+                    createdAt: "2026-08-18T12:02:00.000Z",
+                    signal: "stop",
+                    user: { id: "human-1" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      body: "stop",
+                    },
+                  },
+                ],
+                pageInfo: { hasNextPage: true, endCursor: "activities-page-2" },
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            agentSession: {
+              id: "session-1",
+              appUser: { id: "app-user-1" },
+              issue: { identifier: "MPI-1" },
+              activities: {
+                nodes: [
+                  {
+                    id: "prompt-a",
+                    createdAt: "2026-08-18T12:01:00.000Z",
+                    signal: null,
+                    user: { id: "human-1" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      body: "first",
+                    },
+                  },
+                  {
+                    id: "bridge-thought-without-user",
+                    createdAt: "2026-08-18T12:01:30.000Z",
+                    signal: null,
+                    content: {
+                      __typename: "AgentActivityThoughtContent",
+                    },
+                  },
+                ],
+                pageInfo: { hasNextPage: true, endCursor: "activities-page-3" },
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            agentSession: {
+              id: "session-1",
+              appUser: { id: "app-user-1" },
+              issue: { identifier: "MPI-1" },
+              activities: {
+                nodes: [
+                  {
+                    id: "prompt-z",
+                    createdAt: "2026-08-18T12:01:00.000Z",
+                    signal: null,
+                    user: { id: "human-1" },
+                    content: {
+                      __typename: "AgentActivityPromptContent",
+                      body: "same-time after watermark",
+                    },
+                  },
+                ],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        }),
+      );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    const result = await client.listAgentSessionActivities("session-1", {
+      lookbackAfter: "2026-08-11T12:00:00.000Z",
+      processedThrough: {
+        createdAt: "2026-08-18T12:01:00.000Z",
+        id: "prompt-a",
+      },
+    });
+
+    expect(result).toEqual({
+      id: "session-1",
+      appUserId: "app-user-1",
+      issueIdentifier: "MPI-1",
+      activities: [
+        {
+          id: "prompt-z",
+          createdAt: "2026-08-18T12:01:00.000Z",
+          userId: "human-1",
+          type: "prompt",
+          body: "same-time after watermark",
+        },
+        {
+          id: "bridge-thought-without-user",
+          createdAt: "2026-08-18T12:01:30.000Z",
+          type: "thought",
+        },
+        {
+          id: "prompt-b",
+          createdAt: "2026-08-18T12:02:00.000Z",
+          userId: "human-1",
+          signal: "stop",
+          type: "prompt",
+          body: "stop",
+        },
+        {
+          id: "prompt-c",
+          createdAt: "2026-08-18T12:03:00.000Z",
+          userId: "human-1",
+          type: "prompt",
+          body: "third",
+        },
+      ],
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    const second = JSON.parse(fetchFn.mock.calls[1]?.[1]?.body as string);
+    expect(second.variables).toEqual({
+      sessionId: "session-1",
+      first: 50,
+      after: "activities-page-2",
+      lookbackAfter: "2026-08-11T12:00:00.000Z",
+    });
+    const third = JSON.parse(fetchFn.mock.calls[2]?.[1]?.body as string);
+    expect(third.variables.after).toBe("activities-page-3");
+  });
+
+  it("retains a same-millisecond activity whose id sorts below the watermark", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-tiebreak",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "aaa-sorts-before-watermark",
+                  createdAt: "2026-08-18T12:01:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "must not be skipped forever",
+                  },
+                },
+                {
+                  id: "zzz-watermark",
+                  createdAt: "2026-08-18T12:01:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "already processed",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    const result = await client.listAgentSessionActivities("session-tiebreak", {
+      lookbackAfter: "2026-08-11T12:00:00.000Z",
+      processedThrough: {
+        createdAt: "2026-08-18T12:01:00.000Z",
+        id: "zzz-watermark",
+      },
+    });
+
+    // The watermark activity itself is the only one known to be processed at
+    // that millisecond; an id tiebreaker would drop its sibling permanently.
+    expect(result.activities.map((activity) => activity.id)).toEqual([
+      "aaa-sorts-before-watermark",
+    ]);
+  });
+
+  it("uses the existing OAuth refresh path for reconciliation queries", async () => {
+    const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "linear-query-oauth-"));
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({}, { ok: false, status: 401, statusText: "Unauthorized" }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          access_token: "fresh-access",
+          refresh_token: "fresh-refresh",
+          expires_in: 86399,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        }),
+      );
+    const oauth = new LinearOAuthTokenManager({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      initialAccessToken: "expired-access",
+      storePath: path.join(tmpDir, "tokens.json"),
+      fetchFn,
+    });
+    await oauth.install({
+      access_token: "expired-access",
+      refresh_token: "initial-refresh",
+      expires_in: 0,
+    });
+    const client = new LinearAgentClient(oauth, fetchFn);
+
+    try {
+      await expect(
+        client.listRecentAppOwnedSessions({
+          updatedAfter: "2026-08-17T12:00:00.000Z",
+          maxSessions: 250,
+        }),
+      ).resolves.toEqual([]);
+      expect(fetchFn.mock.calls[2]?.[1]?.headers).toMatchObject({
+        Authorization: "Bearer fresh-access",
+      });
+    } finally {
+      await fsPromises.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a recent-session scan cap above 250 at the Linear boundary", async () => {
+    const fetchFn = vi.fn();
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await expect(
+      client.listRecentAppOwnedSessions({
+        updatedAfter: "2026-08-17T12:00:00.000Z",
+        maxSessions: 251,
+      }),
+    ).rejects.toThrow(/maxSessions/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a looping pagination cursor instead of issuing unbounded reads", async () => {
+    const page = {
+      data: {
+        viewer: { id: "app-user-1" },
+        agentSessions: {
+          nodes: [
+            {
+              id: "foreign-session",
+              updatedAt: "2026-08-18T11:59:00.000Z",
+              appUser: { id: "another-app" },
+            },
+          ],
+          pageInfo: { hasNextPage: true, endCursor: "same-cursor" },
+        },
+      },
+    };
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(page))
+      .mockResolvedValueOnce(jsonResponse(page));
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await expect(
+      client.listRecentAppOwnedSessions({
+        updatedAfter: "2026-08-17T12:00:00.000Z",
+        maxSessions: 250,
+      }),
+    ).rejects.toThrow(/shape/);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+});
+
 const WEBHOOK_SECRET = "whsec_test_secret";
 
 function makeBody(webhookTimestamp: number): Buffer {
