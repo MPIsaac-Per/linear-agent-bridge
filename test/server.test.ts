@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { promises as fsPromises } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
@@ -207,6 +207,7 @@ async function startTestServer(
     linearUsesOAuth?: boolean;
     prepareOAuthTokenStore?: (storePath: string) => Promise<void>;
     shutdownRequestTimeoutMs?: number;
+    shutdownPersistenceTimeoutMs?: number;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
@@ -272,6 +273,9 @@ async function startTestServer(
     onOAuthAuthorizationUrl: resolveAuthorizationUrl,
     ...(options.shutdownRequestTimeoutMs !== undefined
       ? { shutdownRequestTimeoutMs: options.shutdownRequestTimeoutMs }
+      : {}),
+    ...(options.shutdownPersistenceTimeoutMs !== undefined
+      ? { shutdownPersistenceTimeoutMs: options.shutdownPersistenceTimeoutMs }
       : {}),
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
@@ -2591,6 +2595,210 @@ describe("startServer", () => {
     );
   });
 
+  it("recovers a digest-only prior-version liveness outbox with its retained renderer", async () => {
+    const sharedTmpDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "server-prior-liveness-renderer-"),
+    );
+    const pendingPostResponseWork: Array<() => void> = [];
+    const sessionId = "session-prior-liveness-renderer";
+    const executionId = `created:${sessionId}`;
+    const legacyBody = "Reading the issue and gathering context…";
+    const payload = {
+      webhookId: "webhook-prior-liveness-renderer",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: sessionId },
+      promptContext: "private prompt for prior liveness renderer",
+      webhookTimestamp: Date.now(),
+    };
+    let createAttempts = 0;
+    const deliveredBodies: string[] = [];
+    try {
+      activeHarness = await startTestServer(
+        new FakeRuntime(async function* () {
+          yield { kind: "done" } as RuntimeEvent;
+        }),
+        {
+          tmpDir: sharedTmpDir,
+          removeTmpDirOnClose: false,
+          schedulePostResponseWork: (work) => pendingPostResponseWork.push(work),
+        },
+      );
+      const first = activeHarness;
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(first.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      const legacyDigest = createHash("sha256")
+        .update(
+          JSON.stringify({
+            agentSessionId: sessionId,
+            content: { type: "thought", body: legacyBody },
+            ephemeral: true,
+          }),
+        )
+        .digest("hex");
+      await first.bridgeState.prepareActivity(
+        executionId,
+        "liveness",
+        sessionId,
+        legacyDigest,
+      );
+      await first.bridgeState.markActivityAttempted(executionId, "liveness");
+      await first.close();
+      activeHarness = undefined;
+
+      const recoveredRuntime = new FakeRuntime(async function* () {
+        yield { kind: "done" } as RuntimeEvent;
+      });
+      activeHarness = await startTestServer(recoveredRuntime, {
+        tmpDir: sharedTmpDir,
+        removeTmpDirOnClose: false,
+        bridgeStateOwnerId: "runtime-after-prior-renderer",
+        linearFetchImpl: () =>
+          (async (_url: RequestInfo | URL, init?: RequestInit) => {
+            const parsed = JSON.parse(init?.body as string) as {
+              variables: {
+                id?: string;
+                input?: {
+                  content: { body: string };
+                };
+              };
+            };
+            if (parsed.variables.id !== undefined) {
+              return jsonResponse({
+                data: { agentActivities: { nodes: [] } },
+              });
+            }
+            createAttempts += 1;
+            deliveredBodies.push(parsed.variables.input!.content.body);
+            return jsonResponse({
+              data: { agentActivityCreate: { success: true } },
+            });
+          }) as FetchFn,
+      });
+      const recovered = activeHarness;
+      await waitFor(() => recoveredRuntime.requests.length === 1);
+      await waitFor(async () =>
+        (await recovered.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(createAttempts).toBe(1);
+      expect(deliveredBodies).toEqual([legacyBody]);
+    } finally {
+      await activeHarness?.close();
+      activeHarness = undefined;
+      await fsPromises.rm(sharedTmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles a legacy activity id before replay when no outbox was persisted", async () => {
+    const sharedTmpDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "server-legacy-activity-id-reconcile-"),
+    );
+    const pendingPostResponseWork: Array<() => void> = [];
+    const sessionId = "session-legacy-activity-id-reconcile";
+    const executionId = `created:${sessionId}`;
+    const payload = {
+      webhookId: "webhook-legacy-activity-id-reconcile",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: sessionId },
+      promptContext: "private prompt for legacy activity reconciliation",
+      webhookTimestamp: Date.now(),
+    };
+    let legacyActivityId: string | undefined;
+    let queryAttempts = 0;
+    let createAttempts = 0;
+    try {
+      activeHarness = await startTestServer(
+        new FakeRuntime(async function* () {
+          yield { kind: "done" } as RuntimeEvent;
+        }),
+        {
+          tmpDir: sharedTmpDir,
+          removeTmpDirOnClose: false,
+          schedulePostResponseWork: (work) => pendingPostResponseWork.push(work),
+        },
+      );
+      const first = activeHarness;
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(first.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      legacyActivityId = await first.bridgeState.getOrCreateActivityId(
+        executionId,
+        "liveness",
+      );
+      await first.close();
+      activeHarness = undefined;
+
+      const recoveredRuntime = new FakeRuntime(async function* () {
+        yield { kind: "done" } as RuntimeEvent;
+      });
+      activeHarness = await startTestServer(recoveredRuntime, {
+        tmpDir: sharedTmpDir,
+        removeTmpDirOnClose: false,
+        bridgeStateOwnerId: "runtime-after-legacy-activity-id",
+        linearFetchImpl: () =>
+          (async (_url: RequestInfo | URL, init?: RequestInit) => {
+            const parsed = JSON.parse(init?.body as string) as {
+              variables: { id?: string };
+            };
+            if (parsed.variables.id !== undefined) {
+              queryAttempts += 1;
+              return jsonResponse({
+                data: {
+                  agentActivities: {
+                    nodes: [
+                      {
+                        id: legacyActivityId,
+                        agentSession: { id: sessionId },
+                      },
+                    ],
+                  },
+                },
+              });
+            }
+            createAttempts += 1;
+            return jsonResponse({
+              data: { agentActivityCreate: { success: true } },
+            });
+          }) as FetchFn,
+      });
+      const recovered = activeHarness;
+      await waitFor(() => recoveredRuntime.requests.length === 1);
+      await waitFor(async () =>
+        (await recovered.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(queryAttempts).toBe(1);
+      expect(createAttempts).toBe(0);
+    } finally {
+      await activeHarness?.close();
+      activeHarness = undefined;
+      await fsPromises.rm(sharedTmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("confirms a locally visible runtime intent before starting the runtime once", async () => {
     const runtime = new FakeRuntime(async function* () {
       yield { kind: "done" } as RuntimeEvent;
@@ -4075,6 +4283,198 @@ describe("startServer", () => {
       activeHarness = undefined;
       activityIdSpy?.mockRestore();
       errorSpy.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it.each(["temp-sync", "rename"] as const)(
+    "drains a stalled session %s boundary before close returns",
+    async (boundary) => {
+      const boundaryStarted = createDeferred<void>();
+      const releaseBoundary = createDeferred<void>();
+      const runtime = new FakeRuntime(async function* () {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: `runtime-stalled-session-${boundary}`,
+        } as RuntimeEvent;
+        yield { kind: "done" } as RuntimeEvent;
+      });
+      let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+      let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+      let harness: Harness | undefined;
+      try {
+        activeHarness = await startTestServer(runtime, {
+          removeTmpDirOnClose: false,
+          configOverrides: { runInactivityTimeoutMs: 20 },
+        });
+        harness = activeHarness;
+        const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+        const originalOpen = fsPromises.open.bind(fsPromises);
+        const originalRename = fsPromises.rename.bind(fsPromises);
+        openSpy = vi.spyOn(fsPromises, "open").mockImplementation(
+          async (...args) => {
+            const handle = await originalOpen(...args);
+            if (
+              boundary === "temp-sync" &&
+              String(args[0]).includes(".sessions.json.") &&
+              String(args[0]).endsWith(".tmp")
+            ) {
+              const originalSync = handle.sync.bind(handle);
+              vi.spyOn(handle, "sync").mockImplementation(async () => {
+                boundaryStarted.resolve();
+                await releaseBoundary.promise;
+                await originalSync();
+              });
+            }
+            return handle;
+          },
+        );
+        renameSpy = vi.spyOn(fsPromises, "rename").mockImplementation(
+          async (from, to) => {
+            if (boundary === "rename" && String(to) === sessionStorePath) {
+              boundaryStarted.resolve();
+              await releaseBoundary.promise;
+            }
+            await originalRename(from, to);
+          },
+        );
+        const payload = {
+          webhookId: `webhook-stalled-session-${boundary}`,
+          type: "AgentSessionEvent",
+          action: "created",
+          agentSession: { id: `session-stalled-session-${boundary}` },
+          promptContext: `private stalled ${boundary} prompt`,
+          webhookTimestamp: Date.now(),
+        };
+        const body = JSON.stringify(payload);
+        expect(
+          (
+            await fetch(serverUrl(harness.port, "/webhook"), {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "linear-signature": sign(body, WEBHOOK_SECRET),
+              },
+              body,
+            })
+          ).status,
+        ).toBe(200);
+        await boundaryStarted.promise;
+        await waitFor(() =>
+          harness!.calls.some(
+            (call) =>
+              call.content.type === "error" &&
+              call.content.body.includes("was inactive"),
+          ),
+        );
+
+        let closeSettled = false;
+        const closing = harness.close().then(() => {
+          closeSettled = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(closeSettled).toBe(false);
+        releaseBoundary.resolve();
+        await closing;
+        activeHarness = undefined;
+
+        const entriesAfterClose = await fsPromises.readdir(harness.tmpDir);
+        expect(entriesAfterClose.some((entry) => entry.endsWith(".tmp"))).toBe(
+          false,
+        );
+        if (boundary === "temp-sync") {
+          await expect(
+            fsPromises.readFile(sessionStorePath, "utf8"),
+          ).rejects.toMatchObject({ code: "ENOENT" });
+        } else {
+          await expect(
+            new JsonSessionStore(sessionStorePath).get(payload.agentSession.id),
+          ).resolves.toMatchObject({
+            runtimeSessionId: `runtime-stalled-session-${boundary}`,
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        await expect(fsPromises.readdir(harness.tmpDir)).resolves.toEqual(
+          entriesAfterClose,
+        );
+      } finally {
+        releaseBoundary.resolve();
+        renameSpy?.mockRestore();
+        openSpy?.mockRestore();
+        if (harness !== undefined) {
+          await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
+  it("rejects close as incomplete when an in-flight session rename exceeds its shutdown bound", async () => {
+    const renameStarted = createDeferred<void>();
+    const releaseRename = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield {
+        kind: "session-started",
+        runtimeSessionId: "runtime-session-rename-timeout",
+      } as RuntimeEvent;
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        shutdownPersistenceTimeoutMs: 25,
+      });
+      harness = activeHarness;
+      const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      renameSpy = vi.spyOn(fsPromises, "rename").mockImplementation(
+        async (from, to) => {
+          if (String(to) === sessionStorePath) {
+            renameStarted.resolve();
+            await releaseRename.promise;
+          }
+          await originalRename(from, to);
+        },
+      );
+      const payload = {
+        webhookId: "webhook-session-rename-timeout",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "session-rename-timeout" },
+        promptContext: "private session rename timeout prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await renameStarted.promise;
+
+      await expect(harness.close()).rejects.toThrow(
+        "Session persistence shutdown timed out",
+      );
+      activeHarness = undefined;
+      releaseRename.resolve();
+      await waitFor(async () =>
+        (await new JsonSessionStore(sessionStorePath).get(
+          payload.agentSession.id,
+        )) !== undefined,
+      );
+    } finally {
+      releaseRename.resolve();
+      renameSpy?.mockRestore();
       if (harness !== undefined) {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
       }

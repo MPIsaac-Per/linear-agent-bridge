@@ -108,6 +108,7 @@ export interface ActivityOutboxEntry {
   activityId: string;
   agentSessionId: string;
   contentDigest: string;
+  contentVersion?: string | undefined;
   attempts: number;
   status: "pending" | "delivered";
   updatedAt: string;
@@ -168,6 +169,8 @@ export interface BridgeStateStore {
     activityKey: string,
     agentSessionId: string,
     contentDigest: string,
+    contentVersion?: string,
+    compatibleContentDigests?: Readonly<Record<string, string>>,
   ): Promise<ActivityOutboxEntry>;
   markActivityAttempted(
     executionId: string,
@@ -1179,12 +1182,27 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     activityKey: string,
     agentSessionId: string,
     contentDigest: string,
+    contentVersion?: string,
+    compatibleContentDigests: Readonly<Record<string, string>> = {},
   ): Promise<ActivityOutboxEntry> {
     validateIdentifier(executionId, "executionId", MAX_EXECUTION_ID_LENGTH);
     validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
     validateIdentifier(agentSessionId, "agentSessionId");
     if (!/^[a-f0-9]{64}$/.test(contentDigest)) {
       throw new Error("contentDigest must be a lowercase SHA-256 digest");
+    }
+    if (contentVersion !== undefined) {
+      validateIdentifier(contentVersion, "contentVersion", MAX_ACTIVITY_KEY_LENGTH);
+    }
+    const compatibleBindings = Object.entries(compatibleContentDigests);
+    if (compatibleBindings.length > 8) {
+      throw new Error("Too many compatible activity content versions");
+    }
+    for (const [version, digest] of compatibleBindings) {
+      validateIdentifier(version, "contentVersion", MAX_ACTIVITY_KEY_LENGTH);
+      if (!/^[a-f0-9]{64}$/.test(digest)) {
+        throw new Error("contentDigest must be a lowercase SHA-256 digest");
+      }
     }
 
     return this.mutate(async (deadline) => {
@@ -1199,13 +1217,41 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       const outbox = (claim.activityOutbox ??= {});
       const existing = outbox[activityKey];
       if (existing !== undefined) {
+        if (existing.agentSessionId !== agentSessionId) {
+          throw new Error(
+            `Activity binding changed for executionId "${executionId}"`,
+          );
+        }
+        if (contentVersion === undefined) {
+          if (existing.contentDigest !== contentDigest) {
+            throw new Error(
+              `Activity binding changed for executionId "${executionId}"`,
+            );
+          }
+          return { ...existing };
+        }
+        const acceptedBindings = new Map<string, string>([
+          [contentVersion, contentDigest],
+          ...compatibleBindings,
+        ]);
+        const matchedVersion =
+          existing.contentVersion ??
+          [...acceptedBindings].find(
+            ([, digest]) => digest === existing.contentDigest,
+          )?.[0];
         if (
-          existing.agentSessionId !== agentSessionId ||
-          existing.contentDigest !== contentDigest
+          matchedVersion === undefined ||
+          acceptedBindings.get(matchedVersion) !== existing.contentDigest
         ) {
           throw new Error(
             `Activity binding changed for executionId "${executionId}"`,
           );
+        }
+        if (existing.contentVersion === undefined) {
+          existing.contentVersion = matchedVersion;
+          existing.updatedAt = this.timestamp();
+          claim.updatedAt = existing.updatedAt;
+          await this.writeState(state, deadline);
         }
         return { ...existing };
       }
@@ -1214,13 +1260,18 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           `Too many outbound activity ids for executionId "${executionId}"`,
         );
       }
-      const activityId = claim.activityIds[activityKey] ?? randomUUID();
+      const priorActivityId = claim.activityIds[activityKey];
+      const activityId = priorActivityId ?? randomUUID();
       claim.activityIds[activityKey] = activityId;
       const entry: ActivityOutboxEntry = {
         activityId,
         agentSessionId,
         contentDigest,
-        attempts: 0,
+        ...(contentVersion === undefined ? {} : { contentVersion }),
+        // Legacy releases persisted only the caller-supplied UUID. Its
+        // delivery outcome is uncertain, so reconcile that exact ID before
+        // any replay instead of assuming no create was attempted.
+        attempts: priorActivityId === undefined ? 0 : 1,
         status: "pending",
         updatedAt: this.timestamp(),
       };

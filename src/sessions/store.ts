@@ -30,13 +30,15 @@ export class JsonSessionStore {
     return sessions[linearSessionId];
   }
 
-  async put(record: SessionRecord): Promise<void> {
+  async put(record: SessionRecord, signal?: AbortSignal): Promise<void> {
     if (!isSessionRecord(record.linearSessionId, record)) {
       throw new Error("Invalid session record");
     }
+    throwIfAborted(signal);
     const sessions = await this.readAll();
+    throwIfAborted(signal);
     sessions[record.linearSessionId] = record;
-    await this.writeAll(sessions);
+    await this.writeAll(sessions, signal);
   }
 
   /** Only a missing file reads as an empty store. */
@@ -92,9 +94,14 @@ export class JsonSessionStore {
   }
 
   /** Write and sync a secured temp file before atomically replacing the target. */
-  private async writeAll(sessions: SessionMap): Promise<void> {
+  private async writeAll(
+    sessions: SessionMap,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const directory = path.dirname(this.resolvedPath);
+    throwIfAborted(signal);
     await this.ensureDurableDirectory(directory);
+    throwIfAborted(signal);
 
     const tmpPath = path.join(
       directory,
@@ -106,14 +113,23 @@ export class JsonSessionStore {
     let operationError: unknown;
 
     try {
+      throwIfAborted(signal);
       tmpHandle = await fs.open(tmpPath, "wx", 0o600);
       ownsTempPath = true;
+      throwIfAborted(signal);
       await tmpHandle.writeFile(JSON.stringify(sessions, null, 2), "utf8");
+      throwIfAborted(signal);
       await tmpHandle.chmod(0o600);
+      throwIfAborted(signal);
       await tmpHandle.sync();
+      throwIfAborted(signal);
       await tmpHandle.close();
       tmpHandle = undefined;
 
+      // Rename is the point after which cancellation cannot safely undo the
+      // durable mapping. Once entered, finish its directory sync and let the
+      // caller track settlement through shutdown.
+      throwIfAborted(signal);
       await fs.rename(tmpPath, this.resolvedPath);
       ownsTempPath = false;
       await syncDirectory(directory);
@@ -133,6 +149,12 @@ export class JsonSessionStore {
     if (unlinkError !== undefined) {
       throw unlinkError;
     }
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw signal.reason ?? new Error("Session store write aborted");
   }
 }
 

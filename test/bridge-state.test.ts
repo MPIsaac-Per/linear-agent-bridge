@@ -3190,6 +3190,79 @@ describe("JsonBridgeStateStore", () => {
     });
   });
 
+  it("migrates a digest-only activity outbox to its matching retained renderer", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+    });
+    await store.claimEvent(event());
+    const legacyDigest = "a".repeat(64);
+    const currentDigest = "b".repeat(64);
+    const prepared = await store.prepareActivity(
+      "created:session-1",
+      "liveness",
+      "session-1",
+      legacyDigest,
+    );
+    await store.markActivityAttempted("created:session-1", "liveness");
+
+    await expect(
+      store.prepareActivity(
+        "created:session-1",
+        "liveness",
+        "session-1",
+        currentDigest,
+        "created-thought:v2",
+        { "created-thought:v1": legacyDigest },
+      ),
+    ).resolves.toMatchObject({
+      activityId: prepared.activityId,
+      contentDigest: legacyDigest,
+      contentVersion: "created-thought:v1",
+      attempts: 1,
+      status: "pending",
+    });
+    await expect(
+      store.prepareActivity(
+        "created:session-1",
+        "liveness",
+        "session-1",
+        currentDigest,
+        "created-thought:v2",
+        { "created-thought:v1": "c".repeat(64) },
+      ),
+    ).rejects.toThrow("Activity binding changed");
+  });
+
+  it("treats a legacy activity id without an outbox as an uncertain prior attempt", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ...TEST_LOCK_OPTIONS,
+      ownerId: "runtime-a",
+    });
+    await store.claimEvent(event());
+    const legacyActivityId = await store.getOrCreateActivityId(
+      "created:session-1",
+      "liveness",
+    );
+
+    await expect(
+      store.prepareActivity(
+        "created:session-1",
+        "liveness",
+        "session-1",
+        "a".repeat(64),
+        "created-thought:v1",
+      ),
+    ).resolves.toMatchObject({
+      activityId: legacyActivityId,
+      contentVersion: "created-thought:v1",
+      attempts: 1,
+      status: "pending",
+    });
+  });
+
   it("prunes terminal receipts after seven days while preserving active claims", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     let now = Date.parse("2026-08-01T00:00:00.000Z");

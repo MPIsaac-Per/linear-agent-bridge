@@ -25,6 +25,17 @@ function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
+function deferred<T = void>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function rootToLeaf(directory: string): string[] {
   const { root } = path.parse(directory);
   const directories = [root];
@@ -366,6 +377,82 @@ describe("JsonSessionStore", () => {
       await expect(fs.readdir(tmpDir)).resolves.toEqual([]);
     } finally {
       openSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("aborts after a stalled temp sync without publishing or retaining the temp file", async () => {
+    const storePath = path.join(tmpDir, "sessions.json");
+    const syncStarted = deferred();
+    const releaseSync = deferred();
+    const controller = new AbortController();
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]).endsWith(".tmp")) {
+        const originalSync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncStarted.resolve();
+          await releaseSync.promise;
+          await originalSync();
+        });
+      }
+      return handle;
+    });
+    const renameSpy = vi.spyOn(fs, "rename");
+
+    try {
+      const failure = new Error("synthetic session write abort");
+      const write = new JsonSessionStore(storePath).put(
+        record(),
+        controller.signal,
+      );
+      await syncStarted.promise;
+      controller.abort(failure);
+      releaseSync.resolve();
+      await expect(write).rejects.toBe(failure);
+      expect(renameSpy).not.toHaveBeenCalled();
+      await expect(fs.readdir(tmpDir)).resolves.toEqual([]);
+    } finally {
+      releaseSync.resolve();
+      openSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
+  it("settles an in-flight rename before an aborted session write returns", async () => {
+    const storePath = path.join(tmpDir, "sessions.json");
+    const renameStarted = deferred();
+    const releaseRename = deferred();
+    const controller = new AbortController();
+    const originalRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(
+      async (from, to) => {
+        renameStarted.resolve();
+        await releaseRename.promise;
+        await originalRename(from, to);
+      },
+    );
+
+    try {
+      let writeSettled = false;
+      const write = new JsonSessionStore(storePath)
+        .put(record(), controller.signal)
+        .then(() => {
+          writeSettled = true;
+        });
+      await renameStarted.promise;
+      controller.abort(new Error("synthetic abort after rename entry"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(writeSettled).toBe(false);
+      releaseRename.resolve();
+      await write;
+      expect(writeSettled).toBe(true);
+      await expect(
+        new JsonSessionStore(storePath).get("linear-1"),
+      ).resolves.toEqual(record());
+    } finally {
+      releaseRename.resolve();
       renameSpy.mockRestore();
     }
   });

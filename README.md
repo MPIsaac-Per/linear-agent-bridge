@@ -144,9 +144,10 @@ persistent local storage as well. It contains bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
 caller-generated activity UUIDs, a bounded pre-intent activity outbox, and
 recovery ciphertext for accepted turns that have not reached terminal state.
-The plaintext outbox records the activity UUID, session ID, content digest,
-attempt count, delivery status, and timestamps, but not the activity content.
-Plaintext recovery routing metadata includes the action,
+The plaintext outbox records the activity UUID, session ID, bounded static
+renderer version, content digest, attempt count, delivery status, and
+timestamps, but not the activity content. Plaintext recovery routing metadata
+includes the action,
 session/webhook/execution IDs, recovery sequence, event timestamp, envelope
 `keyId`, runtime-start intent timestamp, and stop-fence provenance. Prompt,
 issue, and comment text, the raw signal, and the stop/body semantics remain
@@ -291,6 +292,15 @@ session takes.
   be established. If final confirmation remains uncertain, the receipt stays
   conservatively ambiguous. Same-process duplicate deliveries remain ordinary
   duplicates.
+- Pre-runtime liveness and stop outboxes persist a static renderer version.
+  Keep prior renderers when changing this copy so pending work can reconcile
+  its original caller UUID and content binding across an upgrade. Legacy
+  digest-only entries and caller UUIDs are migrated conservatively and queried
+  by exact activity ID before replay.
+- Session mapping writes abort before entering atomic rename. Shutdown waits a
+  bounded second for a rename already in flight to finish and sync. A timeout
+  rejects close as incomplete, and production signal handling exits nonzero
+  instead of claiming a fully drained shutdown.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.

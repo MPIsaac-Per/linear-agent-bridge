@@ -39,8 +39,10 @@ Changes awaiting a tagged release remain under Unreleased.
   Linear documents caller IDs and lookup but gives no query-visibility or
   repeated-create idempotency guarantee, leaving a disclosed duplicate or
   create-error risk in exchange for availability. Outbox state retains bounded
-  IDs, a content digest, attempt count, delivery status, and timestamps without
-  storing activity content.
+  IDs, a static renderer version, content digest, attempt count, delivery
+  status, and timestamps without storing activity content. Digest-only outbox
+  records and legacy caller UUIDs migrate through retained renderers and exact
+  ID reconciliation.
 - Add reader-first recovery-key rotation through up to four retained previous
   keys. The primary key writes new envelopes while the retained keyring reads
   outstanding envelopes from earlier deployments.

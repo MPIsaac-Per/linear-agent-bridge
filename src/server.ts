@@ -60,8 +60,44 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
+interface PreIntentActivityVersion {
+  content: AgentActivityContent;
+  ephemeral: boolean;
+}
+interface PreIntentActivityDefinition {
+  currentVersion: string;
+  versions: Readonly<Record<string, PreIntentActivityVersion>>;
+}
+const CREATED_THOUGHT_ACTIVITY: PreIntentActivityDefinition = {
+  currentVersion: "created-thought:v1",
+  versions: {
+    "created-thought:v1": {
+      content: { type: "thought", body: CREATED_THOUGHT_BODY },
+      ephemeral: true,
+    },
+  },
+};
+const PROMPTED_THOUGHT_ACTIVITY: PreIntentActivityDefinition = {
+  currentVersion: "prompted-thought:v1",
+  versions: {
+    "prompted-thought:v1": {
+      content: { type: "thought", body: PROMPTED_THOUGHT_BODY },
+      ephemeral: true,
+    },
+  },
+};
+const STOPPED_RESPONSE_ACTIVITY: PreIntentActivityDefinition = {
+  currentVersion: "stopped-response:v1",
+  versions: {
+    "stopped-response:v1": {
+      content: { type: "response", body: STOPPED_RESPONSE_BODY },
+      ephemeral: false,
+    },
+  },
+};
 const ACTIVITY_RECONCILIATION_ATTEMPTS = 4;
 const DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS = 1_000;
+const DEFAULT_PERSISTENCE_SHUTDOWN_TIMEOUT_MS = 1_000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 type TerminalTransition =
   | { kind: "completed_without_runtime" }
@@ -74,6 +110,7 @@ interface InternalServerDeps extends ServerDeps {
   requestShutdownController: AbortController;
   processingInFlight: Set<Promise<void>>;
   requestsInFlight: Set<Promise<void>>;
+  sessionWritesInFlight: Set<Promise<void>>;
   closing: boolean;
   recoveryInFlight?: Promise<void> | undefined;
   recoveryRequested: boolean;
@@ -120,6 +157,8 @@ export interface ServerDeps {
   schedulePostResponseWork?: (work: () => void) => void;
   /** Bounded grace period for request handlers already accepted at shutdown. */
   shutdownRequestTimeoutMs?: number;
+  /** Bounded grace period for session renames already in flight at shutdown. */
+  shutdownPersistenceTimeoutMs?: number;
 }
 
 class OAuthStateStore {
@@ -193,6 +232,7 @@ export function startServer(deps: ServerDeps): {
     requestShutdownController: new AbortController(),
     processingInFlight: new Set<Promise<void>>(),
     requestsInFlight: new Set<Promise<void>>(),
+    sessionWritesInFlight: new Set<Promise<void>>(),
     closing: false,
     recoveryRequested: false,
     recoveryBlocked: false,
@@ -380,6 +420,11 @@ export function startServer(deps: ServerDeps): {
         }
         await listenerShutdown;
         await Promise.allSettled([...internalDeps.processingInFlight]);
+        const sessionWritesDrained = await settlePromisesWithin(
+          [...internalDeps.sessionWritesInFlight],
+          deps.shutdownPersistenceTimeoutMs ??
+            DEFAULT_PERSISTENCE_SHUTDOWN_TIMEOUT_MS,
+        );
         await internalDeps.recoveryInFlight?.catch(() => undefined);
         await startupAttempt?.catch(() => undefined);
         await internalDeps.queue.enqueue(async () => {});
@@ -394,6 +439,9 @@ export function startServer(deps: ServerDeps): {
         }
         if (oauthFlushError !== undefined) {
           throw oauthFlushError;
+        }
+        if (!sessionWritesDrained) {
+          throw new Error("Session persistence shutdown timed out");
         }
       })();
     }
@@ -953,11 +1001,8 @@ async function processClaimedWebhook(
         identity.executionId,
         "liveness",
         sessionId,
-        {
-          type: "thought",
-          body: CREATED_THOUGHT_BODY,
-        },
-        { ephemeral: true, signal: controller!.signal },
+        CREATED_THOUGHT_ACTIVITY,
+        { signal: controller!.signal },
       );
       if (controller!.signal.aborted) {
         if (deps.closing) {
@@ -985,7 +1030,7 @@ async function processClaimedWebhook(
         identity.executionId,
         "stop-response",
         sessionId,
-        { type: "response", body: STOPPED_RESPONSE_BODY },
+        STOPPED_RESPONSE_ACTIVITY,
         { signal: deps.shutdownController.signal },
       );
       if (!deps.closing) {
@@ -1013,11 +1058,8 @@ async function processClaimedWebhook(
       identity.executionId,
       "liveness",
       sessionId,
-      {
-        type: "thought",
-        body: PROMPTED_THOUGHT_BODY,
-      },
-      { ephemeral: true, signal: controller!.signal },
+      PROMPTED_THOUGHT_ACTIVITY,
+      { signal: controller!.signal },
     );
     if (controller!.signal.aborted) {
       if (deps.closing) {
@@ -1574,13 +1616,19 @@ async function handleRuntimeEvent(
   activitySequence: number,
 ): Promise<void> {
   if (event.kind === "session-started") {
-    await deps.store.put({
+    const sessionWrite = deps.store.put({
       linearSessionId: request.linearSessionId,
       runtimeSessionId: event.runtimeSessionId,
       runtime: deps.runtime.name,
       issueIdentifier,
       updatedAt: new Date().toISOString(),
-    });
+    }, request.abortController?.signal);
+    deps.sessionWritesInFlight.add(sessionWrite);
+    try {
+      await sessionWrite;
+    } finally {
+      deps.sessionWritesInFlight.delete(sessionWrite);
+    }
     return;
   }
 
@@ -1657,24 +1705,32 @@ async function emitPreIntentActivity(
   executionId: string,
   activityKey: string,
   agentSessionId: string,
-  content: AgentActivityContent,
-  options: { ephemeral?: boolean; signal?: AbortSignal } = {},
+  definition: PreIntentActivityDefinition,
+  options: { signal?: AbortSignal } = {},
 ): Promise<void> {
-  const contentDigest = createHash("sha256")
-    .update(
-      JSON.stringify({
-        agentSessionId,
-        content,
-        ephemeral: options.ephemeral === true,
-      }),
-    )
-    .digest("hex");
+  const contentDigests = Object.fromEntries(
+    Object.entries(definition.versions).map(([version, rendered]) => [
+      version,
+      activityContentDigest(agentSessionId, rendered),
+    ]),
+  );
+  const currentContentDigest = contentDigests[definition.currentVersion];
+  if (currentContentDigest === undefined) {
+    throw new Error("Current activity content renderer is unavailable");
+  }
   let outbox = await deps.bridgeState.prepareActivity(
     executionId,
     activityKey,
     agentSessionId,
-    contentDigest,
+    currentContentDigest,
+    definition.currentVersion,
+    contentDigests,
   );
+  const rendered =
+    definition.versions[outbox.contentVersion ?? definition.currentVersion];
+  if (rendered === undefined) {
+    throw new Error("Persisted activity content renderer is unavailable");
+  }
   if (outbox.status === "delivered") {
     return;
   }
@@ -1709,12 +1765,27 @@ async function emitPreIntentActivity(
   if (outbox.status === "delivered") {
     return;
   }
-  await deps.linear.createActivity(agentSessionId, content, {
+  await deps.linear.createActivity(agentSessionId, rendered.content, {
     activityId: outbox.activityId,
-    ...options,
+    ...(rendered.ephemeral ? { ephemeral: true } : {}),
     signal,
   });
   await deps.bridgeState.markActivityDelivered(executionId, activityKey);
+}
+
+function activityContentDigest(
+  agentSessionId: string,
+  rendered: PreIntentActivityVersion,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        agentSessionId,
+        content: rendered.content,
+        ephemeral: rendered.ephemeral,
+      }),
+    )
+    .digest("hex");
 }
 
 async function markIngressFailed(
