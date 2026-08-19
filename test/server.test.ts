@@ -1897,6 +1897,88 @@ describe("startServer", () => {
     }
   });
 
+  it("continues same-owner dispatch when the marker is visible after directory sync fails", async () => {
+    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
+      yield { kind: "done" };
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        bridgeStateOwnerId: "runtime-a",
+      });
+      const harness = activeHarness;
+      const stateDirectory = path.dirname(harness.bridgeStatePath);
+      const originalOpen = fsPromises.open.bind(fsPromises);
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      let stateRenames = 0;
+      let failedMarkerDirectorySync = false;
+      renameSpy = vi
+        .spyOn(fsPromises, "rename")
+        .mockImplementation(async (from, to) => {
+          await originalRename(from, to);
+          if (String(to) === harness.bridgeStatePath) {
+            stateRenames += 1;
+          }
+        });
+      openSpy = vi
+        .spyOn(fsPromises, "open")
+        .mockImplementation(async (...args) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]) === stateDirectory) {
+            const originalSync = handle.sync.bind(handle);
+            vi.spyOn(handle, "sync").mockImplementation(async () => {
+              if (stateRenames === 3 && !failedMarkerDirectorySync) {
+                failedMarkerDirectorySync = true;
+                throw new Error(
+                  "synthetic dispatch marker directory sync failure",
+                );
+              }
+              await originalSync();
+            });
+          }
+          return handle;
+        });
+      const payload = {
+        webhookId: "webhook-visible-marker-sync-retry",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: "agent-session-visible-marker-sync-retry" },
+        promptContext: "private visible marker prompt",
+        webhookTimestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() => runtime.requests.length === 1);
+      await waitFor(async () =>
+        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+        "completed",
+      );
+      expect(runtime.requests).toHaveLength(1);
+      const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
+      expect(receipt?.status).toBe("completed");
+      expect(receipt).not.toHaveProperty("failedAt");
+      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).not.toContain("private visible marker prompt");
+    } finally {
+      renameSpy?.mockRestore();
+      openSpy?.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   it("retries the earliest recovered marker failure before dispatching later accepted work", async () => {
     const firstPrompt = "first accepted recovery prompt";
     const secondPrompt = "second accepted recovery prompt";

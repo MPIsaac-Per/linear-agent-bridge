@@ -843,7 +843,12 @@ async function processClaimedWebhook(
       if (released || releaseFailed) {
         throw new PreDispatchClaimReleasedError();
       }
-      throw error;
+      const dispatch = await deps.bridgeState.markDispatchStarted(
+        identity.webhookId,
+      );
+      if (dispatch === "superseded") {
+        return;
+      }
     }
     console.log(
       `[linear-agent-bridge] agent session event: action=${event.action} session=${event.agentSession.id} webhook=${identity.webhookId}`,
