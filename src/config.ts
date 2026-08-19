@@ -27,6 +27,7 @@ export interface Config {
    * discovering the boundary by hitting EACCES.
    */
   agentOutputPath?: string;
+  shutdownTimeoutMs: number;
 }
 
 const DEFAULT_PORT = "3979";
@@ -39,6 +40,9 @@ const DEFAULT_RECONCILE_INTERVAL_MS = "60000";
 const DEFAULT_RECONCILE_LOOKBACK_MS = "86400000";
 const DEFAULT_RECONCILE_MAX_SESSIONS = "250";
 const DEFAULT_AGENT_SESSION_ACK_GRACE_MS = "120000";
+// Chosen to sit inside launchd's 20-second SIGKILL window. systemd's default
+// TimeoutStopSec is far longer, so the same default is safe there.
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = "10000";
 let warnedAboutDeprecatedRunTimeout = false;
 
 function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -171,11 +175,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
 
   const agentOutputPathRaw = env.AGENT_OUTPUT_PATH;
+  const shutdownTimeoutMs = positiveInteger(
+    env.SHUTDOWN_TIMEOUT_MS ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    "SHUTDOWN_TIMEOUT_MS",
+  );
 
   return {
     ...(agentOutputPathRaw !== undefined && agentOutputPathRaw !== ""
       ? { agentOutputPath: resolveAgentOutputPath(agentOutputPathRaw) }
       : {}),
+    shutdownTimeoutMs,
     linearClientId,
     linearClientSecret,
     linearWebhookSecret,

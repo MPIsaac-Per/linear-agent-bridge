@@ -25,6 +25,7 @@ describe("loadConfig", () => {
       linearWebhookSecret: "webhook-secret",
       linearAccessToken: "access-token",
       port: 3979,
+      shutdownTimeoutMs: 10_000,
       runtime: "claude",
       kbPath: process.cwd(),
       sessionStorePath: "./data/sessions.json",
@@ -276,5 +277,26 @@ describe("AGENT_OUTPUT_PATH", () => {
       // Restore write so the fixture can clean itself up.
       await fs.chmod(target, 0o700);
     }
+  });
+});
+
+describe("SHUTDOWN_TIMEOUT_MS", () => {
+  it("defaults to ten seconds, inside launchd's SIGKILL window", () => {
+    expect(loadConfig({ ...validEnv }).shutdownTimeoutMs).toBe(10_000);
+  });
+
+  it("accepts an override", () => {
+    expect(
+      loadConfig({ ...validEnv, SHUTDOWN_TIMEOUT_MS: "2500" }).shutdownTimeoutMs,
+    ).toBe(2500);
+  });
+
+  it("rejects a value that is not a positive integer", () => {
+    expect(() =>
+      loadConfig({ ...validEnv, SHUTDOWN_TIMEOUT_MS: "0" }),
+    ).toThrow(/SHUTDOWN_TIMEOUT_MS/);
+    expect(() =>
+      loadConfig({ ...validEnv, SHUTDOWN_TIMEOUT_MS: "later" }),
+    ).toThrow(/SHUTDOWN_TIMEOUT_MS/);
   });
 });

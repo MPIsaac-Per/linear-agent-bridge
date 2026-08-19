@@ -28,8 +28,23 @@ Changes awaiting a tagged release remain under Unreleased.
   neither crashes the service nor triggers a retry. The README documents the
   three-tier posture, the dedicated-account requirement, and the loss of
   in-place editing that comes with it.
+- `SHUTDOWN_TIMEOUT_MS`, default 10000, bounding the graceful close.
 
 ### Fixed
+
+- Handle `SIGINT` and `SIGTERM`. The service installed no signal handler, so
+  nothing wired a signal to `server.close()`. launchd sends `SIGTERM` on
+  `bootout` and `kickstart -k` and systemd sends it on `stop` and `restart`,
+  all of which the installer runs on every install, so the process was being
+  killed abruptly as a matter of routine. That skipped the close path the
+  durability work assumes: a turn died with no terminal Linear activity, and a
+  claim could strand between its dispatch marker and completion where recovery
+  can only call it ambiguous. Shutdown now calls `close()` exactly once, exits
+  0 when it completes, and exits 1 with a bounded diagnostic when it rejects or
+  when `SHUTDOWN_TIMEOUT_MS` elapses. A second signal neither starts a second
+  close nor shortens the deadline, a signal arriving while startup is still
+  pending shuts down without an unhandled rejection, and the handlers are
+  removed so nothing holds the event loop open.
 
 - Guarantee one lock acquire attempt per state mutation. The retry loop checked
   its deadline before attempting anything, and the directory sync and owner

@@ -6,6 +6,7 @@ import { JsonSessionStore } from "./sessions/store.js";
 import { JsonBridgeStateStore } from "./state/store.js";
 import { createIngressRecoveryKeyring } from "./state/recovery-envelope.js";
 import { SerialQueue } from "./queue.js";
+import { awaitReadyOrShutdown, installGracefulShutdown } from "./shutdown.js";
 import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
 import type { AgentRuntime } from "./types.js";
@@ -42,5 +43,9 @@ const server = startServer({
   }),
   queue: new SerialQueue(),
 });
-await server.ready;
-console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);
+const shutdown = installGracefulShutdown(server, {
+  timeoutMs: config.shutdownTimeoutMs,
+});
+if (await awaitReadyOrShutdown(server.ready, shutdown)) {
+  console.log(`linear-agent-bridge listening on :${config.port} (runtime: ${config.runtime})`);
+}
