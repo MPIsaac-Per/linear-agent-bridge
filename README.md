@@ -464,18 +464,33 @@ Surfacing the path is for usability and nothing else. Three tiers:
 | Path | Access for the service account |
 | --- | --- |
 | Working directory content | read-only |
-| Agent tooling state inside the working directory | writable |
+| Agent tooling state inside the working directory | see below |
 | `AGENT_OUTPUT_PATH` | writable |
 
-The middle tier exists because agent tooling writes state inside the working
-directory, not only content. Verify the exact set against your installed SDK
-version rather than trusting a list that will age.
+The middle tier is conditional, and on current versions it is empty. Measured on
+a real deployment (Agent SDK, Node 22, Linux, 2026-08-19), a complete turn wrote
+nothing into the working directory. Session transcripts and runtime state went
+to the service account's own home, under `$HOME/.claude/projects/<encoded-cwd>/`.
+
+So start with the working directory read-only in full, including `.claude`,
+which the runtime reads for settings and skills but does not write. Grant read,
+not write. Add a writable path inside the working tree only if your own
+deployment shows the runtime failing without one, and check that against the
+version you have installed rather than trusting this paragraph: this is exactly
+the kind of detail that changes between releases, and the first version of this
+section asserted the opposite.
 
 To set it up: run the service as a dedicated account, not your login account
 and **not root**, since running as root defeats the entire model. Grant that
 account read on the working tree and write on the output path and the tooling
 state path. On Linux the installer creates that account for you; see the
 deployment section above.
+
+A writable directory inside the working tree is still useful for a different
+reason: output you want to land in the working tree rather than beside it. A
+single writable folder there, with everything else read-only, gives the agent a
+place to publish without giving it the tree. That is a deliberate choice about
+where output belongs, not a requirement of the runtime.
 
 The trade is real and worth stating plainly. The agent can no longer edit an
 existing file, fix a typo, or maintain an index in place. Every change becomes
