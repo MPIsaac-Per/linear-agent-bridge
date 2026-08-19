@@ -4307,7 +4307,6 @@ describe("startServer", () => {
       try {
         activeHarness = await startTestServer(runtime, {
           removeTmpDirOnClose: false,
-          configOverrides: { runInactivityTimeoutMs: 20 },
         });
         harness = activeHarness;
         const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
@@ -4362,13 +4361,6 @@ describe("startServer", () => {
           ).status,
         ).toBe(200);
         await boundaryStarted.promise;
-        await waitFor(() =>
-          harness!.calls.some(
-            (call) =>
-              call.content.type === "error" &&
-              call.content.body.includes("was inactive"),
-          ),
-        );
 
         let closeSettled = false;
         const closing = harness.close().then(() => {

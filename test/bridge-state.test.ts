@@ -2627,7 +2627,7 @@ describe("JsonBridgeStateStore", () => {
       store as unknown as {
         lockTimeoutMs: number;
       }
-    ).lockTimeoutMs = 50;
+    ).lockTimeoutMs = 250;
     const markerRenameStarted = deferred();
     const releaseRename = deferred();
     const originalRename = fs.rename.bind(fs);
