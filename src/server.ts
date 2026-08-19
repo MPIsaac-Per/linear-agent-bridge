@@ -22,7 +22,7 @@ import type {
   LinearOAuthTokenManager,
   LinearOAuthTokenResponse,
 } from "./linear/oauth.js";
-import type { JsonSessionStore } from "./sessions/store.js";
+import type { JsonSessionStore, SessionRecord } from "./sessions/store.js";
 import type {
   BridgeStateStore,
   IngressEventIdentity,
@@ -98,6 +98,7 @@ const STOPPED_RESPONSE_ACTIVITY: PreIntentActivityDefinition = {
 const ACTIVITY_RECONCILIATION_ATTEMPTS = 4;
 const DEFAULT_REQUEST_SHUTDOWN_TIMEOUT_MS = 1_000;
 const DEFAULT_PERSISTENCE_SHUTDOWN_TIMEOUT_MS = 1_000;
+const DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS = 1_000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 type TerminalTransition =
   | { kind: "completed_without_runtime" }
@@ -159,6 +160,8 @@ export interface ServerDeps {
   shutdownRequestTimeoutMs?: number;
   /** Bounded grace period for session renames already in flight at shutdown. */
   shutdownPersistenceTimeoutMs?: number;
+  /** Bounded queue handoff and session lookup wait after runtime cancellation. */
+  sessionWriteHandoffTimeoutMs?: number;
 }
 
 class OAuthStateStore {
@@ -183,6 +186,13 @@ class OAuthStateStore {
         this.states.delete(state);
       }
     }
+  }
+}
+
+class SessionPersistenceHandoffError extends Error {
+  constructor() {
+    super("Session persistence handoff timed out");
+    this.name = "SessionPersistenceHandoffError";
   }
 }
 
@@ -1127,7 +1137,11 @@ function enqueueSessionRun(
       let runtimeInvoked = false;
       try {
         if (options.loadStoredSessionAtExecution === true) {
-          const storedSession = await deps.store.get(request.linearSessionId);
+          const storedSession = await getStoredSessionForQueuedTurn(
+            deps,
+            request.linearSessionId,
+            controller.signal,
+          );
           effectiveRequest = {
             ...request,
             ...(storedSession?.runtimeSessionId !== undefined
@@ -1293,7 +1307,19 @@ async function releasePreIntentForRecovery(
     );
   }
   if (released || !deps.closing) {
-    void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
+    if (
+      cause instanceof SessionPersistenceHandoffError &&
+      deps.sessionWritesInFlight.size > 0
+    ) {
+      const pendingWrites = [...deps.sessionWritesInFlight];
+      void Promise.allSettled(pendingWrites).then(() => {
+        if (!deps.closing) {
+          void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
+        }
+      });
+    } else {
+      void scheduleAcceptedIngressRecovery(deps).catch(() => undefined);
+    }
     throw new PreRuntimeClaimReleasedError();
   }
   throw cause ?? new PreRuntimeClaimReleasedError();
@@ -1550,6 +1576,11 @@ async function runSessionTask(
   ]);
   clearTimeout(inactivityTimer!);
   controller?.signal.removeEventListener("abort", onControllerAbort);
+  await settlePromisesWithin(
+    [...deps.sessionWritesInFlight],
+    deps.sessionWriteHandoffTimeoutMs ??
+      DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS,
+  );
 
   if (
     inactivityTriggered ||
@@ -1605,6 +1636,35 @@ async function runSessionTask(
     return "failed";
   }
   return signalIsAborted(controller?.signal) ? "stopped" : "completed";
+}
+
+async function getStoredSessionForQueuedTurn(
+  deps: InternalServerDeps,
+  linearSessionId: string,
+  runSignal: AbortSignal,
+): Promise<SessionRecord | undefined> {
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(
+    () =>
+      timeoutController.abort(
+        new SessionPersistenceHandoffError(),
+      ),
+    deps.sessionWriteHandoffTimeoutMs ??
+      DEFAULT_SESSION_WRITE_HANDOFF_TIMEOUT_MS,
+  );
+  timeout.unref?.();
+  try {
+    return await deps.store.get(
+      linearSessionId,
+      AbortSignal.any([
+        runSignal,
+        deps.shutdownController.signal,
+        timeoutController.signal,
+      ]),
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function handleRuntimeEvent(

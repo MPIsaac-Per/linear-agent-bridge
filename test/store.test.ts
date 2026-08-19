@@ -457,6 +457,51 @@ describe("JsonSessionStore", () => {
     }
   });
 
+  it("serializes overlapping session writes without losing either mapping", async () => {
+    const storePath = path.join(tmpDir, "sessions.json");
+    const firstRenameStarted = deferred();
+    const releaseFirstRename = deferred();
+    const originalRename = fs.rename.bind(fs);
+    let targetRenames = 0;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(
+      async (from, to) => {
+        if (String(to) === storePath) {
+          targetRenames += 1;
+          if (targetRenames === 1) {
+            firstRenameStarted.resolve();
+            await releaseFirstRename.promise;
+          }
+        }
+        await originalRename(from, to);
+      },
+    );
+
+    try {
+      const store = new JsonSessionStore(storePath);
+      const first = record({
+        linearSessionId: "linear-first",
+        runtimeSessionId: "runtime-first",
+      });
+      const second = record({
+        linearSessionId: "linear-second",
+        runtimeSessionId: "runtime-second",
+      });
+      const firstWrite = store.put(first);
+      await firstRenameStarted.promise;
+      const secondWrite = store.put(second);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(targetRenames).toBe(1);
+
+      releaseFirstRename.resolve();
+      await Promise.all([firstWrite, secondWrite]);
+      await expect(store.get(first.linearSessionId)).resolves.toEqual(first);
+      await expect(store.get(second.linearSessionId)).resolves.toEqual(second);
+    } finally {
+      releaseFirstRename.resolve();
+      renameSpy.mockRestore();
+    }
+  });
+
   it("rejects a rename failure after temp fsync and removes the temp file", async () => {
     const storePath = path.join(tmpDir, "sessions.json");
     const failure = Object.assign(new Error("synthetic rename failure"), {

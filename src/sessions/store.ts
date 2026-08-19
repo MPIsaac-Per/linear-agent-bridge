@@ -20,20 +20,41 @@ type SessionMap = Record<string, SessionRecord>;
 export class JsonSessionStore {
   private readonly resolvedPath: string;
   private directoryReady: Promise<void> | undefined;
+  private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(pathname: string) {
     this.resolvedPath = path.resolve(pathname);
   }
 
-  async get(linearSessionId: string): Promise<SessionRecord | undefined> {
+  async get(
+    linearSessionId: string,
+    signal?: AbortSignal,
+  ): Promise<SessionRecord | undefined> {
+    await beforeAbort(this.mutationTail, signal);
+    // A filesystem read has no cancellation primitive. Keep the caller
+    // attached through settlement so a timeout cannot spawn overlapping
+    // retries of the same uncancelled read.
     const sessions = await this.readAll();
+    throwIfAborted(signal);
     return sessions[linearSessionId];
   }
 
-  async put(record: SessionRecord, signal?: AbortSignal): Promise<void> {
+  put(record: SessionRecord, signal?: AbortSignal): Promise<void> {
     if (!isSessionRecord(record.linearSessionId, record)) {
-      throw new Error("Invalid session record");
+      return Promise.reject(new Error("Invalid session record"));
     }
+    const write = this.mutationTail.then(() => this.putSerialized(record, signal));
+    this.mutationTail = write.then(
+      () => undefined,
+      () => undefined,
+    );
+    return write;
+  }
+
+  private async putSerialized(
+    record: SessionRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
     throwIfAborted(signal);
     const sessions = await this.readAll();
     throwIfAborted(signal);
@@ -156,6 +177,30 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted === true) {
     throw signal.reason ?? new Error("Session store write aborted");
   }
+}
+
+function beforeAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 const SUPPORTS_DIRECTORY_FSYNC =

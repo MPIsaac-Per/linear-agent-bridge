@@ -43,6 +43,9 @@ Changes awaiting a tagged release remain under Unreleased.
   status, and timestamps without storing activity content. Digest-only outbox
   records and legacy caller UUIDs migrate through retained renderers and exact
   ID reconciliation.
+- Serialize durable runtime-session mappings and gate queued follow-ups behind
+  a bounded write/read handoff. A stuck prior rename releases the global queue
+  without letting the follow-up start a fresh runtime session.
 - Add reader-first recovery-key rotation through up to four retained previous
   keys. The primary key writes new envelopes while the retained keyring reads
   outstanding envelopes from earlier deployments.

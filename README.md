@@ -301,6 +301,10 @@ session takes.
   bounded second for a rename already in flight to finish and sync. A timeout
   rejects close as incomplete, and production signal handling exits nonzero
   instead of claiming a fully drained shutdown.
+- Session mapping mutations are serialized. An inactive turn gives an in-flight
+  mapping write a bounded handoff window; queued follow-ups then use a bounded
+  read barrier, so they resume the durable runtime ID or remain recoverable
+  without starting a fresh runtime session.
 - The HMAC-SHA256 signature (`linear-signature` header) covers the raw
   body; the replay-protection timestamp is `webhookTimestamp` inside the
   JSON, milliseconds, reject beyond 60s skew.

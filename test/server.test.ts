@@ -208,6 +208,7 @@ async function startTestServer(
     prepareOAuthTokenStore?: (storePath: string) => Promise<void>;
     shutdownRequestTimeoutMs?: number;
     shutdownPersistenceTimeoutMs?: number;
+    sessionWriteHandoffTimeoutMs?: number;
   } = {},
 ): Promise<Harness> {
   const calls: LinearCall[] = [];
@@ -276,6 +277,9 @@ async function startTestServer(
       : {}),
     ...(options.shutdownPersistenceTimeoutMs !== undefined
       ? { shutdownPersistenceTimeoutMs: options.shutdownPersistenceTimeoutMs }
+      : {}),
+    ...(options.sessionWriteHandoffTimeoutMs !== undefined
+      ? { sessionWriteHandoffTimeoutMs: options.sessionWriteHandoffTimeoutMs }
       : {}),
     ...(options.schedulePostResponseWork !== undefined
       ? { schedulePostResponseWork: options.schedulePostResponseWork }
@@ -4467,6 +4471,327 @@ describe("startServer", () => {
     } finally {
       releaseRename.resolve();
       renameSpy?.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("waits for an inactive turn's session rename before resuming its queued follow-up", async () => {
+    const renameStarted = createDeferred<void>();
+    const releaseRename = createDeferred<void>();
+    const initialPrompt = "initial prompt with delayed session mapping";
+    const followUpPrompt = "follow up must resume the delayed mapping";
+    const runtime = new FakeRuntime(async function* (request) {
+      if (request.prompt === initialPrompt) {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-delayed-handoff",
+        } as RuntimeEvent;
+      }
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        configOverrides: { runInactivityTimeoutMs: 20 },
+        sessionWriteHandoffTimeoutMs: 250,
+      });
+      harness = activeHarness;
+      const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      renameSpy = vi.spyOn(fsPromises, "rename").mockImplementation(
+        async (from, to) => {
+          if (String(to) === sessionStorePath) {
+            renameStarted.resolve();
+            await releaseRename.promise;
+          }
+          await originalRename(from, to);
+        },
+      );
+      const now = Date.now();
+      const sessionId = "session-delayed-handoff";
+      const created = {
+        webhookId: "webhook-delayed-handoff-created",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: sessionId },
+        promptContext: initialPrompt,
+        webhookTimestamp: now,
+      };
+      const createdBody = JSON.stringify(created);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+            },
+            body: createdBody,
+          })
+        ).status,
+      ).toBe(200);
+      await renameStarted.promise;
+      await waitFor(
+        () => runtime.requests[0]?.abortController?.signal.aborted === true,
+      );
+
+      const prompted = {
+        webhookId: "webhook-delayed-handoff-prompted",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: sessionId },
+        agentActivity: {
+          id: "activity-delayed-handoff-prompted",
+          createdAt: new Date(now + 1).toISOString(),
+          content: { type: "prompt", body: followUpPrompt },
+        },
+        webhookTimestamp: now + 1,
+      };
+      const promptedBody = JSON.stringify(prompted);
+      const promptedRequest = fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(promptedBody, WEBHOOK_SECRET),
+        },
+        body: promptedBody,
+      });
+      await waitFor(async () =>
+        (await harness!.bridgeState.getClaim(
+          prompted.agentActivity.id,
+        ))?.activityOutbox?.liveness?.status === "delivered",
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(runtime.requests).toHaveLength(1);
+
+      releaseRename.resolve();
+      expect((await promptedRequest).status).toBe(200);
+      await waitFor(() => runtime.requests.length === 2);
+      expect(runtime.requests[1]).toMatchObject({
+        linearSessionId: sessionId,
+        prompt: followUpPrompt,
+        resumeSessionId: "runtime-delayed-handoff",
+      });
+    } finally {
+      releaseRename.resolve();
+      renameSpy?.mockRestore();
+      await activeHarness?.close().catch(() => undefined);
+      activeHarness = undefined;
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("releases the global queue when a prior session rename never settles", async () => {
+    const renameStarted = createDeferred<void>();
+    const releaseRename = createDeferred<void>();
+    const initialPrompt = "initial prompt with stuck session mapping";
+    const runtime = new FakeRuntime(async function* (request) {
+      if (request.prompt === initialPrompt) {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-stuck-handoff",
+        } as RuntimeEvent;
+      }
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let getSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        configOverrides: { runInactivityTimeoutMs: 20 },
+        sessionWriteHandoffTimeoutMs: 25,
+        shutdownPersistenceTimeoutMs: 25,
+      });
+      harness = activeHarness;
+      const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const originalRename = fsPromises.rename.bind(fsPromises);
+      renameSpy = vi.spyOn(fsPromises, "rename").mockImplementation(
+        async (from, to) => {
+          if (String(to) === sessionStorePath) {
+            renameStarted.resolve();
+            await releaseRename.promise;
+          }
+          await originalRename(from, to);
+        },
+      );
+      const now = Date.now();
+      const sessionId = "session-stuck-handoff";
+      const created = {
+        webhookId: "webhook-stuck-handoff-created",
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: sessionId },
+        promptContext: initialPrompt,
+        webhookTimestamp: now,
+      };
+      const createdBody = JSON.stringify(created);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+            },
+            body: createdBody,
+          })
+        ).status,
+      ).toBe(200);
+      await renameStarted.promise;
+      await waitFor(
+        () => runtime.requests[0]?.abortController?.signal.aborted === true,
+      );
+
+      const prompted = {
+        webhookId: "webhook-stuck-handoff-prompted",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: sessionId },
+        agentActivity: {
+          id: "activity-stuck-handoff-prompted",
+          createdAt: new Date(now + 1).toISOString(),
+          content: { type: "prompt", body: "must not start a fresh session" },
+        },
+        webhookTimestamp: now + 1,
+      };
+      const promptedBody = JSON.stringify(prompted);
+      getSpy = vi.spyOn(harness.store, "get");
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(promptedBody, WEBHOOK_SECRET),
+            },
+            body: promptedBody,
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(async () =>
+        (await harness!.bridgeState.getClaim(
+          prompted.agentActivity.id,
+        ))?.activityOutbox?.liveness?.status === "delivered",
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const queueReleased = createDeferred<void>();
+      void harness.queue.enqueue(async () => {
+        queueReleased.resolve();
+      });
+      await expect(
+        Promise.race([
+          queueReleased.promise,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("queue release timed out")), 500),
+          ),
+        ]),
+      ).resolves.toBeUndefined();
+      expect(runtime.requests).toHaveLength(1);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(getSpy).toHaveBeenCalledTimes(1);
+      await expect(
+        harness.bridgeState.getReceipt(prompted.webhookId),
+      ).resolves.toMatchObject({
+        recoveryEnvelope: expect.any(Object),
+      });
+
+      await expect(harness.close()).rejects.toThrow(
+        "Session persistence shutdown timed out",
+      );
+      activeHarness = undefined;
+    } finally {
+      releaseRename.resolve();
+      getSpy?.mockRestore();
+      renameSpy?.mockRestore();
+      if (harness !== undefined) {
+        await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("does not accumulate retries while a session read without pending writes is stalled", async () => {
+    const readStarted = createDeferred<void>();
+    const releaseRead = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    let readSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let harness: Harness | undefined;
+    try {
+      activeHarness = await startTestServer(runtime, {
+        removeTmpDirOnClose: false,
+        sessionWriteHandoffTimeoutMs: 25,
+      });
+      harness = activeHarness;
+      const sessionStorePath = path.join(harness.tmpDir, "sessions.json");
+      const originalReadFile = fsPromises.readFile.bind(fsPromises);
+      let sessionReads = 0;
+      readSpy = vi.spyOn(fsPromises, "readFile").mockImplementation(
+        async (...args) => {
+          if (String(args[0]) === sessionStorePath) {
+            sessionReads += 1;
+            readStarted.resolve();
+            await releaseRead.promise;
+          }
+          return await originalReadFile(...args);
+        },
+      );
+      const now = Date.now();
+      const payload = {
+        webhookId: "webhook-stalled-session-read",
+        type: "AgentSessionEvent",
+        action: "prompted",
+        agentSession: { id: "session-stalled-session-read" },
+        agentActivity: {
+          id: "activity-stalled-session-read",
+          createdAt: new Date(now).toISOString(),
+          content: { type: "prompt", body: "wait for the one session read" },
+        },
+        webhookTimestamp: now,
+      };
+      const body = JSON.stringify(payload);
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await readStarted.promise;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(sessionReads).toBe(1);
+      expect(runtime.requests).toHaveLength(0);
+
+      let closeSettled = false;
+      const closing = harness.close().then(() => {
+        closeSettled = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeSettled).toBe(false);
+      releaseRead.resolve();
+      await closing;
+      activeHarness = undefined;
+      expect(sessionReads).toBe(1);
+      expect(runtime.requests).toHaveLength(0);
+      await expect(
+        harness.bridgeState.getReceipt(payload.webhookId),
+      ).resolves.toMatchObject({ recoveryEnvelope: expect.any(Object) });
+    } finally {
+      releaseRead.resolve();
+      readSpy?.mockRestore();
       if (harness !== undefined) {
         await fsPromises.rm(harness.tmpDir, { recursive: true, force: true });
       }
