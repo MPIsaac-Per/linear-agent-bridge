@@ -1386,7 +1386,12 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     let started = false;
     let timeout: NodeJS.Timeout | undefined;
     const scheduled = this.mutationTail.then(() => {
-      if (Date.now() >= deadline) {
+      // A spent budget is not a reason to skip the lock. withFileLock already
+      // owes one acquire attempt, including the owner probe, and a loaded host
+      // can burn the whole budget before this callback runs. The timer below
+      // is the queued-work fence: if it has already rejected the caller, the
+      // mutation must not run later.
+      if (started) {
         throw new BridgeStateLockTimeoutError();
       }
       started = true;
@@ -1405,6 +1410,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     return new Promise<T>((resolve, reject) => {
       timeout = setTimeout(() => {
         if (!started) {
+          started = true;
           reject(new BridgeStateLockTimeoutError());
         }
       }, this.lockTimeoutMs);

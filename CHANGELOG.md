@@ -13,11 +13,26 @@ Changes awaiting a tagged release remain under Unreleased.
   its deadline before attempting anything, and the directory sync and owner
   write ahead of it failed the same way, so a mutation whose budget was spent
   during setup gave up without trying the lock and without ever probing the
-  owner of a stale one. On a loaded host that failed mutations that would have
-  succeeded and left abandoned locks unreclaimed, which is what made the
-  bridge state lock tests fail intermittently on CI. The guaranteed attempt has
-  its own bounded floor, and winning the rename now runs the operation instead
-  of discarding a lock nobody else could use.
+  owner of a stale one. `mutate` had the same refuse-before-attempt gate: it
+  checked the clock when its turn came up, so a loaded host could time out
+  without calling `withFileLock` at all. On a loaded host that failed
+  mutations that would have succeeded and left abandoned locks unreclaimed,
+  which is what made the bridge state lock tests fail intermittently on CI.
+  The guaranteed attempt has its own bounded floor, and winning the rename now
+  runs the operation instead of discarding a lock nobody else could use.
+  Work the admission timer already rejected while queued still does not run.
+- Force `deploy/verify-ingress.sh` onto the public path. It resolved the webhook
+  hostname with the system resolver, so on a host joined to the same overlay
+  network as the service every probe travelled the private path: the node
+  terminated TLS locally with a valid certificate and returned correct status
+  codes while public ingress was down, and the script exited 0. It now resolves
+  through configured public resolvers, connects to those addresses explicitly,
+  probes every address in both families, names the address each probe used, and
+  reports a split between system and public resolution as the headline
+  diagnostic. With no reachable resolver it exits nonzero and states that the
+  public path was not tested rather than falling back to the system resolver.
+  Configure with `VERIFY_INGRESS_RESOLVERS`, default `1.1.1.1,8.8.8.8`.
+
 - Stop reconciliation replaying a session's history on its first sighting. A
   session already in Linear predates the bridge watching it, so nothing in the
   window is missed work. The first pass now adopts the newest observed activity

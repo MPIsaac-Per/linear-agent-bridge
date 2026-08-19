@@ -23,6 +23,16 @@ interface RecordedNodeCall {
   env: Record<string, string>;
 }
 
+interface FakeResolution {
+  stdout: string;
+  exit: number;
+}
+
+const DEFAULT_RESOLUTION: FakeResolution = {
+  stdout: "public 203.0.113.10\nsystem 203.0.113.10\n",
+  exit: 0,
+};
+
 async function makeFakeChildren(options: {
   healthExit?: string;
   authenticationControlExit?: string;
@@ -30,6 +40,8 @@ async function makeFakeChildren(options: {
   healthStatus?: string;
   authenticationControlStatus?: string;
   webhookStatus?: string;
+  resolution?: FakeResolution;
+  failingAddresses?: string[];
 }): Promise<{
   curlPath: string;
   curlLogPath: string;
@@ -51,6 +63,17 @@ const dataIndex = args.indexOf("--data-binary");
 const body = dataIndex === -1 ? "" : fs.readFileSync(args[dataIndex + 1].slice(1), "utf8");
 fs.appendFileSync(${JSON.stringify(curlLogPath)}, JSON.stringify({ args, body, headers, env: process.env }) + "\\n");
 const url = args[args.length - 1];
+const resolveIndex = args.indexOf("--resolve");
+const resolvedAddress = resolveIndex === -1
+  ? ""
+  : args[resolveIndex + 1].split(":").slice(2).join(":").split("[").join("").split("]").join("");
+const failingAddresses = ${JSON.stringify(options.failingAddresses ?? [])};
+if (failingAddresses.includes(resolvedAddress)) {
+  // Models a family that is unreachable from the public internet: the
+  // connection never completes, so curl exits nonzero with no status.
+  process.stdout.write("000 0.000");
+  process.exit(7);
+}
 const isHealth = new URL(url).pathname.endsWith("/healthz");
 const isSigned = headers.some(header => header.toLowerCase().startsWith("linear-signature:"));
 const exitCode = Number(isHealth
@@ -69,11 +92,21 @@ process.exit(exitCode);
   const curlPath = path.join(binDir, "curl");
   await fs.writeFile(curlPath, fakeCurl, { mode: 0o755 });
   const nodePath = path.join(binDir, "node");
+  const resolutionPath = path.join(binDir, "resolution.json");
+  await fs.writeFile(
+    resolutionPath,
+    JSON.stringify(options.resolution ?? DEFAULT_RESOLUTION),
+  );
   const fakeNode = `#!${process.execPath}
 const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(nodeLogPath)}, JSON.stringify({ args, env: process.env }) + "\\n");
+if (args[0] && args[0].endsWith("resolve-public-addresses.mjs")) {
+  const canned = JSON.parse(fs.readFileSync(${JSON.stringify(resolutionPath)}, "utf8"));
+  process.stdout.write(canned.stdout);
+  process.exit(canned.exit);
+}
 const result = spawnSync(${JSON.stringify(process.execPath)}, args, { env: process.env, stdio: "inherit" });
 process.exit(result.status ?? 1);
 `;
@@ -83,6 +116,7 @@ process.exit(result.status ?? 1);
 
 async function runVerifier(
   envOverrides: Record<string, string | undefined> = {},
+  fakes: { resolution?: FakeResolution; failingAddresses?: string[] } = {},
 ): Promise<{
   code: number | null;
   stdout: string;
@@ -108,6 +142,10 @@ async function runVerifier(
       : {}),
     ...(envOverrides.FAKE_WEBHOOK_STATUS !== undefined
       ? { webhookStatus: envOverrides.FAKE_WEBHOOK_STATUS }
+      : {}),
+    ...(fakes.resolution !== undefined ? { resolution: fakes.resolution } : {}),
+    ...(fakes.failingAddresses !== undefined
+      ? { failingAddresses: fakes.failingAddresses }
       : {}),
   });
   const env: NodeJS.ProcessEnv = {
@@ -301,20 +339,26 @@ describe("deploy/verify-ingress.sh", () => {
       expect(call.args[0]).toBe("-q");
       expect(verifierControlledEnv(call.env)).toEqual({});
     }
-    expect(result.nodeCalls).toHaveLength(3);
+    expect(result.nodeCalls).toHaveLength(4);
     expect(verifierControlledEnv(result.nodeCalls[0].env)).toEqual({
       WEBHOOK_URL: "https://edge.example/linear/webhook",
     });
-    expect(verifierControlledEnv(result.nodeCalls[1].env)).toEqual({});
+    // The resolver child receives the host and the resolver list, and nothing
+    // else: no secret, no URL, no inherited environment.
+    expect(verifierControlledEnv(result.nodeCalls[1].env)).toEqual({
+      VERIFY_HOST: "edge.example",
+      VERIFY_RESOLVERS: "1.1.1.1,8.8.8.8",
+    });
     expect(verifierControlledEnv(result.nodeCalls[2].env)).toEqual({});
+    expect(verifierControlledEnv(result.nodeCalls[3].env)).toEqual({});
     expect(result.stdout).toContain(
-      "healthz url=https://edge.example/linear/healthz http_status=200 elapsed_seconds=0.041",
+      "healthz url=https://edge.example/linear/healthz address=203.0.113.10 http_status=200 elapsed_seconds=0.041",
     );
     expect(result.stdout).toContain(
-      "authentication_control url=https://edge.example/linear/webhook http_status=401 elapsed_seconds=0.047",
+      "authentication_control url=https://edge.example/linear/webhook address=203.0.113.10 http_status=401 elapsed_seconds=0.047",
     );
     expect(result.stdout).toContain(
-      "webhook url=https://edge.example/linear/webhook http_status=200 elapsed_seconds=0.052",
+      "webhook url=https://edge.example/linear/webhook address=203.0.113.10 http_status=200 elapsed_seconds=0.052",
     );
     expect(result.stdout + result.stderr).not.toContain(secret);
     expect(result.stdout + result.stderr).not.toContain(webhook.body);
@@ -343,7 +387,7 @@ describe("deploy/verify-ingress.sh", () => {
     expect(result.calls).toHaveLength(2);
     expect(result.calls[1].headers).toEqual(["content-type: application/json"]);
     expect(result.stdout).toContain(
-      "authentication_control url=https://edge.example/linear/webhook http_status=200 elapsed_seconds=0.047",
+      "authentication_control url=https://edge.example/linear/webhook address=203.0.113.10 http_status=200 elapsed_seconds=0.047",
     );
     expect(result.stdout + result.stderr).not.toContain(secret);
     expect(result.stdout + result.stderr).not.toContain(result.calls[1].body);
@@ -397,6 +441,99 @@ describe("deploy/verify-ingress.sh", () => {
         expect(result.stdout + result.stderr).not.toContain(signature);
       }
     }
+  });
+
+  it("reports the split between system and public resolution as the headline", async () => {
+    const result = await runVerifier({}, {
+      resolution: {
+        // What a tailnet-joined host sees: the overlay address locally, the
+        // real ingress address from outside.
+        stdout: "public 203.0.113.10\nsystem 100.64.0.1\n",
+        exit: 0,
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("split_horizon_dns host=edge.example");
+    expect(result.stdout).toContain("system_resolver=100.64.0.1");
+    expect(result.stdout).toContain("public_resolver=203.0.113.10");
+    for (const call of result.calls) {
+      expect(optionValue(call.args, "--resolve")).toBe(
+        "edge.example:443:203.0.113.10",
+      );
+    }
+  });
+
+  it("fails from inside the overlay network when only the public path is broken", async () => {
+    const result = await runVerifier({}, {
+      resolution: {
+        stdout: "public 203.0.113.10\nsystem 100.64.0.1\n",
+        exit: 0,
+      },
+      // The private path would answer every probe. Only the public one is down,
+      // which is the case the verifier previously reported as healthy.
+      failingAddresses: ["203.0.113.10"],
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("the public path failed at: 203.0.113.10");
+    expect(result.stdout).toContain("split_horizon_dns host=edge.example");
+    expect(result.stdout + result.stderr).not.toContain(secret);
+  });
+
+  it("fails when one address family is unreachable and the other is not", async () => {
+    const result = await runVerifier({}, {
+      resolution: {
+        stdout:
+          "public 203.0.113.10\npublic 2001:db8::1\nsystem 203.0.113.10\nsystem 2001:db8::1\n",
+        exit: 0,
+      },
+      failingAddresses: ["2001:db8::1"],
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("the public path failed at: 2001:db8::1");
+    // The working family still reports, so a reader sees the whole picture.
+    expect(result.stdout).toContain("address=203.0.113.10 http_status=200");
+    expect(result.stdout).toContain("address=2001:db8::1 http_status=000");
+    // curl needs the IPv6 literal bracketed in --resolve.
+    const sixCall = result.calls.find((call) =>
+      (optionValue(call.args, "--resolve") ?? "").includes("2001:db8::1"),
+    );
+    expect(optionValue(sixCall?.args ?? [], "--resolve")).toBe(
+      "edge.example:443:[2001:db8::1]",
+    );
+  });
+
+  it("refuses to report success when no configured resolver can be reached", async () => {
+    const result = await runVerifier({}, {
+      resolution: {
+        stdout: "resolver_failed 1.1.1.1 ETIMEOUT\nresolver_failed 8.8.8.8 ECONNREFUSED\n",
+        exit: 3,
+      },
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("the public path was NOT tested");
+    expect(result.stdout).toContain("resolver_unreachable 1.1.1.1 ETIMEOUT");
+    expect(result.stdout).toContain("resolver_unreachable 8.8.8.8 ECONNREFUSED");
+    // Falling back to the system resolver here would prove nothing, so nothing
+    // is probed at all.
+    expect(result.calls).toHaveLength(0);
+  });
+
+  it("honours VERIFY_INGRESS_RESOLVERS and keeps the secret away from the resolver", async () => {
+    const result = await runVerifier({
+      VERIFY_INGRESS_RESOLVERS: "9.9.9.9,149.112.112.112",
+    });
+
+    expect(result.code).toBe(0);
+    const resolverCall = result.nodeCalls[1];
+    expect(verifierControlledEnv(resolverCall.env)).toEqual({
+      VERIFY_HOST: "edge.example",
+      VERIFY_RESOLVERS: "9.9.9.9,149.112.112.112",
+    });
+    expect(Object.values(resolverCall.env).join(" ")).not.toContain(secret);
   });
 });
 
@@ -493,6 +630,7 @@ describe("deploy/parse-funnel-status.mjs", () => {
   ])("fails closed when the matching route is %s", async (_label, status) => {
     expect((await parseStatus(status)).code).not.toBe(0);
   });
+
 });
 
 describe("deploy/install.sh", () => {
