@@ -94,7 +94,8 @@ export type ReconciledAgentActivityType =
   | "thought";
 
 export interface ReconciledAgentActivity extends ReconciliationCursor {
-  userId: string;
+  /** Absent on app-generated output, which carries no Linear user. */
+  userId?: string | undefined;
   type: ReconciledAgentActivityType;
   signal?: string | undefined;
   body?: string | undefined;
@@ -362,17 +363,22 @@ export class LinearAgentClient {
       let reachedWatermark = false;
       for (const rawNode of nodes) {
         const activity = parseAgentActivity(rawNode);
-        if (activity === undefined) {
-          continue;
-        }
         if (options.processedThrough !== undefined) {
-          if (
-            Date.parse(activity.createdAt) <
-            Date.parse(options.processedThrough.createdAt)
-          ) {
+          const activityTime = Date.parse(activity.createdAt);
+          const watermarkTime = Date.parse(options.processedThrough.createdAt);
+          if (activityTime < watermarkTime) {
             reachedWatermark = true;
+            continue;
           }
-          if (compareActivityCursor(activity, options.processedThrough) <= 0) {
+          // At the watermark timestamp only the watermark activity itself is
+          // known-processed. Ids do not order the connection and Date.parse
+          // collapses finer precision, so a same-millisecond sibling is
+          // re-offered rather than skipped: the durable semantic claim
+          // deduplicates a repeat, while skipping drops the prompt forever.
+          if (
+            activityTime === watermarkTime &&
+            activity.id === options.processedThrough.id
+          ) {
             continue;
           }
         }
@@ -537,7 +543,7 @@ const ACTIVITY_TYPENAMES: Record<string, ReconciledAgentActivityType> = {
   AgentActivityThoughtContent: "thought",
 };
 
-function parseAgentActivity(value: unknown): ReconciledAgentActivity | undefined {
+function parseAgentActivity(value: unknown): ReconciledAgentActivity {
   const activity = asRecord(value);
   const user = asRecord(activity?.user);
   const content = asRecord(activity?.content);
@@ -553,9 +559,6 @@ function parseAgentActivity(value: unknown): ReconciledAgentActivity | undefined
   ) {
     throw new LinearQueryError("agentSessionActivities", "shape");
   }
-  if (type !== "prompt" && typeof user?.id !== "string") {
-    return undefined;
-  }
   if (
     type === "prompt" &&
     (typeof user?.id !== "string" || typeof content?.body !== "string")
@@ -565,8 +568,8 @@ function parseAgentActivity(value: unknown): ReconciledAgentActivity | undefined
   return {
     id: activity.id,
     createdAt: activity.createdAt,
-    userId: user!.id as string,
     type,
+    ...(typeof user?.id === "string" ? { userId: user.id } : {}),
     ...(typeof activity.signal === "string" ? { signal: activity.signal } : {}),
     ...(type === "prompt" ? { body: content!.body as string } : {}),
   };

@@ -620,6 +620,11 @@ describe("LinearAgentClient reconciliation reads", () => {
           body: "same-time after watermark",
         },
         {
+          id: "bridge-thought-without-user",
+          createdAt: "2026-08-18T12:01:30.000Z",
+          type: "thought",
+        },
+        {
           id: "prompt-b",
           createdAt: "2026-08-18T12:02:00.000Z",
           userId: "human-1",
@@ -646,6 +651,59 @@ describe("LinearAgentClient reconciliation reads", () => {
     });
     const third = JSON.parse(fetchFn.mock.calls[2]?.[1]?.body as string);
     expect(third.variables.after).toBe("activities-page-3");
+  });
+
+  it("retains a same-millisecond activity whose id sorts below the watermark", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        data: {
+          agentSession: {
+            id: "session-tiebreak",
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "aaa-sorts-before-watermark",
+                  createdAt: "2026-08-18T12:01:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "must not be skipped forever",
+                  },
+                },
+                {
+                  id: "zzz-watermark",
+                  createdAt: "2026-08-18T12:01:00.000Z",
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "already processed",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    const result = await client.listAgentSessionActivities("session-tiebreak", {
+      lookbackAfter: "2026-08-11T12:00:00.000Z",
+      processedThrough: {
+        createdAt: "2026-08-18T12:01:00.000Z",
+        id: "zzz-watermark",
+      },
+    });
+
+    // The watermark activity itself is the only one known to be processed at
+    // that millisecond; an id tiebreaker would drop its sibling permanently.
+    expect(result.activities.map((activity) => activity.id)).toEqual([
+      "aaa-sorts-before-watermark",
+    ]);
   });
 
   it("uses the existing OAuth refresh path for reconciliation queries", async () => {
