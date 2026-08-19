@@ -264,7 +264,12 @@ describe("AGENT_OUTPUT_PATH", () => {
     );
   });
 
-  it("rejects a directory it cannot write to, at startup rather than mid-turn", async () => {
+  // Root bypasses mode bits, so this check cannot fire for it and the
+  // assertion would be about the test runner's identity rather than the code.
+  // MPI-1460 documents running the service as root as defeating the model
+  // anyway, so the case that matters is the one a service account hits.
+  const deniedWriteCase = process.getuid?.() === 0 ? it.skip : it;
+  deniedWriteCase("rejects a directory it cannot write to, at startup rather than mid-turn", async () => {
     const dir = await tempDir();
     const target = path.join(dir, "read-only");
     await fs.mkdir(target, { mode: 0o500 });
