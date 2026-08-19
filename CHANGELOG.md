@@ -32,6 +32,20 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ### Fixed
 
+- Key durable webhook receipts on the `Linear-Delivery` header instead of
+  `webhookId`. Linear defines `webhookId` as the identifier of the webhook
+  configuration, so it repeats on every delivery, while the header is a UUID
+  unique to each payload. Keying receipts on `webhookId` meant the first
+  delivery claimed the slot and every later one collided with it and was
+  refused with a 503. The defect was invisible while webhook delivery was
+  broken, because reconciliation carried the load; it surfaced on the second
+  message after ingress was repaired.
+- Stop reconciliation settling a session that is younger than
+  `AGENT_SESSION_ACK_GRACE_MS`. It recorded `initializedAt` on that first
+  sighting, which is permanent, so the deferred decision the grace exists to
+  allow could never happen. Such a session is now left undecided until a later
+  scan can judge it.
+
 - Recover a session's opening prompt when its `created` webhook is lost.
   Reconciliation dispatches nothing on first sighting of a session, which is
   correct for history and swallowed genuine missed work: mention the agent on a

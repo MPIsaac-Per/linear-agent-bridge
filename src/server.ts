@@ -448,16 +448,21 @@ async function reconcileAgentSession(
     // when Linear created this session, so its opening prompt should have
     // arrived. Inside the lookback bounds the blast radius of a long outage and
     // keeps recovery within the window where the created claim still exists.
-    const createdWhileWatching =
+    const createdAfterWatching =
       Number.isFinite(sessionCreatedAt) &&
       sessionCreatedAt > Date.parse(watchingSince) &&
-      sessionCreatedAt >= now - deps.config.reconcileLookbackMs &&
-      // A created webhook that is merely slow has not been lost. Without this
-      // the two paths race: reconciliation recovers the opening prompt while
-      // the webhook is still in flight, and the turn runs twice, since the two
-      // claim on different identities. AGENT_SESSION_ACK_GRACE_MS already means
-      // "long enough that a missing claim is a real problem".
-      sessionCreatedAt <= now - deps.config.agentSessionAckGraceMs;
+      sessionCreatedAt >= now - deps.config.reconcileLookbackMs;
+    // A created webhook that is merely slow has not been lost, and this session
+    // is too young to judge. Leave it undecided rather than settling it as
+    // history: initializing here writes initializedAt permanently, so the
+    // deferred decision the grace exists to allow would never happen.
+    if (
+      createdAfterWatching &&
+      sessionCreatedAt > now - deps.config.agentSessionAckGraceMs
+    ) {
+      return;
+    }
+    const createdWhileWatching = createdAfterWatching;
     // The created webhook path claims `created:<sessionId>`; reconciliation
     // claims activity ids. Different keys, so a claim here is the only evidence
     // that the opening prompt already ran. Without this check a session whose
@@ -756,6 +761,15 @@ async function handleWebhook(
   const signatureHeader = Array.isArray(signatureHeaderRaw)
     ? signatureHeaderRaw[0]
     : signatureHeaderRaw;
+  // Linear's own words: webhookId is "ID uniquely identifying this webhook",
+  // the configuration, constant across every delivery it sends. The per-payload
+  // identity is the Linear-Delivery header, "a UUID (v4) that uniquely
+  // identifies this payload". Keying durable receipts on webhookId meant the
+  // first delivery took the slot and every later one collided with it.
+  const deliveryHeaderRaw = req.headers["linear-delivery"];
+  const deliveryHeader = Array.isArray(deliveryHeaderRaw)
+    ? deliveryHeaderRaw[0]
+    : deliveryHeaderRaw;
 
   if (
     !verifyWebhookSignature(
@@ -807,7 +821,7 @@ async function handleWebhook(
     return;
   }
 
-  const identity = eventIdentity(event);
+  const identity = eventIdentity(event, deliveryHeader);
   const recoverablePayload = recoveryPayload(event);
   const repairingLegacyReceipt =
     !deps.dispatchReady &&
@@ -1141,13 +1155,29 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
   return obj as unknown as LinearAgentSessionEvent;
 }
 
-function eventIdentity(event: LinearAgentSessionEvent): IngressEventIdentity {
+/**
+ * Build the durable ingress identity for a delivery.
+ *
+ * `deliveryId` is the Linear-Delivery header and is the only per-payload
+ * value Linear provides. `event.webhookId` identifies the webhook
+ * configuration and repeats on every delivery, so it cannot key a receipt.
+ * When the header is absent the payload's webhookId is combined with the
+ * execution identity, which keeps receipts distinct per unit of work rather
+ * than collapsing every delivery onto one key.
+ */
+function eventIdentity(
+  event: LinearAgentSessionEvent,
+  deliveryId?: string,
+): IngressEventIdentity {
+  const executionId =
+    event.action === "created"
+      ? `created:${event.agentSession.id}`
+      : event.agentActivity.id;
   return {
-    webhookId: event.webhookId,
-    executionId:
-      event.action === "created"
-        ? `created:${event.agentSession.id}`
-        : event.agentActivity.id,
+    webhookId: isBoundedIdentifier(deliveryId)
+      ? deliveryId
+      : `${event.webhookId}:${executionId}`,
+    executionId,
     linearSessionId: event.agentSession.id,
     action: event.action,
   };

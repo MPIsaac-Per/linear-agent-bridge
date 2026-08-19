@@ -156,7 +156,11 @@ class FakeRuntime implements AgentRuntime {
   lastRequest: SessionRequest | undefined;
   requests: SessionRequest[] = [];
 
-  constructor(private readonly produce: (request: SessionRequest) => AsyncIterable<RuntimeEvent>) {}
+  constructor(
+    private readonly produce: (
+      request: SessionRequest,
+    ) => AsyncIterable<RuntimeEvent>,
+  ) {}
 
   async *runSession(request: SessionRequest): AsyncIterable<RuntimeEvent> {
     this.lastRequest = request;
@@ -286,7 +290,8 @@ async function startTestServer(
   await options.prepareOAuthTokenStore?.(oauthTokenStorePath);
 
   const tokenFetch = vi.fn(
-    options.tokenFetchImpl ?? (async () => jsonResponse({ access_token: "unused" })),
+    options.tokenFetchImpl ??
+      (async () => jsonResponse({ access_token: "unused" })),
   );
 
   let resolveListening!: (address: { port: number; host: string }) => void;
@@ -387,6 +392,24 @@ function watchingSessions(
   };
 }
 
+/**
+ * Linear sends a per-payload id in the Linear-Delivery header; webhookId names
+ * the webhook configuration and repeats. These tests give each delivery its own
+ * webhookId, so it doubles as a realistic delivery id. A retry of the same
+ * delivery reuses it, which is exactly what a retry should look like.
+ */
+function deliveryIdOf(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { webhookId?: unknown };
+    if (typeof parsed.webhookId === "string") {
+      return parsed.webhookId;
+    }
+  } catch {
+    // Not a JSON body; the request is rejected before identity is built.
+  }
+  return "delivery-unparsed";
+}
+
 let activeHarness: Harness | undefined;
 
 afterEach(async () => {
@@ -436,7 +459,9 @@ describe("startServer", () => {
       ).rejects.toThrow("Bridge HTTP listener could not start");
     } finally {
       await new Promise<void>((resolve, reject) => {
-        occupied.close((error) => (error === undefined ? resolve() : reject(error)));
+        occupied.close((error) =>
+          error === undefined ? resolve() : reject(error),
+        );
       });
     }
   });
@@ -448,9 +473,12 @@ describe("startServer", () => {
     activeHarness = await startTestServer(runtime);
 
     expect(activeHarness.host).toBe("127.0.0.1");
-    const ipv4Response = await fetch(serverUrl(activeHarness.port, "/healthz"), {
-      headers: { connection: "close" },
-    });
+    const ipv4Response = await fetch(
+      serverUrl(activeHarness.port, "/healthz"),
+      {
+        headers: { connection: "close" },
+      },
+    );
     expect(ipv4Response.status).toBe(200);
     await ipv4Response.text();
   });
@@ -481,6 +509,7 @@ describe("startServer", () => {
       headers: {
         "Content-Type": "application/json",
         "linear-signature": sign(body, WEBHOOK_SECRET),
+        "linear-delivery": deliveryIdOf(body),
         connection: "close",
       },
       body,
@@ -492,13 +521,112 @@ describe("startServer", () => {
     expect(runtime.lastRequest).toBeUndefined();
   });
 
-  it("signed created event: acks 200, emits the liveness thought, forwards runtime activities in order, persists the session mapping", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "session-started", runtimeSessionId: "runtime-session-abc" };
-      yield { kind: "activity", activity: { type: "thought", body: "Looking at the issue" } };
-      yield { kind: "activity", activity: { type: "response", body: "Fixed it" } };
-      yield { kind: "done" };
+  it("processes two deliveries that share a webhookId, because webhookId names the webhook not the delivery", async () => {
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+
+    // Linear's webhookId is "ID uniquely identifying this webhook", the
+    // configuration, so every delivery from one webhook carries the same value.
+    // Per-payload identity is the Linear-Delivery header. Keying receipts on
+    // webhookId let the first delivery take the slot and rejected every later
+    // one as a conflicting replay.
+    const sharedWebhookId = "webhook-config-id-shared-by-every-delivery";
+    const send = async (
+      sessionId: string,
+      deliveryId: string,
+    ): Promise<Response> => {
+      const body = JSON.stringify({
+        webhookId: sharedWebhookId,
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: { id: sessionId },
+        promptContext: "first contact",
+        webhookTimestamp: Date.now(),
+      });
+      return fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryId,
+        },
+        body,
+      });
+    };
+
+    expect((await send("session-shared-a", "delivery-a")).status).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    expect((await send("session-shared-b", "delivery-b")).status).toBe(200);
+    await waitFor(() => runtime.requests.length === 2);
+
+    await expect(
+      harness.bridgeState.getReceipt("delivery-a"),
+    ).resolves.toMatchObject({ executionId: "created:session-shared-a" });
+    await expect(
+      harness.bridgeState.getReceipt("delivery-b"),
+    ).resolves.toMatchObject({ executionId: "created:session-shared-b" });
+  });
+
+  it("still deduplicates a genuine retry of the same delivery", async () => {
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+
+    const body = JSON.stringify({
+      webhookId: "webhook-config-id",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: "session-retried" },
+      promptContext: "sent once, delivered twice",
+      webhookTimestamp: Date.now(),
     });
+    const send = async (): Promise<Response> =>
+      fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+          // A retry repeats the delivery id, which is what makes it a retry.
+          "linear-delivery": "delivery-retried-once",
+        },
+        body,
+      });
+
+    expect((await send()).status).toBe(200);
+    await waitFor(() => runtime.requests.length === 1);
+    expect((await send()).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    expect(runtime.requests).toHaveLength(1);
+  });
+
+  it("signed created event: acks 200, emits the liveness thought, forwards runtime activities in order, persists the session mapping", async () => {
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-session-abc",
+        };
+        yield {
+          kind: "activity",
+          activity: { type: "thought", body: "Looking at the issue" },
+        };
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "Fixed it" },
+        };
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
@@ -520,7 +648,11 @@ describe("startServer", () => {
 
     const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "linear-signature": signature },
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": signature,
+        "linear-delivery": deliveryIdOf(body),
+      },
       body,
     });
 
@@ -530,7 +662,10 @@ describe("startServer", () => {
 
     expect(harness.calls[0]).toEqual({
       agentSessionId: "agent-session-1",
-      content: { type: "thought", body: "Reading the issue and gathering context…" },
+      content: {
+        type: "thought",
+        body: "Reading the issue and gathering context…",
+      },
       ephemeral: true,
     });
     expect(harness.calls[1]).toEqual({
@@ -557,9 +692,10 @@ describe("startServer", () => {
       issueIdentifier: "MPI-1",
       updatedAt: expect.any(String),
     });
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt("webhook-created-1"))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt("webhook-created-1"))?.status ===
+        "completed",
     );
     await expect(
       harness.bridgeState.getClaim("created:agent-session-1"),
@@ -573,9 +709,11 @@ describe("startServer", () => {
   });
 
   it("keeps ingress unavailable when durable receipt persistence cannot be initialized", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       activeHarness = await startTestServer(runtime, {
@@ -599,6 +737,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -606,7 +745,9 @@ describe("startServer", () => {
       expect(response.status).toBe(503);
       expect(runtime.requests).toHaveLength(0);
       expect(harness.calls).toHaveLength(0);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).toContain("error=FilesystemError");
       expect(logged).not.toContain("raw-persistence-prompt-body");
       expect(logged).not.toContain("EISDIR");
@@ -658,6 +799,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -665,9 +807,9 @@ describe("startServer", () => {
       ).toBe(200);
       expect(pendingPostResponseWork).toHaveLength(1);
       expect(firstRuntime.requests).toHaveLength(0);
-      expect(await fsPromises.readFile(first.bridgeStatePath, "utf8")).not.toContain(
-        prompt,
-      );
+      expect(
+        await fsPromises.readFile(first.bridgeStatePath, "utf8"),
+      ).not.toContain(prompt);
 
       await first.close();
       activeHarness = undefined;
@@ -689,13 +831,14 @@ describe("startServer", () => {
           prompt,
         }),
       ]);
-      await waitFor(async () =>
-        (await recovered.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await recovered.bridgeState.getReceipt(payload.webhookId))
+            ?.status === "completed",
       );
-      expect(await fsPromises.readFile(recovered.bridgeStatePath, "utf8")).not.toContain(
-        prompt,
-      );
+      expect(
+        await fsPromises.readFile(recovered.bridgeStatePath, "utf8"),
+      ).not.toContain(prompt);
     } finally {
       await activeHarness?.close();
       activeHarness = undefined;
@@ -747,15 +890,16 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
       expect(firstRuntime.requests).toHaveLength(0);
-      expect(await fsPromises.readFile(first.bridgeStatePath, "utf8")).not.toContain(
-        prompt,
-      );
+      expect(
+        await fsPromises.readFile(first.bridgeStatePath, "utf8"),
+      ).not.toContain(prompt);
 
       await first.close();
       activeHarness = undefined;
@@ -776,9 +920,10 @@ describe("startServer", () => {
           resumeSessionId: "runtime-session-before-prompted-crash",
         }),
       );
-      await waitFor(async () =>
-        (await recovered.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await recovered.bridgeState.getReceipt(payload.webhookId))
+            ?.status === "completed",
       );
 
       const lateSame = JSON.stringify({
@@ -792,6 +937,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(lateSame, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(lateSame),
             },
             body: lateSame,
           })
@@ -809,6 +955,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(crossed, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(crossed),
             },
             body: crossed,
           })
@@ -865,7 +1012,8 @@ describe("startServer", () => {
         {
           tmpDir: sharedTmpDir,
           removeTmpDirOnClose: false,
-          schedulePostResponseWork: (work) => pendingPostResponseWork.push(work),
+          schedulePostResponseWork: (work) =>
+            pendingPostResponseWork.push(work),
         },
       );
       const first = activeHarness;
@@ -878,6 +1026,7 @@ describe("startServer", () => {
               headers: {
                 "Content-Type": "application/json",
                 "linear-signature": sign(body, WEBHOOK_SECRET),
+                "linear-delivery": deliveryIdOf(body),
               },
               body,
             })
@@ -902,10 +1051,9 @@ describe("startServer", () => {
         bridgeStateOwnerId: "runtime-after-created-prompted-crash",
       });
       await waitFor(() => recoveredRuntime.requests.length === 2);
-      expect(recoveredRuntime.requests.map((request) => request.prompt)).toEqual([
-        createdPrompt,
-        promptedPrompt,
-      ]);
+      expect(
+        recoveredRuntime.requests.map((request) => request.prompt),
+      ).toEqual([createdPrompt, promptedPrompt]);
       expect(recoveredRuntime.requests[0]?.resumeSessionId).toBeUndefined();
       expect(recoveredRuntime.requests[1]?.resumeSessionId).toBe(
         "runtime-created-during-recovery",
@@ -952,7 +1100,8 @@ describe("startServer", () => {
         {
           tmpDir: sharedTmpDir,
           removeTmpDirOnClose: false,
-          schedulePostResponseWork: (work) => pendingPostResponseWork.push(work),
+          schedulePostResponseWork: (work) =>
+            pendingPostResponseWork.push(work),
         },
       );
       const first = activeHarness;
@@ -965,6 +1114,7 @@ describe("startServer", () => {
               headers: {
                 "Content-Type": "application/json",
                 "linear-signature": sign(body, WEBHOOK_SECRET),
+                "linear-delivery": deliveryIdOf(body),
               },
               body,
             })
@@ -1093,9 +1243,7 @@ describe("startServer", () => {
         prepareBridgeState: async (storePath) => {
           const prior = new JsonBridgeStateStore(storePath, {
             ownerId: "runtime-before-stalled-oauth",
-            recoveryKeyring: createIngressRecoveryKeyring(
-              INGRESS_RECOVERY_KEY,
-            ),
+            recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
           });
           await prior.claimEvent(
             {
@@ -1130,9 +1278,9 @@ describe("startServer", () => {
       });
       expect(receiptAfterClose).not.toHaveProperty("completedAt");
       expect(receiptAfterClose).not.toHaveProperty("failedAt");
-      expect(await fsPromises.readFile(harness.bridgeStatePath, "utf8")).not.toContain(
-        "recoveryEnvelope",
-      );
+      expect(
+        await fsPromises.readFile(harness.bridgeStatePath, "utf8"),
+      ).not.toContain("recoveryEnvelope");
       expect(
         errorSpy.mock.calls.some((call) =>
           call.join(" ").includes("recovery processing failed"),
@@ -1147,9 +1295,9 @@ describe("startServer", () => {
         }),
       );
       await waitFor(async () =>
-        (await fsPromises.readFile(harness!.oauthTokenStorePath, "utf8")).includes(
-          "fresh-refresh-token",
-        ),
+        (
+          await fsPromises.readFile(harness!.oauthTokenStorePath, "utf8")
+        ).includes("fresh-refresh-token"),
       );
       expect(activityAttempts).toBe(1);
       expect(runtime.requests).toHaveLength(0);
@@ -1198,14 +1346,16 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
-      await waitFor(async () =>
-        (await harness!.bridgeState.getReceipt(payload.webhookId))
-          ?.dispatchStartedAt !== undefined,
+      await waitFor(
+        async () =>
+          (await harness!.bridgeState.getReceipt(payload.webhookId))
+            ?.dispatchStartedAt !== undefined,
       );
 
       let closeSettled = false;
@@ -1273,6 +1423,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1346,6 +1497,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1404,9 +1556,7 @@ describe("startServer", () => {
         prepareBridgeState: async (storePath) => {
           const prior = new JsonBridgeStateStore(storePath, {
             ownerId: "runtime-before-backoff-close",
-            recoveryKeyring: createIngressRecoveryKeyring(
-              INGRESS_RECOVERY_KEY,
-            ),
+            recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
           });
           await prior.claimEvent(
             {
@@ -1443,10 +1593,13 @@ describe("startServer", () => {
       });
       harness = activeHarness;
       await markerFailed.promise;
-      await waitFor(async () =>
-        (await harness!.bridgeState.getReceipt(
-          "webhook-recovery-backoff-close",
-        ))?.status === "received",
+      await waitFor(
+        async () =>
+          (
+            await harness!.bridgeState.getReceipt(
+              "webhook-recovery-backoff-close",
+            )
+          )?.status === "received",
       );
 
       const startedAt = Date.now();
@@ -1505,7 +1658,9 @@ describe("startServer", () => {
       },
       webhookTimestamp: now,
     };
-    const send = async (payload: typeof created | typeof stop): Promise<void> => {
+    const send = async (
+      payload: typeof created | typeof stop,
+    ): Promise<void> => {
       const body = JSON.stringify(payload);
       expect(
         (
@@ -1514,6 +1669,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1526,14 +1682,16 @@ describe("startServer", () => {
     expect(pendingPostResponseWork).toHaveLength(2);
 
     pendingPostResponseWork[1]!();
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt(stop.webhookId))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(stop.webhookId))?.status ===
+        "completed",
     );
     pendingPostResponseWork[0]!();
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt(created.webhookId))?.status ===
-      "superseded",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(created.webhookId))?.status ===
+        "superseded",
     );
 
     expect(runtime.requests).toHaveLength(0);
@@ -1582,6 +1740,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1590,9 +1749,10 @@ describe("startServer", () => {
     }
     expect(pendingPostResponseWork).toHaveLength(1);
     pendingPostResponseWork[0]!();
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt(base.webhookId))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(base.webhookId))?.status ===
+        "completed",
     );
     await expect(
       harness.bridgeState.getReceipt("webhook-stop-semantic-redelivery"),
@@ -1645,7 +1805,9 @@ describe("startServer", () => {
       },
       webhookTimestamp: now + 1,
     };
-    const send = async (payload: typeof stop | typeof newerPrompt): Promise<void> => {
+    const send = async (
+      payload: typeof stop | typeof newerPrompt,
+    ): Promise<void> => {
       const body = JSON.stringify(payload);
       expect(
         (
@@ -1654,6 +1816,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1684,16 +1847,19 @@ describe("startServer", () => {
     expect(runtime.requests[0]?.abortController.signal.aborted).toBe(false);
 
     finishRuntime.resolve();
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt(newerPrompt.webhookId))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(newerPrompt.webhookId))
+          ?.status === "completed",
     );
   });
 
   it("retries a visible claim after its directory sync fails and executes it once", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     let openSpy: ReturnType<typeof vi.spyOn> | undefined;
     let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -1747,6 +1913,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
           },
           body,
         });
@@ -1765,14 +1932,19 @@ describe("startServer", () => {
       expect(retry.status).toBe(200);
       expect(concurrentRetry.status).toBe(200);
       await waitFor(() => runtime.requests.length === 1);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+          "completed",
       );
       expect(runtime.requests).toHaveLength(1);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).not.toContain("private retry exactly once prompt");
-      expect(logged).not.toContain("synthetic final claim directory sync failure");
+      expect(logged).not.toContain(
+        "synthetic final claim directory sync failure",
+      );
     } finally {
       renameSpy?.mockRestore();
       openSpy?.mockRestore();
@@ -1781,9 +1953,11 @@ describe("startServer", () => {
   });
 
   it("recovers without another webhook after marker and release fail before either state write", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     let openSpy: ReturnType<typeof vi.spyOn> | undefined;
     let readSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -1843,6 +2017,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -1850,16 +2025,21 @@ describe("startServer", () => {
       ).toBe(200);
       await waitFor(() => releaseReadFailed);
       expect(runtime.requests).toHaveLength(0);
-      const visibleReceipt = await harness.bridgeState.getReceipt(payload.webhookId);
+      const visibleReceipt = await harness.bridgeState.getReceipt(
+        payload.webhookId,
+      );
       expect(visibleReceipt?.dispatchStartedAt).toBeUndefined();
 
       await waitFor(() => runtime.requests.length === 1);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+          "completed",
       );
       expect(runtime.requests).toHaveLength(1);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).not.toContain("private marker release retry prompt");
       expect(logged).not.toContain("synthetic marker open failure");
       expect(logged).not.toContain("synthetic release read failure");
@@ -1871,9 +2051,11 @@ describe("startServer", () => {
   });
 
   it("returns 503 with headroom before Linear's five-second deadline when the state lock is busy", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       activeHarness = await startTestServer(runtime, {
@@ -1903,6 +2085,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -1919,9 +2102,11 @@ describe("startServer", () => {
   });
 
   it("times out while queued behind a same-store mutation and never runs the abandoned claim later", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       activeHarness = await startTestServer(runtime, {
@@ -1949,6 +2134,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -1979,9 +2165,11 @@ describe("startServer", () => {
   });
 
   it("recovers without another webhook after a marker failure and successful release", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       activeHarness = await startTestServer(runtime);
@@ -1996,7 +2184,9 @@ describe("startServer", () => {
       const releaseSpy = vi
         .spyOn(harness.bridgeState, "releasePreDispatchClaim")
         .mockImplementation(originalReleasePreDispatchClaim);
-      markSpy.mockRejectedValueOnce(new Error("synthetic marker write failure"));
+      markSpy.mockRejectedValueOnce(
+        new Error("synthetic marker write failure"),
+      );
       const payload = {
         webhookId: "webhook-dispatch-marker-retry",
         type: "AgentSessionEvent",
@@ -2013,19 +2203,23 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
       await waitFor(() => runtime.requests.length === 1);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+          "completed",
       );
       expect(markSpy).toHaveBeenCalledTimes(2);
       expect(releaseSpy).toHaveBeenCalledTimes(1);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).not.toContain("private retry prompt");
       expect(logged).not.toContain("synthetic marker write failure");
     } finally {
@@ -2034,9 +2228,11 @@ describe("startServer", () => {
   });
 
   it("continues same-owner dispatch when the marker is visible after directory sync fails", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     let openSpy: ReturnType<typeof vi.spyOn> | undefined;
     let renameSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -2093,21 +2289,25 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
       await waitFor(() => runtime.requests.length === 1);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+          "completed",
       );
       expect(runtime.requests).toHaveLength(1);
       const receipt = await harness.bridgeState.getReceipt(payload.webhookId);
       expect(receipt?.status).toBe("completed");
       expect(receipt).not.toHaveProperty("failedAt");
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).not.toContain("private visible marker prompt");
     } finally {
       renameSpy?.mockRestore();
@@ -2129,9 +2329,7 @@ describe("startServer", () => {
         prepareBridgeState: async (storePath) => {
           const prior = new JsonBridgeStateStore(storePath, {
             ownerId: "runtime-before-ordered-recovery",
-            recoveryKeyring: createIngressRecoveryKeyring(
-              INGRESS_RECOVERY_KEY,
-            ),
+            recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
           });
           for (const [index, prompt] of [firstPrompt, secondPrompt].entries()) {
             await prior.claimEvent(
@@ -2175,9 +2373,10 @@ describe("startServer", () => {
         firstPrompt,
         secondPrompt,
       ]);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt("webhook-ordered-recovery-1"))
-          ?.status === "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt("webhook-ordered-recovery-1"))
+            ?.status === "completed",
       );
     } finally {
       openSpy?.mockRestore();
@@ -2185,10 +2384,15 @@ describe("startServer", () => {
   });
 
   it("deduplicates webhook retries and supersedes a second receipt for the same created execution", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "activity", activity: { type: "response", body: "once" } };
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "once" },
+        };
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
     const basePayload = {
@@ -2206,6 +2410,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -2235,10 +2440,15 @@ describe("startServer", () => {
   });
 
   it("keeps startup unready until an exact signed redelivery repairs a true legacy receipt", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "activity", activity: { type: "response", body: "recovered" } };
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "recovered" },
+        };
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime, {
       bridgeStateOwnerId: "runtime-after-restart",
       awaitReady: false,
@@ -2265,9 +2475,7 @@ describe("startServer", () => {
     };
     const body = JSON.stringify(payload);
 
-    expect(
-      (await fetch(serverUrl(harness.port, "/healthz"))).status,
-    ).toBe(503);
+    expect((await fetch(serverUrl(harness.port, "/healthz"))).status).toBe(503);
     let readySettled = false;
     void harness.ready.then(() => {
       readySettled = true;
@@ -2275,17 +2483,18 @@ describe("startServer", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(readySettled).toBe(false);
 
-    await waitFor(async () =>
-      (
-        await fetch(serverUrl(harness.port, "/webhook"), {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "linear-signature": "invalid-signature",
-          },
-          body,
-        })
-      ).status === 401,
+    await waitFor(
+      async () =>
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": "invalid-signature",
+            },
+            body,
+          })
+        ).status === 401,
     );
     const unrelated = {
       ...payload,
@@ -2300,6 +2509,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(unrelatedBody, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(unrelatedBody),
           },
           body: unrelatedBody,
         })
@@ -2316,6 +2526,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
           },
           body,
         })
@@ -2324,12 +2535,13 @@ describe("startServer", () => {
     await harness.ready;
     expect((await fetch(serverUrl(harness.port, "/healthz"))).status).toBe(200);
     await waitFor(() => runtime.requests.length === 1);
-    await waitFor(async () =>
-      (
-        await harness.bridgeState.getReceipt(
-          "webhook-reclaim-before-dispatch",
-        )
-      )?.status === "completed",
+    await waitFor(
+      async () =>
+        (
+          await harness.bridgeState.getReceipt(
+            "webhook-reclaim-before-dispatch",
+          )
+        )?.status === "completed",
     );
     await expect(
       harness.bridgeState.getClaim(
@@ -2384,7 +2596,9 @@ describe("startServer", () => {
                   // +1: reconciliation's first run stamps the watching marker.
                   if (stateRenames === 2 && !failedVisibleRepairSync) {
                     failedVisibleRepairSync = true;
-                    throw new Error("synthetic visible legacy repair sync failure");
+                    throw new Error(
+                      "synthetic visible legacy repair sync failure",
+                    );
                   }
                   await originalSync();
                 });
@@ -2404,17 +2618,18 @@ describe("startServer", () => {
         webhookTimestamp: Date.now(),
       };
       const body = JSON.stringify(payload);
-      await waitFor(async () =>
-        (
-          await fetch(serverUrl(harness.port, "/webhook"), {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "linear-signature": "invalid-signature",
-            },
-            body,
-          })
-        ).status === 401,
+      await waitFor(
+        async () =>
+          (
+            await fetch(serverUrl(harness.port, "/webhook"), {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "linear-signature": "invalid-signature",
+              },
+              body,
+            })
+          ).status === 401,
       );
       expect(
         (
@@ -2423,6 +2638,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -2432,9 +2648,10 @@ describe("startServer", () => {
       await harness.ready;
       await waitFor(() => runtime.requests.length === 1);
       expect(runtime.requests[0]?.prompt).toBe(prompt);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(payload.webhookId))?.status ===
+          "completed",
       );
       expect(runtime.requests).toHaveLength(1);
     } finally {
@@ -2459,9 +2676,7 @@ describe("startServer", () => {
         prepareBridgeState: async (storePath) => {
           const prior = new JsonBridgeStateStore(storePath, {
             ownerId: "runtime-before-unrecoverable-state",
-            recoveryKeyring: createIngressRecoveryKeyring(
-              INGRESS_RECOVERY_KEY,
-            ),
+            recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
           });
           await prior.claimEvent(
             {
@@ -2512,6 +2727,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -2525,9 +2741,11 @@ describe("startServer", () => {
   );
 
   it("surfaces a post-dispatch retry as ambiguous without running it again", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime, {
       bridgeStateOwnerId: "runtime-after-restart",
       prepareBridgeState: async (storePath) => {
@@ -2561,6 +2779,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
           },
           body,
         })
@@ -2584,9 +2803,11 @@ describe("startServer", () => {
   });
 
   it("rejects agent events without the required durable identities", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
     const payloads = [
@@ -2685,6 +2906,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -2694,23 +2916,29 @@ describe("startServer", () => {
   });
 
   it("logs bounded static diagnostics for invalid JSON and invalid agent events", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
       activeHarness = await startTestServer(runtime);
       const harness = activeHarness;
       const invalidJson = '{"secret":"raw-invalid-json-body"';
-      const invalidJsonResponse = await fetch(serverUrl(harness.port, "/webhook"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "linear-signature": sign(invalidJson, WEBHOOK_SECRET),
+      const invalidJsonResponse = await fetch(
+        serverUrl(harness.port, "/webhook"),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(invalidJson, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(invalidJson),
+          },
+          body: invalidJson,
         },
-        body: invalidJson,
-      });
+      );
       expect(invalidJsonResponse.status).toBe(400);
 
       const invalidEvent = JSON.stringify({
@@ -2722,21 +2950,27 @@ describe("startServer", () => {
         },
         webhookTimestamp: Date.now(),
       });
-      const invalidEventResponse = await fetch(serverUrl(harness.port, "/webhook"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "linear-signature": sign(invalidEvent, WEBHOOK_SECRET),
+      const invalidEventResponse = await fetch(
+        serverUrl(harness.port, "/webhook"),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(invalidEvent, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(invalidEvent),
+          },
+          body: invalidEvent,
         },
-        body: invalidEvent,
-      });
+      );
       expect(invalidEventResponse.status).toBe(400);
 
       expect(errorSpy.mock.calls.map((call) => call.join(" "))).toEqual([
         "[linear-agent-bridge] webhook rejected: error=InvalidJson",
         "[linear-agent-bridge] webhook rejected: error=InvalidAgentSessionEvent",
       ]);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).not.toContain("raw-invalid-json-body");
       expect(logged).not.toContain("raw-invalid-agent-body");
     } finally {
@@ -2745,9 +2979,11 @@ describe("startServer", () => {
   });
 
   it("logs turn lifecycle with bounded session, reason, and queue fields", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     try {
@@ -2757,7 +2993,10 @@ describe("startServer", () => {
         webhookId: "webhook-created-log",
         type: "AgentSessionEvent",
         action: "created",
-        agentSession: { id: "agent-session-log", issue: { title: "secret issue title" } },
+        agentSession: {
+          id: "agent-session-log",
+          issue: { title: "secret issue title" },
+        },
         promptContext: "secret prompt contents",
         webhookTimestamp: Date.now(),
       };
@@ -2769,6 +3008,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -2776,7 +3016,9 @@ describe("startServer", () => {
       ).toBe(200);
 
       await waitFor(() =>
-        logSpy.mock.calls.some((call) => String(call[0]).includes("turn terminal")),
+        logSpy.mock.calls.some((call) =>
+          String(call[0]).includes("turn terminal"),
+        ),
       );
       expect(
         logSpy.mock.calls
@@ -2795,11 +3037,19 @@ describe("startServer", () => {
   });
 
   it("signed prompted event with a pre-seeded store record: fake runtime receives resumeSessionId", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "session-started", runtimeSessionId: "runtime-session-resumed" };
-      yield { kind: "activity", activity: { type: "response", body: "continuing" } };
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-session-resumed",
+        };
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "continuing" },
+        };
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
@@ -2830,7 +3080,11 @@ describe("startServer", () => {
 
     const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "linear-signature": signature },
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": signature,
+        "linear-delivery": deliveryIdOf(body),
+      },
       body,
     });
 
@@ -2844,16 +3098,19 @@ describe("startServer", () => {
       resumeSessionId: "prior-runtime-session",
       abortController: expect.any(AbortController),
     });
-    await waitFor(async () =>
-      (await harness.bridgeState.getClaim("activity-prompted-2"))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getClaim("activity-prompted-2"))?.status ===
+        "completed",
     );
   });
 
   it("accepts explicit null prompt signals from Linear as absent", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
     const payload = {
@@ -2876,6 +3133,7 @@ describe("startServer", () => {
       headers: {
         "Content-Type": "application/json",
         "linear-signature": sign(body, WEBHOOK_SECRET),
+        "linear-delivery": deliveryIdOf(body),
       },
       body,
     });
@@ -2889,9 +3147,11 @@ describe("startServer", () => {
   });
 
   it("never serializes a prompted activity or body into logs", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     try {
@@ -2919,6 +3179,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -2943,9 +3204,13 @@ describe("startServer", () => {
       await Promise.race([
         release.promise,
         new Promise<void>((resolve) => {
-          request.abortController?.signal.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
+          request.abortController?.signal.addEventListener(
+            "abort",
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
         }),
       ]);
       yield { kind: "done" };
@@ -2962,7 +3227,11 @@ describe("startServer", () => {
         agentSession: {
           id: "agent-session-stop",
           createdAt: "2020-01-01T00:00:00.000Z",
-          issue: { id: "issue-stop", identifier: "MPI-STOP", title: "Long request" },
+          issue: {
+            id: "issue-stop",
+            identifier: "MPI-STOP",
+            title: "Long request",
+          },
         },
         promptContext: "do a long task",
         webhookTimestamp: Date.now(),
@@ -2973,6 +3242,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(createdBody),
         },
         body: createdBody,
       });
@@ -2996,6 +3266,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(stopBody),
         },
         body: stopBody,
       });
@@ -3003,14 +3274,17 @@ describe("startServer", () => {
 
       await waitFor(() =>
         harness.calls.some(
-          (call) => call.content.type === "response" && call.content.body === "Stopped.",
+          (call) =>
+            call.content.type === "response" &&
+            call.content.body === "Stopped.",
         ),
       );
       expect(runtime.requests).toHaveLength(1);
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt("webhook-stop-prompted"))?.status ===
-        "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt("webhook-stop-prompted"))
+            ?.status === "completed",
       );
       await expect(
         harness.bridgeState.getReconciliationState("agent-session-stop"),
@@ -3029,9 +3303,11 @@ describe("startServer", () => {
     const thoughtStarted = createDeferred<void>();
     const releaseThought = createDeferred<void>();
     const thoughtFinished = createDeferred<void>();
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime, {
       linearFetchImpl: (calls) =>
@@ -3043,14 +3319,21 @@ describe("startServer", () => {
           calls.push({
             agentSessionId: input.agentSessionId,
             content: input.content,
-            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+            ...(input.ephemeral !== undefined
+              ? { ephemeral: input.ephemeral }
+              : {}),
           });
-          if (input.content.type === "thought" && input.content.body === "Working on it…") {
+          if (
+            input.content.type === "thought" &&
+            input.content.body === "Working on it…"
+          ) {
             thoughtStarted.resolve();
             await releaseThought.promise;
             thoughtFinished.resolve();
           }
-          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+          return jsonResponse({
+            data: { agentActivityCreate: { success: true } },
+          });
         }) as FetchFn,
     });
     const harness = activeHarness;
@@ -3079,6 +3362,7 @@ describe("startServer", () => {
       headers: {
         "Content-Type": "application/json",
         "linear-signature": sign(promptedBody, WEBHOOK_SECRET),
+        "linear-delivery": deliveryIdOf(promptedBody),
       },
       body: promptedBody,
     });
@@ -3108,20 +3392,23 @@ describe("startServer", () => {
       headers: {
         "Content-Type": "application/json",
         "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+        "linear-delivery": deliveryIdOf(stopBody),
       },
       body: stopBody,
     });
     await waitFor(() =>
       harness.calls.some(
-        (call) => call.content.type === "response" && call.content.body === "Stopped.",
+        (call) =>
+          call.content.type === "response" && call.content.body === "Stopped.",
       ),
     );
 
     releaseThought.resolve();
     await thoughtFinished.promise;
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt(promptedPayload.webhookId))?.status ===
-      "completed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(promptedPayload.webhookId))
+          ?.status === "completed",
     );
     expect(runtime.requests).toHaveLength(0);
   });
@@ -3166,6 +3453,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(promptBody, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(promptBody),
             },
             body: promptBody,
           })
@@ -3193,6 +3481,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(stopBody, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(stopBody),
             },
             body: stopBody,
           })
@@ -3404,6 +3693,36 @@ describe("startServer", () => {
     };
   }
 
+  it("leaves a session younger than the ack grace undecided rather than settling it as history", async () => {
+    const markerAt = Date.now() - 10 * 60_000;
+    // Created well after the marker, but only seconds ago: a created webhook
+    // may still be in flight. Settling it now would write initializedAt
+    // permanently and the deferred decision would never happen.
+    const sessionCreatedAt = new Date(Date.now() - 5_000).toISOString();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      prepareBridgeState: watchingSince(markerAt),
+      reconciliationFetchImpl: lostCreatedFetch({
+        sessionId: "session-too-young",
+        sessionCreatedAt,
+        promptCreatedAt: sessionCreatedAt,
+      }),
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+    const harness = activeHarness;
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Nothing dispatched, and crucially nothing recorded: the session must stay
+    // eligible for a later scan to recover once the grace has passed.
+    expect(runtime.requests).toHaveLength(0);
+    const state =
+      await harness.bridgeState.getReconciliationState("session-too-young");
+    expect(state.initializedAt).toBeUndefined();
+  });
+
   it("recovers a session whose created webhook was lost, exactly once", async () => {
     const markerAt = Date.now() - 10 * 60_000;
     // Older than the ack grace, so a missing claim is a lost delivery rather
@@ -3467,6 +3786,7 @@ describe("startServer", () => {
       headers: {
         "Content-Type": "application/json",
         "linear-signature": sign(body, WEBHOOK_SECRET),
+        "linear-delivery": deliveryIdOf(body),
       },
       body,
     });
@@ -3543,7 +3863,9 @@ describe("startServer", () => {
                 },
                 {
                   id: "prompt-history-b",
-                  createdAt: new Date(Date.parse(promptCreatedAt) + 1000).toISOString(),
+                  createdAt: new Date(
+                    Date.parse(promptCreatedAt) + 1000,
+                  ).toISOString(),
                   signal: null,
                   user: { id: "human-1" },
                   content: {
@@ -3573,9 +3895,8 @@ describe("startServer", () => {
 
     // The watermark adopts the newest activity seen, so later scans have a
     // cursor to skip past instead of rediscovering the same backlog.
-    const state = await harness.bridgeState.getReconciliationState(
-      "session-cold-start",
-    );
+    const state =
+      await harness.bridgeState.getReconciliationState("session-cold-start");
     expect(state.initializedAt).toEqual(expect.any(String));
     expect(state.processedThrough).toMatchObject({ id: "prompt-history-b" });
   });
@@ -3724,6 +4045,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
           },
           body,
         })
@@ -3799,7 +4121,9 @@ describe("startServer", () => {
         const prior = new JsonBridgeStateStore(storePath, {
           ownerId: "runtime-before-restart",
         });
-        await prior.initializeReconciliationSession("session-resume-after-stop");
+        await prior.initializeReconciliationSession(
+          "session-resume-after-stop",
+        );
         await prior.recordStopFence("session-resume-after-stop", {
           id: "stop-before-resume",
           createdAt: stopCreatedAt,
@@ -3870,9 +4194,13 @@ describe("startServer", () => {
       await Promise.race([
         release.promise,
         new Promise<void>((resolve) => {
-          request.abortController?.signal.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
+          request.abortController?.signal.addEventListener(
+            "abort",
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
         }),
       ]);
       yield { kind: "done" };
@@ -3898,6 +4226,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(createdBody, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(createdBody),
         },
         body: createdBody,
       });
@@ -3922,6 +4251,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(queuedBody, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(queuedBody),
         },
         body: queuedBody,
       });
@@ -3937,19 +4267,22 @@ describe("startServer", () => {
       await waitFor(() =>
         harness.calls.some(
           (call) =>
-            call.content.type === "response" && call.content.body === "Stopped.",
+            call.content.type === "response" &&
+            call.content.body === "Stopped.",
         ),
       );
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt("reconcile:recovered-stop"))
-          ?.status === "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt("reconcile:recovered-stop"))
+            ?.status === "completed",
       );
 
       expect(runtime.requests).toHaveLength(1);
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt("queued-before-recovered-stop"))
-          ?.status === "completed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt("queued-before-recovered-stop"))
+            ?.status === "completed",
       );
     } finally {
       release.resolve();
@@ -4225,9 +4558,7 @@ describe("startServer", () => {
       // The point is that a shutdown-aborted dispatch does not move the
       // checkpoint. The session also carries an initialization marker.
       await expect(
-        harness.bridgeState.getReconciliationState(
-          "session-shutdown-mutation",
-        ),
+        harness.bridgeState.getReconciliationState("session-shutdown-mutation"),
       ).resolves.not.toHaveProperty("processedThrough");
       const logged = errorSpy.mock.calls.flat().join("\n");
       expect(logged).not.toContain("reconciliation event failed");
@@ -4303,9 +4634,7 @@ describe("startServer", () => {
 
       expect(runtime.requests).toHaveLength(0);
       await expect(
-        harness.bridgeState.getReconciliationState(
-          "session-refresh-shutdown",
-        ),
+        harness.bridgeState.getReconciliationState("session-refresh-shutdown"),
       ).resolves.toEqual({});
       const logged = errorSpy.mock.calls.flat().join("\n");
       expect(logged).not.toContain("reconciliation event failed");
@@ -4351,7 +4680,9 @@ describe("startServer", () => {
       const harness = activeHarness;
       await waitFor(() => errorSpy.mock.calls.length > 0);
 
-      expect((await fetch(serverUrl(harness.port, "/healthz"))).status).toBe(200);
+      expect((await fetch(serverUrl(harness.port, "/healthz"))).status).toBe(
+        200,
+      );
       const payload = {
         webhookId: "webhook-after-reconciliation-failure",
         type: "AgentSessionEvent",
@@ -4368,13 +4699,16 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
       await waitFor(() => runtime.requests.length === 1);
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).toContain("reconciliation failed");
       expect(logged).not.toContain("raw reconciliation response secret");
     } finally {
@@ -4450,23 +4784,27 @@ describe("startServer", () => {
       });
       const harness = activeHarness;
 
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt(
-          "reconcile:prompt-recovered-failure",
-        ))?.status === "failed",
+      await waitFor(
+        async () =>
+          (
+            await harness.bridgeState.getReceipt(
+              "reconcile:prompt-recovered-failure",
+            )
+          )?.status === "failed",
       );
       await expect(
         harness.bridgeState.getClaim("prompt-recovered-failure"),
       ).resolves.toMatchObject({ status: "failed" });
-      await waitFor(async () =>
-        (await harness.bridgeState.getReconciliationState(
-          "session-recovered-failure",
-        )).processedThrough?.id === "prompt-recovered-failure",
+      await waitFor(
+        async () =>
+          (
+            await harness.bridgeState.getReconciliationState(
+              "session-recovered-failure",
+            )
+          ).processedThrough?.id === "prompt-recovered-failure",
       );
       await expect(
-        harness.bridgeState.getReconciliationState(
-          "session-recovered-failure",
-        ),
+        harness.bridgeState.getReconciliationState("session-recovered-failure"),
       ).resolves.toMatchObject({
         processedThrough: {
           id: "prompt-recovered-failure",
@@ -4538,7 +4876,10 @@ describe("startServer", () => {
     });
     try {
       activeHarness = await startTestServer(runtime, {
-        prepareBridgeState: watchingSessions("session-claimed", "session-stalled"),
+        prepareBridgeState: watchingSessions(
+          "session-claimed",
+          "session-stalled",
+        ),
         reconciliationFetchImpl: reconciliationFetch,
         configOverrides: {
           reconcileIntervalMs: 600000,
@@ -4615,7 +4956,9 @@ describe("startServer", () => {
             ownerId: "runtime-before-restart",
             now: () => now - 60_000,
           });
-          await prior.initializeReconciliationSession("session-resume-after-stop");
+          await prior.initializeReconciliationSession(
+            "session-resume-after-stop",
+          );
           await prior.claimEvent({
             webhookId: "reconcile:prompt-claimed",
             executionId: "prompt-claimed",
@@ -4629,9 +4972,8 @@ describe("startServer", () => {
       });
       const harness = activeHarness;
       await waitFor(async () => {
-        const state = await harness.bridgeState.getReconciliationState(
-          "session-claimed",
-        );
+        const state =
+          await harness.bridgeState.getReconciliationState("session-claimed");
         return state.processedThrough?.id === "prompt-claimed";
       });
       expect(warnSpy).not.toHaveBeenCalled();
@@ -4649,9 +4991,13 @@ describe("startServer", () => {
       await Promise.race([
         release.promise,
         new Promise<void>((resolve) => {
-          request.abortController?.signal.addEventListener("abort", () => resolve(), {
-            once: true,
-          });
+          request.abortController?.signal.addEventListener(
+            "abort",
+            () => resolve(),
+            {
+              once: true,
+            },
+          );
         }),
       ]);
       yield { kind: "done" };
@@ -4670,7 +5016,11 @@ describe("startServer", () => {
         agentSession: {
           id: "agent-session-timeout",
           createdAt: "2020-01-01T00:00:00.000Z",
-          issue: { id: "issue-timeout", identifier: "MPI-TIME", title: "Bounded request" },
+          issue: {
+            id: "issue-timeout",
+            identifier: "MPI-TIME",
+            title: "Bounded request",
+          },
         },
         promptContext: "do a bounded task",
         webhookTimestamp: Date.now(),
@@ -4681,6 +5031,7 @@ describe("startServer", () => {
         headers: {
           "Content-Type": "application/json",
           "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
         },
         body,
       });
@@ -4690,13 +5041,15 @@ describe("startServer", () => {
         harness.calls.some(
           (call) =>
             call.content.type === "error" &&
-            call.content.body === "This request was inactive for 25 ms and was stopped.",
+            call.content.body ===
+              "This request was inactive for 25 ms and was stopped.",
         ),
       );
       expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
-      await waitFor(async () =>
-        (await harness.bridgeState.getReceipt("webhook-timeout"))?.status ===
-        "failed",
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt("webhook-timeout"))?.status ===
+          "failed",
       );
       await expect(
         harness.bridgeState.getReceipt("webhook-timeout"),
@@ -4721,12 +5074,18 @@ describe("startServer", () => {
         await new Promise((resolve) => setTimeout(resolve, 40));
         yield { kind: "progress" };
         await new Promise((resolve) => setTimeout(resolve, 40));
-        yield { kind: "session-started", runtimeSessionId: "runtime-active-long" };
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-active-long",
+        };
         await new Promise((resolve) => setTimeout(resolve, 40));
       }
       yield {
         kind: "activity",
-        activity: { type: "response", body: `completed ${request.linearSessionId}` },
+        activity: {
+          type: "response",
+          body: `completed ${request.linearSessionId}`,
+        },
       };
       yield { kind: "done" };
     });
@@ -4736,12 +5095,18 @@ describe("startServer", () => {
     });
     const harness = activeHarness;
 
-    for (const sessionId of ["agent-session-active-long", "agent-session-waiting"]) {
+    for (const sessionId of [
+      "agent-session-active-long",
+      "agent-session-waiting",
+    ]) {
       const payload = {
         webhookId: `webhook-${sessionId}`,
         type: "AgentSessionEvent",
         action: "created",
-        agentSession: { id: sessionId, issue: { title: "Active long request" } },
+        agentSession: {
+          id: sessionId,
+          issue: { title: "Active long request" },
+        },
         promptContext: sessionId,
         webhookTimestamp: Date.now(),
       };
@@ -4753,6 +5118,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -4783,7 +5149,10 @@ describe("startServer", () => {
     ).toEqual([
       {
         agentSessionId: "agent-session-active-long",
-        content: { type: "thought", body: "Reading the issue and gathering context…" },
+        content: {
+          type: "thought",
+          body: "Reading the issue and gathering context…",
+        },
         ephemeral: true,
       },
       {
@@ -4822,7 +5191,10 @@ describe("startServer", () => {
     });
     const harness = activeHarness;
 
-    for (const sessionId of ["agent-session-done", "agent-session-after-done"]) {
+    for (const sessionId of [
+      "agent-session-done",
+      "agent-session-after-done",
+    ]) {
       const payload = {
         webhookId: `webhook-${sessionId}`,
         type: "AgentSessionEvent",
@@ -4839,6 +5211,7 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
@@ -4849,19 +5222,23 @@ describe("startServer", () => {
     await waitFor(() =>
       harness.calls.some(
         (call) =>
-          call.content.type === "response" && call.content.body === "queued after done",
+          call.content.type === "response" &&
+          call.content.body === "queued after done",
       ),
     );
     await new Promise((resolve) => setTimeout(resolve, 75));
     expect(
       harness.calls.some(
         (call) =>
-          call.content.type === "response" && call.content.body === "late after done",
+          call.content.type === "response" &&
+          call.content.body === "late after done",
       ),
     ).toBe(false);
     expect(
       harness.calls.some(
-        (call) => call.content.type === "error" && call.content.body.includes("was inactive"),
+        (call) =>
+          call.content.type === "error" &&
+          call.content.body.includes("was inactive"),
       ),
     ).toBe(false);
   });
@@ -4870,13 +5247,15 @@ describe("startServer", () => {
     const activityStarted = createDeferred<void>();
     let activitySignal: AbortSignal | null | undefined;
     let activityCompleted = false;
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield {
-        kind: "activity",
-        activity: { type: "response", body: "activity delivery that hangs" },
-      };
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "activity",
+          activity: { type: "response", body: "activity delivery that hangs" },
+        };
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime, {
       configOverrides: { runInactivityTimeoutMs: 30 },
@@ -4889,7 +5268,9 @@ describe("startServer", () => {
           calls.push({
             agentSessionId: input.agentSessionId,
             content: input.content,
-            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+            ...(input.ephemeral !== undefined
+              ? { ephemeral: input.ephemeral }
+              : {}),
           });
           if (
             input.content.type === "response" &&
@@ -4906,12 +5287,16 @@ describe("startServer", () => {
               if (activitySignal?.aborted === true) {
                 rejectAbort();
               } else {
-                activitySignal?.addEventListener("abort", rejectAbort, { once: true });
+                activitySignal?.addEventListener("abort", rejectAbort, {
+                  once: true,
+                });
               }
             });
             activityCompleted = true;
           }
-          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+          return jsonResponse({
+            data: { agentActivityCreate: { success: true } },
+          });
         }) as FetchFn,
     });
     const harness = activeHarness;
@@ -4919,7 +5304,10 @@ describe("startServer", () => {
       webhookId: "webhook-activity-timeout",
       type: "AgentSessionEvent",
       action: "created",
-      agentSession: { id: "agent-session-activity-timeout", issue: { title: "Hang" } },
+      agentSession: {
+        id: "agent-session-activity-timeout",
+        issue: { title: "Hang" },
+      },
       promptContext: "deliver a response",
       webhookTimestamp: Date.now(),
     };
@@ -4932,6 +5320,7 @@ describe("startServer", () => {
           headers: {
             "Content-Type": "application/json",
             "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
           },
           body,
         })
@@ -4943,7 +5332,8 @@ describe("startServer", () => {
         (call) =>
           call.agentSessionId === "agent-session-activity-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request was inactive for 30 ms and was stopped.",
+          call.content.body ===
+            "This request was inactive for 30 ms and was stopped.",
       ),
     );
 
@@ -4986,21 +5376,29 @@ describe("startServer", () => {
           calls.push({
             agentSessionId: input.agentSessionId,
             content: input.content,
-            ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+            ...(input.ephemeral !== undefined
+              ? { ephemeral: input.ephemeral }
+              : {}),
           });
           if (
             input.content.type === "error" &&
-            input.content.body === "This request was inactive for 30 ms and was stopped."
+            input.content.body ===
+              "This request was inactive for 30 ms and was stopped."
           ) {
             return await new Promise<Response>(() => {});
           }
-          return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+          return jsonResponse({
+            data: { agentActivityCreate: { success: true } },
+          });
         }) as FetchFn,
     });
     const harness = activeHarness;
 
     try {
-      for (const sessionId of ["agent-session-hard-timeout", "agent-session-queued"]) {
+      for (const sessionId of [
+        "agent-session-hard-timeout",
+        "agent-session-queued",
+      ]) {
         const payload = {
           webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
@@ -5017,6 +5415,7 @@ describe("startServer", () => {
               headers: {
                 "Content-Type": "application/json",
                 "linear-signature": sign(body, WEBHOOK_SECRET),
+                "linear-delivery": deliveryIdOf(body),
               },
               body,
             })
@@ -5040,7 +5439,8 @@ describe("startServer", () => {
         (call) =>
           call.agentSessionId === "agent-session-hard-timeout" &&
           call.content.type === "error" &&
-          call.content.body === "This request was inactive for 30 ms and was stopped.",
+          call.content.body ===
+            "This request was inactive for 30 ms and was stopped.",
       );
       expect(timeoutCalls).toHaveLength(1);
 
@@ -5058,7 +5458,8 @@ describe("startServer", () => {
           (call) =>
             call.agentSessionId === "agent-session-hard-timeout" &&
             call.content.type === "error" &&
-            call.content.body === "This request was inactive for 30 ms and was stopped.",
+            call.content.body ===
+              "This request was inactive for 30 ms and was stopped.",
         ),
       ).toHaveLength(1);
     } finally {
@@ -5089,12 +5490,18 @@ describe("startServer", () => {
     const harness = activeHarness;
 
     try {
-      for (const sessionId of ["agent-session-close-first", "agent-session-close-next"]) {
+      for (const sessionId of [
+        "agent-session-close-first",
+        "agent-session-close-next",
+      ]) {
         const payload = {
           webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
           action: "created",
-          agentSession: { id: sessionId, issue: { title: "Force close ordering" } },
+          agentSession: {
+            id: sessionId,
+            issue: { title: "Force close ordering" },
+          },
           promptContext: sessionId,
           webhookTimestamp: Date.now(),
         };
@@ -5106,6 +5513,7 @@ describe("startServer", () => {
               headers: {
                 "Content-Type": "application/json",
                 "linear-signature": sign(body, WEBHOOK_SECRET),
+                "linear-delivery": deliveryIdOf(body),
               },
               body,
             })
@@ -5113,7 +5521,10 @@ describe("startServer", () => {
         ).toBe(200);
       }
 
-      await waitFor(() => order.includes("started:agent-session-close-next"), 250);
+      await waitFor(
+        () => order.includes("started:agent-session-close-next"),
+        250,
+      );
       expect(order).toEqual([
         "started:agent-session-close-first",
         "closed:agent-session-close-first",
@@ -5152,7 +5563,10 @@ describe("startServer", () => {
           webhookId: `webhook-${sessionId}`,
           type: "AgentSessionEvent",
           action: "created",
-          agentSession: { id: sessionId, issue: { title: "Claude close ordering" } },
+          agentSession: {
+            id: sessionId,
+            issue: { title: "Claude close ordering" },
+          },
           promptContext: sessionId,
           webhookTimestamp: Date.now(),
         };
@@ -5164,6 +5578,7 @@ describe("startServer", () => {
               headers: {
                 "Content-Type": "application/json",
                 "linear-signature": sign(body, WEBHOOK_SECRET),
+                "linear-delivery": deliveryIdOf(body),
               },
               body,
             })
@@ -5183,9 +5598,11 @@ describe("startServer", () => {
   });
 
   it("rejects an invalid signature with 401 and enqueues nothing", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
@@ -5194,7 +5611,10 @@ describe("startServer", () => {
       webhookId: "webhook-bad-signature",
       type: "AgentSessionEvent",
       action: "created",
-      agentSession: { id: "agent-session-bad-sig", issue: { id: "i", identifier: "MPI-3", title: "t" } },
+      agentSession: {
+        id: "agent-session-bad-sig",
+        issue: { id: "i", identifier: "MPI-3", title: "t" },
+      },
       promptContext: "ctx",
       webhookTimestamp: Date.now(),
     };
@@ -5203,7 +5623,10 @@ describe("startServer", () => {
 
     const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "linear-signature": badSignature },
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": badSignature,
+      },
       body,
     });
 
@@ -5216,11 +5639,13 @@ describe("startServer", () => {
   });
 
   it("emits an error activity when the runtime throws, and the server stays up for /healthz", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      throw new Error("kaboom");
-      // eslint-disable-next-line no-unreachable
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        throw new Error("kaboom");
+        // eslint-disable-next-line no-unreachable
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
@@ -5229,7 +5654,10 @@ describe("startServer", () => {
       webhookId: "webhook-runtime-error",
       type: "AgentSessionEvent",
       action: "created",
-      agentSession: { id: "agent-session-err", issue: { id: "i", identifier: "MPI-4", title: "t" } },
+      agentSession: {
+        id: "agent-session-err",
+        issue: { id: "i", identifier: "MPI-4", title: "t" },
+      },
       promptContext: "ctx",
       webhookTimestamp: Date.now(),
     };
@@ -5238,7 +5666,11 @@ describe("startServer", () => {
 
     const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "linear-signature": signature },
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": signature,
+        "linear-delivery": deliveryIdOf(body),
+      },
       body,
     });
 
@@ -5248,16 +5680,20 @@ describe("startServer", () => {
 
     expect(harness.calls[0]).toEqual({
       agentSessionId: "agent-session-err",
-      content: { type: "thought", body: "Reading the issue and gathering context…" },
+      content: {
+        type: "thought",
+        body: "Reading the issue and gathering context…",
+      },
       ephemeral: true,
     });
     expect(harness.calls[1]).toEqual({
       agentSessionId: "agent-session-err",
       content: { type: "error", body: "kaboom" },
     });
-    await waitFor(async () =>
-      (await harness.bridgeState.getReceipt("webhook-runtime-error"))?.status ===
-      "failed",
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt("webhook-runtime-error"))
+          ?.status === "failed",
     );
     await expect(
       harness.bridgeState.getReceipt("webhook-runtime-error"),
@@ -5276,11 +5712,13 @@ describe("startServer", () => {
   });
 
   it("logs only a bounded error class when processing fails", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      throw new Error("raw-runtime-error-body");
-      // eslint-disable-next-line no-unreachable
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        throw new Error("raw-runtime-error-body");
+        // eslint-disable-next-line no-unreachable
+        yield { kind: "done" };
+      },
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -5302,20 +5740,24 @@ describe("startServer", () => {
             headers: {
               "Content-Type": "application/json",
               "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
             },
             body,
           })
         ).status,
       ).toBe(200);
-      await waitFor(async () =>
-        (
-          await harness.bridgeState.getReceipt(
-            "webhook-bounded-processing-error",
-          )
-        )?.status === "failed",
+      await waitFor(
+        async () =>
+          (
+            await harness.bridgeState.getReceipt(
+              "webhook-bounded-processing-error",
+            )
+          )?.status === "failed",
       );
 
-      const logged = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      const logged = errorSpy.mock.calls
+        .map((call) => call.join(" "))
+        .join("\n");
       expect(logged).toContain("error=RuntimeExecutionError");
       expect(logged).not.toContain("raw-runtime-error-body");
       expect(logged).not.toContain("raw-secret-prompt-body");
@@ -5325,9 +5767,11 @@ describe("startServer", () => {
   });
 
   it("oauth callback: exchanges the code and persists the rotating token pair", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
 
     const tokenResponse = {
       access_token: "tok-secret-123",
@@ -5352,12 +5796,18 @@ describe("startServer", () => {
       expect(state).toMatch(/^[A-Za-z0-9_-]{40,}$/);
 
       const response = await fetch(
-        serverUrl(harness.port, `/oauth/callback?code=auth-code-xyz&state=${state}`),
+        serverUrl(
+          harness.port,
+          `/oauth/callback?code=auth-code-xyz&state=${state}`,
+        ),
       );
       expect(response.status).toBe(200);
 
       expect(harness.tokenFetch).toHaveBeenCalledTimes(1);
-      const [url, init] = harness.tokenFetch.mock.calls[0] as [string, RequestInit];
+      const [url, init] = harness.tokenFetch.mock.calls[0] as [
+        string,
+        RequestInit,
+      ];
       expect(url).toBe("https://api.linear.app/oauth/token");
       expect(init.method).toBe("POST");
       expect(init.headers).toMatchObject({
@@ -5369,7 +5819,9 @@ describe("startServer", () => {
       expect(params.get("client_id")).toBe("client-id-test");
       expect(params.get("client_secret")).toBe("client-secret-test");
       expect(params.get("grant_type")).toBe("authorization_code");
-      expect(params.get("redirect_uri")).toBe("http://localhost:3979/oauth/callback");
+      expect(params.get("redirect_uri")).toBe(
+        "http://localhost:3979/oauth/callback",
+      );
 
       expect(logSpy).toHaveBeenCalledWith(
         "[linear-agent-bridge] OAuth token pair installed",
@@ -5378,7 +5830,9 @@ describe("startServer", () => {
       expect(logged).not.toContain("tok-secret-123");
       expect(logged).not.toContain("rt-1");
       expect(
-        JSON.parse(await fsPromises.readFile(harness.oauthTokenStorePath, "utf8")),
+        JSON.parse(
+          await fsPromises.readFile(harness.oauthTokenStorePath, "utf8"),
+        ),
       ).toMatchObject({
         accessToken: "tok-secret-123",
         refreshToken: "rt-1",
@@ -5389,9 +5843,11 @@ describe("startServer", () => {
   });
 
   it("oauth callback: cancels a failed token response without exposing its body", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     let bodyCanceled = false;
     activeHarness = await startTestServer(runtime, {
       tokenFetchImpl: (async () =>
@@ -5430,9 +5886,11 @@ describe("startServer", () => {
   });
 
   it("oauth callback: rejects a missing or replayed state before token exchange", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
     activeHarness = await startTestServer(runtime, {
       tokenFetchImpl: (async () =>
         jsonResponse({
@@ -5449,7 +5907,9 @@ describe("startServer", () => {
     expect(missingState.status).toBe(400);
     expect(harness.tokenFetch).not.toHaveBeenCalled();
 
-    const state = new URL(await harness.authorizationUrl).searchParams.get("state");
+    const state = new URL(await harness.authorizationUrl).searchParams.get(
+      "state",
+    );
     expect(state).not.toBeNull();
     const callbackUrl = serverUrl(
       harness.port,
@@ -5463,9 +5923,11 @@ describe("startServer", () => {
   });
 
   it("ignores a non-agent-session webhook category but still acks 200", async () => {
-    const runtime = new FakeRuntime(async function* (): AsyncGenerator<RuntimeEvent> {
-      yield { kind: "done" };
-    });
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
 
     activeHarness = await startTestServer(runtime);
     const harness = activeHarness;
@@ -5481,7 +5943,11 @@ describe("startServer", () => {
 
     const response = await fetch(serverUrl(harness.port, "/webhook"), {
       method: "POST",
-      headers: { "Content-Type": "application/json", "linear-signature": signature },
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": signature,
+        "linear-delivery": deliveryIdOf(body),
+      },
       body,
     });
 

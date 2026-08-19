@@ -338,8 +338,10 @@ session takes.
   activity timestamp rather than substituting webhook delivery time.
 - AgentSessionEvent payloads put their fields at the top level of the
   webhook body (no `data` wrapper, unlike data-change webhooks).
-- `webhookId` identifies a Linear delivery. The created semantic execution id
-  is `created:<agentSession.id>`; prompted execution is identified by
+- The `Linear-Delivery` header identifies one delivery; `webhookId` identifies
+  the webhook configuration and repeats on every delivery it sends, so it cannot
+  key a receipt. The created semantic execution id is
+  `created:<agentSession.id>`; prompted execution is identified by
   `agentActivity.id`. Linear activity creation receives a caller-generated UUID
   persisted before the request, so an OAuth retry reuses the same id.
 - A restart recovers an accepted claim whose dispatch marker is absent by
