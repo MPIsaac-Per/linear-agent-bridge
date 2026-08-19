@@ -111,7 +111,9 @@ evicted. Preserve this file through a cutover and rollback.
 Reconciliation runs at startup and every `RECONCILE_INTERVAL_MS` (default
 60,000 ms). It discovers sessions within `RECONCILE_LOOKBACK_MS` (default 24
 hours), up to `RECONCILE_MAX_SESSIONS` (default 250), while always including
-locally known sessions. Activity reads and watermarks have a seven-day bound.
+locally known sessions. `RECONCILE_LOOKBACK_MS` also bounds how far back
+activities are read. A session's first reconciliation dispatches nothing and
+only adopts a watermark, so historical prompts are never replayed as new turns.
 `AGENT_SESSION_ACK_GRACE_MS` (default 120,000 ms) controls when an old unclaimed
 prompt produces the bounded `stalled_agent_session` warning. That warning is
 rate-limited to once per session every 15 minutes.

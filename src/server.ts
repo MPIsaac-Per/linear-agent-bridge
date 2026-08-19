@@ -63,7 +63,6 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge follow-up turns before they enter the host-wide serial queue. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
-const RECONCILIATION_ACTIVITY_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const STALLED_WARNING_INTERVAL_MS = 15 * 60 * 1000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 
@@ -419,7 +418,7 @@ async function reconcileAgentSession(
     await deps.bridgeState.getReconciliationState(sessionId);
   const snapshot = await deps.linear.listAgentSessionActivities(sessionId, {
     lookbackAfter: new Date(
-      now - RECONCILIATION_ACTIVITY_LOOKBACK_MS,
+      now - deps.config.reconcileLookbackMs,
     ).toISOString(),
     ...(reconciliationState.processedThrough !== undefined
       ? { processedThrough: reconciliationState.processedThrough }
@@ -427,6 +426,24 @@ async function reconcileAgentSession(
     signal: deps.reconciliationController?.signal,
   });
   if (reconciliationCancelled(deps)) {
+    return;
+  }
+
+  // Fix 1: cold start. A session reconciliation has never seen has no basis
+  // for calling anything in the window "missed" — the bridge simply was not
+  // watching. Adopt the newest observed activity as the watermark, dispatch
+  // nothing, and pick up genuinely new prompts from the next pass onward.
+  // Without this, the first reconciliation of every session replays its whole
+  // history as fresh turns.
+  if (reconciliationState.initializedAt === undefined) {
+    const newestSeen = snapshot.activities.at(-1);
+    await deps.bridgeState.initializeReconciliationSession(
+      sessionId,
+      newestSeen === undefined ? undefined : activityCursor(newestSeen),
+    );
+    console.log(
+      `[linear-agent-bridge] reconciliation initialized: session=${sessionId} observed=${snapshot.activities.length} dispatched=0`,
+    );
     return;
   }
   const humanPrompts = snapshot.activities.filter(

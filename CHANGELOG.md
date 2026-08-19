@@ -7,6 +7,17 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop reconciliation replaying a session's history on its first sighting. A
+  session already in Linear predates the bridge watching it, so nothing in the
+  window is missed work. The first pass now adopts the newest observed activity
+  as the watermark and dispatches nothing. Previously the first reconciliation
+  of every session dispatched every prompt in the window as a fresh turn.
+- Bound the activity read with `RECONCILE_LOOKBACK_MS`. The window was a
+  hardcoded seven days, so the setting only gated which sessions were scanned
+  and appeared to control a window it did not.
+
 ### Added
 
 - Add a deterministic signed public-ingress verifier, strict Funnel status

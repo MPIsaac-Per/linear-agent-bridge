@@ -190,9 +190,15 @@ unhealthy.
 Reconciliation runs once at startup and every `RECONCILE_INTERVAL_MS` (default
 `60000`). Each scan includes every locally known Linear session plus at most
 `RECONCILE_MAX_SESSIONS` (default `250`) app-owned sessions updated within
-`RECONCILE_LOOKBACK_MS` (default `86400000`, 24 hours). Session activities are
-read no further back than seven days and resume from a durable per-session
-watermark. `AGENT_SESSION_ACK_GRACE_MS` (default `120000`) controls when an old,
+`RECONCILE_LOOKBACK_MS` (default `86400000`, 24 hours). That same window bounds
+how far back session activities are read, and reads resume from a durable
+per-session watermark.
+
+The first time reconciliation sees a session it dispatches nothing. It adopts
+the newest activity it observes as the watermark and picks up genuinely new
+prompts from the next scan onward. A session already in Linear predates the
+bridge watching it, so its history is not missed work; without this, a first
+run would replay every prompt in the window as a fresh turn. `AGENT_SESSION_ACK_GRACE_MS` (default `120000`) controls when an old,
 unclaimed prompt produces a bounded `stalled_agent_session` diagnostic;
 repeats are limited to once per session every 15 minutes.
 
