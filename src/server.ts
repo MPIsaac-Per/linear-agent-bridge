@@ -369,6 +369,11 @@ function scheduleReconciliation(deps: InternalServerDeps): void {
 
 async function reconcileAgentSessions(deps: InternalServerDeps): Promise<void> {
   const now = deps.now?.() ?? Date.now();
+  // Stamped once, on the first run this state file ever sees. Sessions older
+  // than it predate the bridge and are history; sessions newer than it were
+  // created while the bridge was watching, so an undispatched one is missed
+  // work rather than history.
+  const watchingSince = await deps.bridgeState.ensureWatchingSince();
   const sessionIds = new Set([
     ...(await deps.bridgeState.listKnownSessionIds()),
     ...(await deps.store.listSessionIds()),
@@ -397,7 +402,7 @@ async function reconcileAgentSessions(deps: InternalServerDeps): Promise<void> {
       return;
     }
     try {
-      await reconcileAgentSession(deps, sessionId, now);
+      await reconcileAgentSession(deps, sessionId, now, watchingSince);
     } catch (error) {
       if (isExpectedReconciliationShutdown(deps, error)) {
         return;
@@ -413,6 +418,7 @@ async function reconcileAgentSession(
   deps: InternalServerDeps,
   sessionId: string,
   now: number,
+  watchingSince: string,
 ): Promise<void> {
   const reconciliationState =
     await deps.bridgeState.getReconciliationState(sessionId);
@@ -437,14 +443,46 @@ async function reconcileAgentSession(
   // history as fresh turns.
   if (reconciliationState.initializedAt === undefined) {
     const newestSeen = snapshot.activities.at(-1);
-    await deps.bridgeState.initializeReconciliationSession(
-      sessionId,
-      newestSeen === undefined ? undefined : activityCursor(newestSeen),
-    );
+    const sessionCreatedAt = Date.parse(snapshot.createdAt);
+    // Two-sided on purpose. Newer than the marker means the bridge was running
+    // when Linear created this session, so its opening prompt should have
+    // arrived. Inside the lookback bounds the blast radius of a long outage and
+    // keeps recovery within the window where the created claim still exists.
+    const createdWhileWatching =
+      Number.isFinite(sessionCreatedAt) &&
+      sessionCreatedAt > Date.parse(watchingSince) &&
+      sessionCreatedAt >= now - deps.config.reconcileLookbackMs &&
+      // A created webhook that is merely slow has not been lost. Without this
+      // the two paths race: reconciliation recovers the opening prompt while
+      // the webhook is still in flight, and the turn runs twice, since the two
+      // claim on different identities. AGENT_SESSION_ACK_GRACE_MS already means
+      // "long enough that a missing claim is a real problem".
+      sessionCreatedAt <= now - deps.config.agentSessionAckGraceMs;
+    // The created webhook path claims `created:<sessionId>`; reconciliation
+    // claims activity ids. Different keys, so a claim here is the only evidence
+    // that the opening prompt already ran. Without this check a session whose
+    // webhook arrived normally would run its first prompt twice.
+    const createdClaim = createdWhileWatching
+      ? await deps.bridgeState.getClaim(`created:${sessionId}`)
+      : undefined;
+    if (!createdWhileWatching || createdClaim !== undefined) {
+      await deps.bridgeState.initializeReconciliationSession(
+        sessionId,
+        newestSeen === undefined ? undefined : activityCursor(newestSeen),
+      );
+      console.log(
+        `[linear-agent-bridge] reconciliation initialized: session=${sessionId} observed=${snapshot.activities.length} dispatched=0`,
+      );
+      return;
+    }
+    // Created while this bridge was watching and never claimed: the opening
+    // webhook was lost. Record the sighting without a watermark and fall
+    // through to the normal dispatch path, which owns the stop fence and the
+    // activity-id deduplication.
+    await deps.bridgeState.initializeReconciliationSession(sessionId);
     console.log(
-      `[linear-agent-bridge] reconciliation initialized: session=${sessionId} observed=${snapshot.activities.length} dispatched=0`,
+      `[linear-agent-bridge] reconciliation recovering lost created: session=${sessionId} observed=${snapshot.activities.length}`,
     );
-    return;
   }
   const humanPrompts = snapshot.activities.filter(
     (activity) =>

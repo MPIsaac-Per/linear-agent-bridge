@@ -240,6 +240,7 @@ async function startTestServer(
           data: {
             agentSession: {
               id: request.variables.sessionId,
+              createdAt: "2020-01-01T00:00:00.000Z",
               appUser: { id: "app-user-test" },
               activities: {
                 nodes: [],
@@ -508,6 +509,7 @@ describe("startServer", () => {
       action: "created",
       agentSession: {
         id: "agent-session-1",
+        createdAt: "2020-01-01T00:00:00.000Z",
         issue: { id: "issue-1", identifier: "MPI-1", title: "Fix the bug" },
       },
       promptContext: "<issue>Fix the bug</issue>",
@@ -637,6 +639,7 @@ describe("startServer", () => {
         action: "created",
         agentSession: {
           id: "session-created-crash-before-dispatch",
+          createdAt: "2020-01-01T00:00:00.000Z",
           issue: {
             id: "issue-created-crash-before-dispatch",
             identifier: "MPI-1448",
@@ -1719,7 +1722,8 @@ describe("startServer", () => {
           if (String(args[0]) === stateDirectory) {
             const originalSync = handle.sync.bind(handle);
             vi.spyOn(handle, "sync").mockImplementation(async () => {
-              if (stateRenames === 2 && !failedFinalClaimSync) {
+              // +1: reconciliation's first run stamps the watching marker.
+              if (stateRenames === 3 && !failedFinalClaimSync) {
                 failedFinalClaimSync = true;
                 throw new Error("synthetic final claim directory sync failure");
               }
@@ -1800,7 +1804,8 @@ describe("startServer", () => {
             openedPath.endsWith(".tmp")
           ) {
             stateTempOpens += 1;
-            if (stateTempOpens === 3) {
+            // +1: reconciliation's first run stamps the watching marker.
+            if (stateTempOpens === 4) {
               markerOpenFailed = true;
               throw new Error("synthetic marker open failure");
             }
@@ -2060,7 +2065,8 @@ describe("startServer", () => {
           if (String(args[0]) === stateDirectory) {
             const originalSync = handle.sync.bind(handle);
             vi.spyOn(handle, "sync").mockImplementation(async () => {
-              if (stateRenames === 3 && !failedMarkerDirectorySync) {
+              // +1: reconciliation's first run stamps the watching marker.
+              if (stateRenames === 4 && !failedMarkerDirectorySync) {
                 failedMarkerDirectorySync = true;
                 throw new Error(
                   "synthetic dispatch marker directory sync failure",
@@ -2375,7 +2381,8 @@ describe("startServer", () => {
               if (String(args[0]) === stateDirectory) {
                 const originalSync = handle.sync.bind(handle);
                 vi.spyOn(handle, "sync").mockImplementation(async () => {
-                  if (stateRenames === 1 && !failedVisibleRepairSync) {
+                  // +1: reconciliation's first run stamps the watching marker.
+                  if (stateRenames === 2 && !failedVisibleRepairSync) {
                     failedVisibleRepairSync = true;
                     throw new Error("synthetic visible legacy repair sync failure");
                   }
@@ -2954,6 +2961,7 @@ describe("startServer", () => {
         action: "created",
         agentSession: {
           id: "agent-session-stop",
+          createdAt: "2020-01-01T00:00:00.000Z",
           issue: { id: "issue-stop", identifier: "MPI-STOP", title: "Long request" },
         },
         promptContext: "do a long task",
@@ -3239,6 +3247,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-restart-stop",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             issue: { identifier: "MPI-1448" },
             activities: {
@@ -3330,6 +3339,166 @@ describe("startServer", () => {
     expect(persisted).not.toContain("continue the implementation");
   });
 
+  // MPI-1463. A session created while the bridge was watching, never claimed,
+  // is a lost `created` webhook rather than history. That is the one message
+  // reconciliation could not recover.
+  function lostCreatedFetch(options: {
+    sessionId: string;
+    sessionCreatedAt: string;
+    promptCreatedAt: string;
+  }): FetchFn {
+    return (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(init?.body as string) as { query: string };
+      if (request.query.includes("ReconciliationAgentSessions")) {
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-1" },
+            agentSessions: {
+              nodes: [
+                {
+                  id: options.sessionId,
+                  updatedAt: options.promptCreatedAt,
+                  appUser: { id: "app-user-1" },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      }
+      return jsonResponse({
+        data: {
+          agentSession: {
+            id: options.sessionId,
+            createdAt: options.sessionCreatedAt,
+            appUser: { id: "app-user-1" },
+            activities: {
+              nodes: [
+                {
+                  id: "prompt-opening",
+                  createdAt: options.promptCreatedAt,
+                  signal: null,
+                  user: { id: "human-1" },
+                  content: {
+                    __typename: "AgentActivityPromptContent",
+                    body: "the opening prompt nobody delivered",
+                  },
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      });
+    }) as FetchFn;
+  }
+
+  /** Stamp the watching marker at a chosen time, as a prior run would have. */
+  function watchingSince(atMs: number): (storePath: string) => Promise<void> {
+    return async (storePath: string): Promise<void> => {
+      const prior = new JsonBridgeStateStore(storePath, {
+        ownerId: "runtime-prior",
+        now: () => atMs,
+      });
+      await prior.ensureWatchingSince();
+    };
+  }
+
+  it("recovers a session whose created webhook was lost, exactly once", async () => {
+    const markerAt = Date.now() - 10 * 60_000;
+    // Older than the ack grace, so a missing claim is a lost delivery rather
+    // than one still in flight.
+    const sessionCreatedAt = new Date(markerAt + 60_000).toISOString();
+    const promptCreatedAt = new Date(markerAt + 61_000).toISOString();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      prepareBridgeState: watchingSince(markerAt),
+      reconciliationFetchImpl: lostCreatedFetch({
+        sessionId: "session-lost-created",
+        sessionCreatedAt,
+        promptCreatedAt,
+      }),
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+
+    await waitFor(() => runtime.requests.length === 1);
+    // Several more scans run. Recovery happens once, not once per scan.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(runtime.requests).toHaveLength(1);
+    expect(runtime.requests[0]?.prompt).toContain(
+      "the opening prompt nobody delivered",
+    );
+  });
+
+  it("does not re-run an opening prompt whose created webhook was delivered", async () => {
+    const markerAt = Date.now() - 90_000;
+    const sessionId = "session-created-delivered";
+    const promptCreatedAt = new Date(markerAt + 11_000).toISOString();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      prepareBridgeState: watchingSince(markerAt),
+      reconciliationFetchImpl: lostCreatedFetch({
+        sessionId,
+        sessionCreatedAt: new Date(markerAt + 10_000).toISOString(),
+        promptCreatedAt,
+      }),
+      configOverrides: { reconcileIntervalMs: 20 },
+    });
+    const harness = activeHarness;
+
+    // The created webhook arrives normally and runs the turn, claiming
+    // `created:<sessionId>`. Reconciliation keys its claims on activity ids, so
+    // without an explicit check it would see an unclaimed opening prompt on a
+    // session newer than the marker and run it a second time.
+    const body = JSON.stringify({
+      webhookId: "webhook-created-delivered",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: { id: sessionId },
+      promptContext: "the opening prompt nobody delivered",
+      webhookTimestamp: Date.now(),
+    });
+    const response = await fetch(serverUrl(harness.port, "/webhook"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "linear-signature": sign(body, WEBHOOK_SECRET),
+      },
+      body,
+    });
+    expect(response.status).toBe(200);
+
+    await waitFor(() => runtime.requests.length === 1);
+    // Let several reconciliation scans run over the same session.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runtime.requests).toHaveLength(1);
+  });
+
+  it("dispatches nothing for a session created after the marker but outside the lookback", async () => {
+    const markerAt = Date.now() - 30 * 60_000;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" } as RuntimeEvent;
+    });
+    activeHarness = await startTestServer(runtime, {
+      prepareBridgeState: watchingSince(markerAt),
+      reconciliationFetchImpl: lostCreatedFetch({
+        sessionId: "session-outside-lookback",
+        // After the marker, but older than the lookback below. A long outage
+        // must not turn into a flood of replayed openings.
+        sessionCreatedAt: new Date(markerAt + 1_000).toISOString(),
+        promptCreatedAt: new Date(markerAt + 2_000).toISOString(),
+      }),
+      configOverrides: { reconcileIntervalMs: 20, reconcileLookbackMs: 5_000 },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runtime.requests).toHaveLength(0);
+  });
+
   it("adopts a watermark without dispatching on a session it has never reconciled", async () => {
     const promptCreatedAt = new Date().toISOString();
     const reconciliationFetch = (async (
@@ -3358,6 +3527,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-cold-start",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -3444,6 +3614,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-lookback",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [],
@@ -3499,6 +3670,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-missed-once",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -3591,6 +3763,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-resume-after-stop",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -3668,6 +3841,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: request.variables?.sessionId,
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: stopVisible
@@ -3907,6 +4081,7 @@ describe("startServer", () => {
           data: {
             agentSession: {
               id: "session-shutdown-fetch",
+              createdAt: "2020-01-01T00:00:00.000Z",
               appUser: { id: "app-user-1" },
               activities: {
                 nodes: [
@@ -3976,6 +4151,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-shutdown-mutation",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -4235,6 +4411,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-recovered-failure",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -4335,6 +4512,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-stalled",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -4404,6 +4582,7 @@ describe("startServer", () => {
         data: {
           agentSession: {
             id: "session-claimed",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [
@@ -4490,6 +4669,7 @@ describe("startServer", () => {
         action: "created",
         agentSession: {
           id: "agent-session-timeout",
+          createdAt: "2020-01-01T00:00:00.000Z",
           issue: { id: "issue-timeout", identifier: "MPI-TIME", title: "Bounded request" },
         },
         promptContext: "do a bounded task",

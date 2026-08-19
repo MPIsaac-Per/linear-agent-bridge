@@ -32,6 +32,19 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ### Fixed
 
+- Recover a session's opening prompt when its `created` webhook is lost.
+  Reconciliation dispatches nothing on first sighting of a session, which is
+  correct for history and swallowed genuine missed work: mention the agent on a
+  new issue, lose that one delivery, and the session sat silent forever with no
+  retry and no diagnostic. Every later prompt in the session recovered normally.
+  The bridge now records `watchingSince` once, so a session Linear created while
+  the bridge was running and never claimed is recognised as missed work.
+  Recovery is bounded by `RECONCILE_LOOKBACK_MS`, held off by
+  `AGENT_SESSION_ACK_GRACE_MS` so it cannot race a webhook still in flight, and
+  skipped entirely when a `created:<sessionId>` claim shows the opening already
+  ran. `RECONCILE_LOOKBACK_MS` is now rejected at startup if it exceeds durable
+  state retention, since that claim is what recovery deduplicates against.
+
 - Handle `SIGINT` and `SIGTERM`. The service installed no signal handler, so
   nothing wired a signal to `server.close()`. launchd sends `SIGTERM` on
   `bootout` and `kickstart -k` and systemd sends it on `stop` and `restart`,

@@ -506,6 +506,7 @@ describe("LinearAgentClient reconciliation reads", () => {
           data: {
             agentSession: {
               id: "session-1",
+              createdAt: "2020-01-01T00:00:00.000Z",
               appUser: { id: "app-user-1" },
               issue: { identifier: "MPI-1" },
               activities: {
@@ -542,6 +543,7 @@ describe("LinearAgentClient reconciliation reads", () => {
           data: {
             agentSession: {
               id: "session-1",
+              createdAt: "2020-01-01T00:00:00.000Z",
               appUser: { id: "app-user-1" },
               issue: { identifier: "MPI-1" },
               activities: {
@@ -576,6 +578,7 @@ describe("LinearAgentClient reconciliation reads", () => {
           data: {
             agentSession: {
               id: "session-1",
+              createdAt: "2020-01-01T00:00:00.000Z",
               appUser: { id: "app-user-1" },
               issue: { identifier: "MPI-1" },
               activities: {
@@ -609,6 +612,7 @@ describe("LinearAgentClient reconciliation reads", () => {
 
     expect(result).toEqual({
       id: "session-1",
+      createdAt: "2020-01-01T00:00:00.000Z",
       appUserId: "app-user-1",
       issueIdentifier: "MPI-1",
       activities: [
@@ -659,6 +663,7 @@ describe("LinearAgentClient reconciliation reads", () => {
         data: {
           agentSession: {
             id: "session-scalar",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [],
@@ -690,6 +695,7 @@ describe("LinearAgentClient reconciliation reads", () => {
         data: {
           agentSession: {
             id: "session-tiebreak",
+            createdAt: "2020-01-01T00:00:00.000Z",
             appUser: { id: "app-user-1" },
             activities: {
               nodes: [

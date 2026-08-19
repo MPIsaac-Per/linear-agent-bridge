@@ -2714,3 +2714,30 @@ describe("JsonBridgeStateStore", () => {
     ).resolves.toBe(false);
   });
 });
+
+describe("watchingSince", () => {
+  it("stamps once and never re-stamps across runs or a reload", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    let clock = 1_000_000;
+    const first = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-a",
+      now: () => clock,
+      ...TEST_LOCK_OPTIONS,
+    });
+
+    const stamped = await first.ensureWatchingSince();
+    clock += 60_000;
+    // A second call in the same process must not move it.
+    expect(await first.ensureWatchingSince()).toBe(stamped);
+
+    // Nor may a restart. Sessions that predate this bridge stay history for the
+    // life of the state file; re-stamping would silently make them recoverable.
+    const reloaded = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-b",
+      now: () => clock,
+      ...TEST_LOCK_OPTIONS,
+    });
+    expect(await reloaded.ensureWatchingSince()).toBe(stamped);
+    expect(stamped).toBe(new Date(1_000_000).toISOString());
+  });
+});
