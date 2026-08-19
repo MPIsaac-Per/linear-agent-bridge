@@ -658,7 +658,7 @@ describe("JsonBridgeStateStore", () => {
     }
   });
 
-  it("rejects queued work that reaches the mutation tail after its absolute deadline", async () => {
+  it("does not mutate after the admission timer rejects queued work", async () => {
     const storePath = path.join(tmpDir, "bridge-state.json");
     const store = new JsonBridgeStateStore(storePath, {
       ownerId: "runtime-a",
@@ -672,14 +672,94 @@ describe("JsonBridgeStateStore", () => {
     ).mutationTail = gate.promise;
 
     const claim = store.claimEvent(event());
-    const blockedUntil = Date.now() + 50;
-    while (Date.now() < blockedUntil) {
-      // Keep the timer callback pending so resolving the tail queues admission first.
-    }
-    gate.resolve();
-
     await expect(claim).rejects.toThrow(/Timed out acquiring bridge state lock/);
+    const drain = (
+      store as unknown as {
+        mutationTail: Promise<void>;
+      }
+    ).mutationTail;
+    // The caller already has its timeout. Releasing the queue later must not
+    // acquire the lock or persist a claim the caller was told failed.
+    gate.resolve();
+    await drain;
     await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("completes a mutation that is admitted after its budget is already spent", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-a",
+      lockTimeoutMs: 25,
+      ...TEST_LOCK_OPTIONS,
+    });
+    const origin = 1_700_000_000_000;
+    let firstNow = true;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      if (firstNow) {
+        firstNow = false;
+        return origin;
+      }
+      return origin + 1_000;
+    });
+
+    try {
+      // mutate computes the deadline from the first Date.now, then the clock
+      // jumps past it before the mutation-tail callback runs. That is the
+      // loaded-host admission race: the lock is free and the mutation can
+      // still finish, so refusing here skips the owed attempt.
+      await expect(store.claimEvent(event())).resolves.toMatchObject({
+        disposition: "claimed",
+      });
+      await expect(store.getReceipt("webhook-1")).resolves.toMatchObject({
+        status: "claimed",
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("probes the lock owner when a mutation is admitted after its budget is already spent", async () => {
+    const storePath = path.join(tmpDir, "bridge-state.json");
+    const lockPath = `${storePath}.lock`;
+    const token = "live-owner-spent-admission";
+    await writeLockOwner(lockPath, token, {
+      pid: process.pid,
+      hostname: os.hostname(),
+      processIdentity: CURRENT_PROCESS_IDENTITY,
+      uid: TEST_UID,
+    });
+    const inspectedUidPids: number[] = [];
+    const store = new JsonBridgeStateStore(storePath, {
+      ownerId: "runtime-b",
+      lockTimeoutMs: 25,
+      lockRetryMs: 10,
+      lockProcessIdentity: async () => CURRENT_PROCESS_IDENTITY,
+      lockBootIdentity: async () => BOOT_A,
+      lockProcessUid: async (pid) => {
+        inspectedUidPids.push(pid);
+        return TEST_UID;
+      },
+    });
+    const origin = 1_700_000_000_000;
+    let firstNow = true;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      if (firstNow) {
+        firstNow = false;
+        return origin;
+      }
+      return origin + 1_000;
+    });
+
+    try {
+      await expect(store.claimEvent(event())).rejects.toThrow(
+        /Timed out acquiring bridge state lock/,
+      );
+      expect(inspectedUidPids).toEqual([process.pid]);
+      expect(await fs.readdir(lockPath)).toEqual([`${token}.json`]);
+      await expect(store.getReceipt("webhook-1")).resolves.toBeUndefined();
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("does not mutate after a retry delay crosses the absolute lock deadline", async () => {

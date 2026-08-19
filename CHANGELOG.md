@@ -13,11 +13,14 @@ Changes awaiting a tagged release remain under Unreleased.
   its deadline before attempting anything, and the directory sync and owner
   write ahead of it failed the same way, so a mutation whose budget was spent
   during setup gave up without trying the lock and without ever probing the
-  owner of a stale one. On a loaded host that failed mutations that would have
-  succeeded and left abandoned locks unreclaimed, which is what made the
-  bridge state lock tests fail intermittently on CI. The guaranteed attempt has
-  its own bounded floor, and winning the rename now runs the operation instead
-  of discarding a lock nobody else could use.
+  owner of a stale one. `mutate` had the same refuse-before-attempt gate: it
+  checked the clock when its turn came up, so a loaded host could time out
+  without calling `withFileLock` at all. On a loaded host that failed
+  mutations that would have succeeded and left abandoned locks unreclaimed,
+  which is what made the bridge state lock tests fail intermittently on CI.
+  The guaranteed attempt has its own bounded floor, and winning the rename now
+  runs the operation instead of discarding a lock nobody else could use.
+  Work the admission timer already rejected while queued still does not run.
 - Stop reconciliation replaying a session's history on its first sighting. A
   session already in Linear predates the bridge watching it, so nothing in the
   window is missed work. The first pass now adopts the newest observed activity
