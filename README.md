@@ -21,7 +21,7 @@ Linear (mention / delegate / follow-up prompt)
   -> webhook + reconciliation: AgentSessionEvent / AgentSession activities
   -> src/server.ts        verify HMAC, persist ingress, ack < 5s
   -> src/state/store.ts   durable receipt + semantic execution claim
-  -> src/queue.ts         serial execution, concurrency 1
+  -> src/queue.ts         per-session FIFO lanes, concurrent across sessions
   -> src/runtime/claude.ts  Agent SDK query(), cwd = KB_PATH, resume
   -> src/linear/client.ts   agentActivityCreate (thought/action/response)
 ```
@@ -363,8 +363,10 @@ session takes.
 - Persist the receipt and semantic claim, then ack the webhook within the 5s
   limit. Do external work after the ack and emit a thought immediately on
   `created` (10s liveness limit), or Linear marks the session unresponsive.
-- Keep runtime execution serial. Concurrent headless Claude sessions on
-  one host have produced cross-session content contamination.
+- Serialize runtime turns per Linear agent-session, and run distinct sessions
+  concurrently. The retired host-wide concurrency-1 rule came from MPI-682,
+  which imported a 2026-04-26 `claude -p` file-write incident that did not
+  apply to the Agent SDK's session-isolated conversations.
 - Claude Agent SDK tool results arrive as `user` messages containing
   `tool_result` blocks. Pair them to the preceding `tool_use` ID so Linear
   receives a completed action instead of a permanent spinner.
@@ -376,17 +378,17 @@ session takes.
   immediately without resetting the watchdog, and later iterator events are
   ignored. There is no total wall-clock cap while the runtime remains active.
   Cancellation closes the SDK query process handle exactly once. Before
-  inactivity releases the global serial queue, the server invokes the
+  inactivity releases the session's serial lane, the server invokes the
   runtime's synchronous force-close control; an uncooperative iterator still
-  cannot retain the queue.
+  cannot retain that lane.
   Turn-scoped Linear activity requests receive the same abort signal, late
   events are ignored, and inactivity is reported once on a best-effort basis.
 - `RUN_TIMEOUT_MS` remains a deprecated fallback for one release. The bridge
   logs one bounded warning whenever the legacy variable is present;
   `RUN_INACTIVITY_TIMEOUT_MS` takes precedence when both are present.
-- Turn lifecycle logs contain bounded operational fields: session id and queue
-  size at start, then session id, terminal reason, and remaining queue size at
-  completion. Prompt and issue contents are not included.
+- Turn lifecycle logs contain bounded operational fields: session id and that
+  session's lane depth at start, then session id, terminal reason, and remaining
+  lane depth at completion. Prompt and issue contents are not included.
 - Invalid JSON and invalid agent-event diagnostics are static classes. Ingress
   failures log bounded error classes rather than raw errors, and Linear HTTP or
   GraphQL response bodies are not copied into thrown errors or logs.

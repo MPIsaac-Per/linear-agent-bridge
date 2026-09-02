@@ -17,7 +17,7 @@ import {
   createIngressRecoveryKeyring,
   IngressRecoveryEnvelopeError,
 } from "../src/state/recovery-envelope.js";
-import { SerialQueue } from "../src/queue.js";
+import { SessionLanes } from "../src/queue.js";
 import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
 import type {
   AgentActivityContent,
@@ -42,6 +42,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     bridgeStateStorePath: "unused-see-bridge-state-field",
     oauthTokenStorePath: "unused-see-oauth-field",
     runInactivityTimeoutMs: 300000,
+    progressNoticeIntervalMs: 120000,
     ingressRecoveryKey: INGRESS_RECOVERY_KEY,
     ingressRecoveryPreviousKeys: [],
     reconcileIntervalMs: 60000,
@@ -193,7 +194,7 @@ interface Harness {
   store: JsonSessionStore;
   bridgeState: JsonBridgeStateStore;
   bridgeStatePath: string;
-  queue: SerialQueue;
+  queue: SessionLanes;
   activityIds: string[];
   tokenFetch: ReturnType<typeof vi.fn>;
   oauthTokenStorePath: string;
@@ -303,7 +304,7 @@ async function startTestServer(
     resolveAuthorizationUrl = resolve;
   });
 
-  const queue = new SerialQueue();
+  const queue = new SessionLanes();
   const oauth = new LinearOAuthTokenManager({
     clientId: "client-id-test",
     clientSecret: "client-secret-test",
@@ -356,7 +357,7 @@ async function startTestServer(
       await server.close();
       // Drain session finalizers before removing the temp dir, or the store's
       // atomic-write temp file can race the rm (ENOTEMPTY).
-      await queue.enqueue(async () => {});
+      await queue.drain();
       if (options.removeTmpDirOnClose !== false) {
         await fsPromises.rm(tmpDir, { recursive: true, force: true });
       }
@@ -1327,9 +1328,12 @@ describe("startServer", () => {
         removeTmpDirOnClose: false,
       });
       harness = activeHarness;
-      const occupied = harness.queue.enqueue(async () => {
-        await releaseQueue.promise;
-      });
+      const occupied = harness.queue.enqueue(
+        "session-queued-during-close",
+        async () => {
+          await releaseQueue.promise;
+        },
+      );
       const payload = {
         webhookId: "webhook-queued-during-close",
         type: "AgentSessionEvent",
@@ -2978,17 +2982,23 @@ describe("startServer", () => {
     }
   });
 
-  it("logs turn lifecycle with bounded session, reason, and queue fields", async () => {
+  it("logs lifecycle queue depth for the current Linear session only", async () => {
     const runtime = new FakeRuntime(
       async function* (): AsyncGenerator<RuntimeEvent> {
         yield { kind: "done" };
       },
     );
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const releaseOtherLane = createDeferred<void>();
+    let otherLane: Promise<void> | undefined;
 
     try {
       activeHarness = await startTestServer(runtime);
       const harness = activeHarness;
+      otherLane = harness.queue.enqueue(
+        "agent-session-other-log",
+        () => releaseOtherLane.promise,
+      );
       const payload = {
         webhookId: "webhook-created-log",
         type: "AgentSessionEvent",
@@ -3032,6 +3042,8 @@ describe("startServer", () => {
       expect(logged).not.toContain("secret issue title");
       expect(logged).not.toContain("secret prompt contents");
     } finally {
+      releaseOtherLane.resolve();
+      await otherLane;
       logSpy.mockRestore();
     }
   });
@@ -4111,6 +4123,7 @@ describe("startServer", () => {
     });
     activeHarness = await startTestServer(runtime, {
       reconciliationFetchImpl: reconciliationFetch,
+      now: () => Date.parse(promptCreatedAt) + 60_000,
       configOverrides: {
         reconcileIntervalMs: 600000,
         // This case is about stop-fence ordering, not the lookback window;
@@ -4259,7 +4272,8 @@ describe("startServer", () => {
         harness.calls.some(
           (call) =>
             call.content.type === "thought" &&
-            call.content.body === "Working on it…",
+            call.content.body ===
+              "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
         ),
       );
 
@@ -5066,11 +5080,11 @@ describe("startServer", () => {
     }
   });
 
-  it("allows a long turn with runtime activity and starts a queued turn's watchdog only when it executes", async () => {
+  it("starts a queued follow-up's watchdog only when its session lane executes it", async () => {
     const runtime = new FakeRuntime(async function* (
       request: SessionRequest,
     ): AsyncGenerator<RuntimeEvent> {
-      if (request.linearSessionId === "agent-session-active-long") {
+      if (request.prompt === "active long turn") {
         await new Promise((resolve) => setTimeout(resolve, 40));
         yield { kind: "progress" };
         await new Promise((resolve) => setTimeout(resolve, 40));
@@ -5084,7 +5098,7 @@ describe("startServer", () => {
         kind: "activity",
         activity: {
           type: "response",
-          body: `completed ${request.linearSessionId}`,
+          body: `completed ${request.prompt}`,
         },
       };
       yield { kind: "done" };
@@ -5094,23 +5108,12 @@ describe("startServer", () => {
       configOverrides: { runInactivityTimeoutMs: 75 },
     });
     const harness = activeHarness;
-
-    for (const sessionId of [
-      "agent-session-active-long",
-      "agent-session-waiting",
-    ]) {
-      const payload = {
-        webhookId: `webhook-${sessionId}`,
+    const send = async (payload: Record<string, unknown>): Promise<void> => {
+      const body = JSON.stringify({
+        ...payload,
         type: "AgentSessionEvent",
-        action: "created",
-        agentSession: {
-          id: sessionId,
-          issue: { title: "Active long request" },
-        },
-        promptContext: sessionId,
         webhookTimestamp: Date.now(),
-      };
-      const body = JSON.stringify(payload);
+      });
       expect(
         (
           await fetch(serverUrl(harness.port, "/webhook"), {
@@ -5124,14 +5127,34 @@ describe("startServer", () => {
           })
         ).status,
       ).toBe(200);
-    }
+    };
+
+    await send({
+      webhookId: "webhook-active-long",
+      action: "created",
+      agentSession: {
+        id: "agent-session-active-long",
+        issue: { title: "Active long request" },
+      },
+      promptContext: "active long turn",
+    });
+    await send({
+      webhookId: "webhook-active-long-follow-up",
+      action: "prompted",
+      agentSession: { id: "agent-session-active-long" },
+      agentActivity: {
+        id: "activity-active-long-follow-up",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "queued follow-up turn" },
+      },
+    });
 
     await waitFor(
       () =>
         harness.calls.some(
           (call) =>
             call.content.type === "response" &&
-            call.content.body === "completed agent-session-waiting",
+            call.content.body === "completed queued follow-up turn",
         ),
       500,
     );
@@ -5143,26 +5166,17 @@ describe("startServer", () => {
       ),
     ).toBe(false);
     expect(
-      harness.calls.filter(
-        (call) => call.agentSessionId === "agent-session-active-long",
+      harness.calls.some(
+        (call) =>
+          call.content.type === "thought" &&
+          call.content.body ===
+            "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
       ),
-    ).toEqual([
-      {
-        agentSessionId: "agent-session-active-long",
-        content: {
-          type: "thought",
-          body: "Reading the issue and gathering context…",
-        },
-        ephemeral: true,
-      },
-      {
-        agentSessionId: "agent-session-active-long",
-        content: {
-          type: "response",
-          body: "completed agent-session-active-long",
-        },
-      },
-    ]);
+    ).toBe(true);
+    expect(runtime.requests[1]).toMatchObject({
+      prompt: "queued follow-up turn",
+      resumeSessionId: "runtime-active-long",
+    });
   });
 
   it("ends a turn immediately on done without resetting the watchdog or accepting later events", async () => {
@@ -5341,16 +5355,16 @@ describe("startServer", () => {
     expect(activityCompleted).toBe(false);
   });
 
-  it("inactivity releases the serial queue and ignores late runtime events", async () => {
+  it("inactivity releases one session's lane and ignores its late runtime events", async () => {
     const releaseFirst = createDeferred<void>();
     const runtime = new FakeRuntime(async function* (
       request: SessionRequest,
     ): AsyncGenerator<RuntimeEvent> {
       yield {
         kind: "session-started",
-        runtimeSessionId: `runtime-${request.linearSessionId}`,
+        runtimeSessionId: "runtime-hard-timeout",
       };
-      if (request.linearSessionId === "agent-session-hard-timeout") {
+      if (request.prompt === "hard timeout") {
         await releaseFirst.promise;
         yield {
           kind: "activity",
@@ -5393,56 +5407,67 @@ describe("startServer", () => {
         }) as FetchFn,
     });
     const harness = activeHarness;
+    const send = async (payload: Record<string, unknown>): Promise<void> => {
+      const body = JSON.stringify({
+        ...payload,
+        type: "AgentSessionEvent",
+        webhookTimestamp: Date.now(),
+      });
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+    };
 
     try {
-      for (const sessionId of [
-        "agent-session-hard-timeout",
-        "agent-session-queued",
-      ]) {
-        const payload = {
-          webhookId: `webhook-${sessionId}`,
-          type: "AgentSessionEvent",
-          action: "created",
-          agentSession: { id: sessionId, issue: { title: "Bounded request" } },
-          promptContext: sessionId,
-          webhookTimestamp: Date.now(),
-        };
-        const body = JSON.stringify(payload);
-        expect(
-          (
-            await fetch(serverUrl(harness.port, "/webhook"), {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "linear-signature": sign(body, WEBHOOK_SECRET),
-                "linear-delivery": deliveryIdOf(body),
-              },
-              body,
-            })
-          ).status,
-        ).toBe(200);
-      }
+      await send({
+        webhookId: "webhook-hard-timeout",
+        action: "created",
+        agentSession: {
+          id: "agent-session-hard-timeout",
+          issue: { title: "Bounded request" },
+        },
+        promptContext: "hard timeout",
+      });
+      await waitFor(() => runtime.requests.length === 1);
+      await send({
+        webhookId: "webhook-hard-timeout-follow-up",
+        action: "prompted",
+        agentSession: { id: "agent-session-hard-timeout" },
+        agentActivity: {
+          id: "activity-hard-timeout-follow-up",
+          createdAt: new Date().toISOString(),
+          content: { type: "prompt", body: "queued turn" },
+        },
+      });
 
       await waitFor(
         () =>
           runtime.requests.length === 2 &&
           harness.calls.some(
             (call) =>
-              call.agentSessionId === "agent-session-queued" &&
               call.content.type === "response" &&
               call.content.body === "queued turn completed",
           ),
         250,
       );
-
-      const timeoutCalls = harness.calls.filter(
-        (call) =>
-          call.agentSessionId === "agent-session-hard-timeout" &&
-          call.content.type === "error" &&
-          call.content.body ===
-            "This request was inactive for 30 ms and was stopped.",
-      );
-      expect(timeoutCalls).toHaveLength(1);
+      expect(
+        harness.calls.filter(
+          (call) =>
+            call.content.type === "error" &&
+            call.content.body ===
+              "This request was inactive for 30 ms and was stopped.",
+        ),
+      ).toHaveLength(1);
 
       releaseFirst.resolve();
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -5453,31 +5478,22 @@ describe("startServer", () => {
             call.content.body === "late response must be ignored",
         ),
       ).toBe(false);
-      expect(
-        harness.calls.filter(
-          (call) =>
-            call.agentSessionId === "agent-session-hard-timeout" &&
-            call.content.type === "error" &&
-            call.content.body ===
-              "This request was inactive for 30 ms and was stopped.",
-        ),
-      ).toHaveLength(1);
     } finally {
       releaseFirst.resolve();
     }
   });
 
-  it("force-closes an inactive runtime before the next queued turn starts", async () => {
+  it("force-closes an inactive runtime before the next turn in its lane starts", async () => {
     const releaseFirst = createDeferred<void>();
     const order: string[] = [];
     const runtime: AgentRuntime = {
       name: "force-close-aware",
       forceCloseSession(request): void {
-        order.push(`closed:${request.linearSessionId}`);
+        order.push(`closed:${request.prompt}`);
       },
       async *runSession(request): AsyncGenerator<RuntimeEvent> {
-        order.push(`started:${request.linearSessionId}`);
-        if (request.linearSessionId === "agent-session-close-first") {
+        order.push(`started:${request.prompt}`);
+        if (request.prompt === "force-close-first") {
           await releaseFirst.promise;
           return;
         }
@@ -5488,54 +5504,61 @@ describe("startServer", () => {
       configOverrides: { runInactivityTimeoutMs: 30 },
     });
     const harness = activeHarness;
+    const send = async (payload: Record<string, unknown>): Promise<void> => {
+      const body = JSON.stringify({
+        ...payload,
+        type: "AgentSessionEvent",
+        webhookTimestamp: Date.now(),
+      });
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+    };
 
     try {
-      for (const sessionId of [
-        "agent-session-close-first",
-        "agent-session-close-next",
-      ]) {
-        const payload = {
-          webhookId: `webhook-${sessionId}`,
-          type: "AgentSessionEvent",
-          action: "created",
-          agentSession: {
-            id: sessionId,
-            issue: { title: "Force close ordering" },
-          },
-          promptContext: sessionId,
-          webhookTimestamp: Date.now(),
-        };
-        const body = JSON.stringify(payload);
-        expect(
-          (
-            await fetch(serverUrl(harness.port, "/webhook"), {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "linear-signature": sign(body, WEBHOOK_SECRET),
-                "linear-delivery": deliveryIdOf(body),
-              },
-              body,
-            })
-          ).status,
-        ).toBe(200);
-      }
+      await send({
+        webhookId: "webhook-force-close-first",
+        action: "created",
+        agentSession: {
+          id: "agent-session-force-close",
+          issue: { title: "Force close ordering" },
+        },
+        promptContext: "force-close-first",
+      });
+      await waitFor(() => order.includes("started:force-close-first"));
+      await send({
+        webhookId: "webhook-force-close-next",
+        action: "prompted",
+        agentSession: { id: "agent-session-force-close" },
+        agentActivity: {
+          id: "activity-force-close-next",
+          createdAt: new Date().toISOString(),
+          content: { type: "prompt", body: "force-close-next" },
+        },
+      });
 
-      await waitFor(
-        () => order.includes("started:agent-session-close-next"),
-        250,
-      );
+      await waitFor(() => order.includes("started:force-close-next"), 250);
       expect(order).toEqual([
-        "started:agent-session-close-first",
-        "closed:agent-session-close-first",
-        "started:agent-session-close-next",
+        "started:force-close-first",
+        "closed:force-close-first",
+        "started:force-close-next",
       ]);
     } finally {
       releaseFirst.resolve();
     }
   });
 
-  it("closes the first Claude query before starting the next queued Claude turn", async () => {
+  it("closes the first Claude query before starting the next turn in its lane", async () => {
     const releaseFirst = createDeferred<void>();
     const order: string[] = [];
     const queryFn: QueryFn = ({ prompt }) => {
@@ -5556,35 +5579,48 @@ describe("startServer", () => {
       configOverrides: { runInactivityTimeoutMs: 30 },
     });
     const harness = activeHarness;
+    const send = async (payload: Record<string, unknown>): Promise<void> => {
+      const body = JSON.stringify({
+        ...payload,
+        type: "AgentSessionEvent",
+        webhookTimestamp: Date.now(),
+      });
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+    };
 
     try {
-      for (const sessionId of ["claude-close-first", "claude-close-next"]) {
-        const payload = {
-          webhookId: `webhook-${sessionId}`,
-          type: "AgentSessionEvent",
-          action: "created",
-          agentSession: {
-            id: sessionId,
-            issue: { title: "Claude close ordering" },
-          },
-          promptContext: sessionId,
-          webhookTimestamp: Date.now(),
-        };
-        const body = JSON.stringify(payload);
-        expect(
-          (
-            await fetch(serverUrl(harness.port, "/webhook"), {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "linear-signature": sign(body, WEBHOOK_SECRET),
-                "linear-delivery": deliveryIdOf(body),
-              },
-              body,
-            })
-          ).status,
-        ).toBe(200);
-      }
+      await send({
+        webhookId: "webhook-claude-close-first",
+        action: "created",
+        agentSession: {
+          id: "agent-session-claude-close",
+          issue: { title: "Claude close ordering" },
+        },
+        promptContext: "claude-close-first",
+      });
+      await waitFor(() => order.includes("started:claude-close-first"));
+      await send({
+        webhookId: "webhook-claude-close-next",
+        action: "prompted",
+        agentSession: { id: "agent-session-claude-close" },
+        agentActivity: {
+          id: "activity-claude-close-next",
+          createdAt: new Date().toISOString(),
+          content: { type: "prompt", body: "claude-close-next" },
+        },
+      });
 
       await waitFor(() => order.includes("started:claude-close-next"), 250);
       expect(order).toEqual([
@@ -5956,5 +5992,673 @@ describe("startServer", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(harness.calls).toEqual([]);
     expect(runtime.lastRequest).toBeUndefined();
+  });
+
+  it("runs created turns from different Linear sessions concurrently", async () => {
+    const release = createDeferred<void>();
+    const bothStarted = createDeferred<void>();
+    const started = new Set<string>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      started.add(request.linearSessionId);
+      if (started.size === 2) {
+        bothStarted.resolve();
+      }
+      yield {
+        kind: "activity",
+        activity: {
+          type: "action",
+          action: "Inspect",
+          parameter: request.linearSessionId,
+        },
+      };
+      await release.promise;
+      yield { kind: "done" };
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const sendCreated = async (
+      linearSessionId: string,
+      webhookId: string,
+    ): Promise<Response> => {
+      const body = JSON.stringify({
+        webhookId,
+        type: "AgentSessionEvent",
+        action: "created",
+        agentSession: {
+          id: linearSessionId,
+          issue: {
+            id: `issue-${linearSessionId}`,
+            identifier: "MPI-1605",
+            title: "Concurrent turns",
+          },
+        },
+        promptContext: `work for ${linearSessionId}`,
+        webhookTimestamp: Date.now(),
+      });
+      return fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
+        },
+        body,
+      });
+    };
+
+    try {
+      const responses = await Promise.all([
+        sendCreated("session-concurrent-a", "webhook-concurrent-a"),
+        sendCreated("session-concurrent-b", "webhook-concurrent-b"),
+      ]);
+      expect(responses.map(({ status }) => status)).toEqual([200, 200]);
+      await bothStarted.promise;
+      await waitFor(
+        () =>
+          harness.calls.filter(
+            (call) =>
+              call.content.type === "action" &&
+              (call.agentSessionId === "session-concurrent-a" ||
+                call.agentSessionId === "session-concurrent-b"),
+          ).length === 2,
+      );
+
+      for (const sessionId of [
+        "session-concurrent-a",
+        "session-concurrent-b",
+      ]) {
+        expect(
+          harness.calls.some(
+            (call) =>
+              call.agentSessionId === sessionId &&
+              call.content.type === "thought" &&
+              call.content.body === "Reading the issue and gathering context…",
+          ),
+        ).toBe(true);
+      }
+      release.resolve();
+      await waitFor(() =>
+        logSpy.mock.calls.some((call) =>
+          String(call[0]).includes("turn terminal"),
+        ),
+      );
+      const lifecycleLogs = logSpy.mock.calls
+        .map((call) => call.join(" "))
+        .filter((line) => line.includes("turn "));
+      const firstTerminal = lifecycleLogs.findIndex((line) =>
+        line.includes("turn terminal"),
+      );
+      expect(firstTerminal).toBeGreaterThanOrEqual(2);
+      expect(
+        lifecycleLogs
+          .slice(0, firstTerminal)
+          .filter((line) => line.includes("turn start")),
+      ).toHaveLength(2);
+    } finally {
+      release.resolve();
+      logSpy.mockRestore();
+    }
+  });
+
+  it("queues a prompted follow-up in its session lane and resumes the runtime id persisted by the first turn", async () => {
+    const firstBlocked = createDeferred<void>();
+    const releaseFirst = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      if (request.prompt === "opening turn") {
+        yield {
+          kind: "session-started",
+          runtimeSessionId: "runtime-session-from-first-turn",
+        };
+        firstBlocked.resolve();
+        await releaseFirst.promise;
+      }
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+    const send = async (payload: Record<string, unknown>): Promise<Response> => {
+      const body = JSON.stringify({
+        ...payload,
+        type: "AgentSessionEvent",
+        webhookTimestamp: Date.now(),
+      });
+      return fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
+        },
+        body,
+      });
+    };
+
+    try {
+      expect(
+        (
+          await send({
+            webhookId: "webhook-session-lane-created",
+            action: "created",
+            agentSession: {
+              id: "session-lane-follow-up",
+              issue: {
+                id: "issue-session-lane-follow-up",
+                identifier: "MPI-1605",
+                title: "Resume queued follow-up",
+              },
+            },
+            promptContext: "opening turn",
+          })
+        ).status,
+      ).toBe(200);
+      await firstBlocked.promise;
+
+      expect(
+        (
+          await send({
+            webhookId: "webhook-session-lane-prompted",
+            action: "prompted",
+            agentSession: { id: "session-lane-follow-up" },
+            agentActivity: {
+              id: "activity-session-lane-follow-up",
+              createdAt: new Date().toISOString(),
+              content: { type: "prompt", body: "follow-up turn" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(runtime.requests).toHaveLength(1);
+      releaseFirst.resolve();
+      await waitFor(() => runtime.requests.length === 2);
+      expect(runtime.requests[1]).toMatchObject({
+        linearSessionId: "session-lane-follow-up",
+        prompt: "follow-up turn",
+        resumeSessionId: "runtime-session-from-first-turn",
+      });
+      await waitFor(() =>
+        harness.calls.some(
+          (call) =>
+            call.agentSessionId === "session-lane-follow-up" &&
+            call.content.type === "thought" &&
+            call.content.body === "Working on it…" &&
+            call.ephemeral === true,
+        ),
+      );
+      expect(
+        harness.calls
+          .filter(
+            (call) =>
+              call.agentSessionId === "session-lane-follow-up" &&
+              call.content.type === "thought",
+          )
+          .map((call) => call.content.body),
+      ).toEqual([
+        "Reading the issue and gathering context…",
+        "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
+        "Working on it…",
+      ]);
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
+  it("classifies an aborted queued-start follow-up as stopped", async () => {
+    const firstStarted = createDeferred<void>();
+    const releaseFirst = createDeferred<void>();
+    const queuedStartStarted = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      yield {
+        kind: "session-started",
+        runtimeSessionId: "runtime-abort-queued-follow-up",
+      };
+      firstStarted.resolve();
+      await releaseFirst.promise;
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      linearFetchImpl: (calls) => {
+        const baseFetch = fakeLinearFetch(calls, []);
+        return (async (
+          url: RequestInfo | URL,
+          init?: RequestInit,
+        ): Promise<Response> => {
+          const parsed = JSON.parse(init?.body as string) as {
+            variables: {
+              input: {
+                agentSessionId: string;
+                content: AgentActivityContent;
+              };
+            };
+          };
+          const response = await baseFetch(url, init);
+          const input = parsed.variables.input;
+          if (
+            input.agentSessionId === "session-abort-queued-follow-up" &&
+            input.content.type === "thought" &&
+            input.content.body === "Working on it…"
+          ) {
+            queuedStartStarted.resolve();
+            const pending = Promise.withResolvers<Response>();
+            init?.signal?.addEventListener(
+              "abort",
+              () => pending.reject(init.signal?.reason),
+              { once: true },
+            );
+            return pending.promise;
+          }
+          return response;
+        }) as FetchFn;
+      },
+    });
+    const harness = activeHarness;
+    const send = async (payload: Record<string, unknown>): Promise<Response> => {
+      const body = JSON.stringify({
+        ...payload,
+        type: "AgentSessionEvent",
+        webhookTimestamp: Date.now(),
+      });
+      return fetch(serverUrl(harness.port, "/webhook"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "linear-signature": sign(body, WEBHOOK_SECRET),
+          "linear-delivery": deliveryIdOf(body),
+        },
+        body,
+      });
+    };
+
+    try {
+      expect(
+        (
+          await send({
+            webhookId: "webhook-abort-queued-created",
+            action: "created",
+            agentSession: {
+              id: "session-abort-queued-follow-up",
+              issue: {
+                id: "issue-abort-queued-follow-up",
+                identifier: "MPI-1605",
+                title: "Abort queued follow-up",
+              },
+            },
+            promptContext: "opening turn",
+          })
+        ).status,
+      ).toBe(200);
+      await firstStarted.promise;
+      expect(
+        (
+          await send({
+            webhookId: "webhook-abort-queued-prompted",
+            action: "prompted",
+            agentSession: { id: "session-abort-queued-follow-up" },
+            agentActivity: {
+              id: "activity-abort-queued-follow-up",
+              createdAt: new Date().toISOString(),
+              content: { type: "prompt", body: "queued follow-up" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      await waitFor(() =>
+        harness.calls.some(
+          (call) =>
+            call.content.type === "thought" &&
+            call.content.body ===
+              "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
+        ),
+      );
+
+      releaseFirst.resolve();
+      await queuedStartStarted.promise;
+      expect(
+        (
+          await send({
+            webhookId: "webhook-abort-queued-stop",
+            action: "prompted",
+            agentSession: { id: "session-abort-queued-follow-up" },
+            agentActivity: {
+              id: "activity-abort-queued-stop",
+              createdAt: new Date().toISOString(),
+              content: { type: "prompt", body: "stop", signal: "stop" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getReceipt(
+            "webhook-abort-queued-prompted",
+          ))?.status === "completed",
+      );
+      expect(runtime.requests).toHaveLength(1);
+      expect(
+        harness.calls.filter(
+          (call) =>
+            call.agentSessionId === "session-abort-queued-follow-up",
+        ),
+      ).toEqual([
+        {
+          agentSessionId: "session-abort-queued-follow-up",
+          content: {
+            type: "thought",
+            body: "Reading the issue and gathering context…",
+          },
+          ephemeral: true,
+        },
+        {
+          agentSessionId: "session-abort-queued-follow-up",
+          content: {
+            type: "thought",
+            body: "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
+          },
+        },
+        {
+          agentSessionId: "session-abort-queued-follow-up",
+          content: { type: "thought", body: "Working on it…" },
+          ephemeral: true,
+        },
+        {
+          agentSessionId: "session-abort-queued-follow-up",
+          content: { type: "response", body: "Stopped." },
+        },
+      ]);
+    } finally {
+      releaseFirst.resolve();
+    }
+  });
+
+  it("emits durable progress notices at each configured interval with the latest action", async () => {
+    let now = 1_000_000;
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield {
+          kind: "activity",
+          activity: {
+            type: "action",
+            action: "Inspect repository",
+            parameter: "src/server.ts",
+          },
+        };
+        now += 60_000;
+        yield { kind: "progress" };
+        now += 59_999;
+        yield { kind: "progress" };
+        now += 1;
+        yield { kind: "progress" };
+        now += 60_000;
+        yield {
+          kind: "activity",
+          activity: {
+            type: "action",
+            action: "Run verification",
+            parameter: "npm test",
+          },
+        };
+        now += 60_000;
+        yield { kind: "progress" };
+        yield { kind: "done" };
+      },
+    );
+
+    activeHarness = await startTestServer(runtime, { now: () => now });
+    const harness = activeHarness;
+    const body = JSON.stringify({
+      webhookId: "webhook-progress-notices",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "agent-session-progress-notices",
+        issue: {
+          id: "issue-progress-notices",
+          identifier: "MPI-PROGRESS",
+          title: "Report progress",
+        },
+      },
+      promptContext: "report deterministic progress",
+      webhookTimestamp: Date.now(),
+    });
+
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+    await waitFor(() => harness.calls.length === 5);
+
+    expect(harness.calls).toEqual([
+      {
+        agentSessionId: "agent-session-progress-notices",
+        content: {
+          type: "thought",
+          body: "Reading the issue and gathering context…",
+        },
+        ephemeral: true,
+      },
+      {
+        agentSessionId: "agent-session-progress-notices",
+        content: {
+          type: "action",
+          action: "Inspect repository",
+          parameter: "src/server.ts",
+        },
+        ephemeral: true,
+      },
+      {
+        agentSessionId: "agent-session-progress-notices",
+        content: {
+          type: "thought",
+          body: "Still working (2 minutes). Last step: Inspect repository — src/server.ts",
+        },
+      },
+      {
+        agentSessionId: "agent-session-progress-notices",
+        content: {
+          type: "action",
+          action: "Run verification",
+          parameter: "npm test",
+        },
+        ephemeral: true,
+      },
+      {
+        agentSessionId: "agent-session-progress-notices",
+        content: {
+          type: "thought",
+          body: "Still working (4 minutes). Last step: Run verification — npm test",
+        },
+      },
+    ]);
+  });
+
+  it("keeps the original inactivity deadline after emitting a durable progress notice", async () => {
+    let now = 1_000_000;
+    let noticeReleased = false;
+    const activityStarted = createDeferred<void>();
+    const releaseActivity = createDeferred<void>();
+    const noticeStarted = createDeferred<void>();
+    const releaseNotice = createDeferred<void>();
+    const inactivitySeen = createDeferred<void>();
+    const releaseRuntime = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (
+      request: SessionRequest,
+    ): AsyncGenerator<RuntimeEvent> {
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "runtime step completed" },
+      };
+      await Promise.race([
+        releaseRuntime.promise,
+        new Promise<void>((resolve) => {
+          request.abortController?.signal.addEventListener("abort", resolve, {
+            once: true,
+          });
+        }),
+      ]);
+      yield { kind: "done" };
+    });
+
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: {
+        progressNoticeIntervalMs: 30,
+        runInactivityTimeoutMs: 500,
+      },
+      now: () => now,
+      linearFetchImpl: (calls) => {
+        const baseFetch = fakeLinearFetch(calls, []);
+        return (async (
+          url: RequestInfo | URL,
+          init?: RequestInit,
+        ): Promise<Response> => {
+          const response = await baseFetch(url, init);
+          const call = calls.at(-1);
+          if (
+            call?.content.type === "response" &&
+            call.content.body === "runtime step completed"
+          ) {
+            activityStarted.resolve();
+            await releaseActivity.promise;
+            now += 30;
+          }
+          if (
+            call?.content.type === "thought" &&
+            call.content.body === "Still working (30 ms)."
+          ) {
+            noticeStarted.resolve();
+            await releaseNotice.promise;
+            noticeReleased = true;
+          }
+          if (
+            call?.content.type === "error" &&
+            call.content.body ===
+              "This request was inactive for 500 ms and was stopped."
+          ) {
+            inactivitySeen.resolve();
+          }
+          return response;
+        }) as FetchFn;
+      },
+    });
+    const harness = activeHarness;
+    const body = JSON.stringify({
+      webhookId: "webhook-progress-watchdog",
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: "agent-session-progress-watchdog",
+        issue: {
+          id: "issue-progress-watchdog",
+          identifier: "MPI-WATCHDOG",
+          title: "Keep the watchdog deadline",
+        },
+      },
+      promptContext: "become inactive after reporting progress",
+      webhookTimestamp: Date.now(),
+    });
+
+    try {
+      vi.useFakeTimers();
+      expect(
+        (
+          await fetch(serverUrl(harness.port, "/webhook"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "linear-signature": sign(body, WEBHOOK_SECRET),
+              "linear-delivery": deliveryIdOf(body),
+            },
+            body,
+          })
+        ).status,
+      ).toBe(200);
+      await vi.advanceTimersByTimeAsync(0);
+      await activityStarted.promise;
+      await vi.advanceTimersByTimeAsync(300);
+      releaseActivity.resolve();
+      await noticeStarted.promise;
+
+      expect(
+        harness.calls.filter(
+          (call) =>
+            call.agentSessionId === "agent-session-progress-watchdog",
+        ),
+      ).toEqual([
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: {
+            type: "thought",
+            body: "Reading the issue and gathering context…",
+          },
+          ephemeral: true,
+        },
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: { type: "response", body: "runtime step completed" },
+        },
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: { type: "thought", body: "Still working (30 ms)." },
+        },
+      ]);
+
+      await vi.advanceTimersByTimeAsync(199);
+      expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await inactivitySeen.promise;
+      expect(noticeReleased).toBe(false);
+      expect(
+        harness.calls.filter(
+          (call) =>
+            call.agentSessionId === "agent-session-progress-watchdog",
+        ),
+      ).toEqual([
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: {
+            type: "thought",
+            body: "Reading the issue and gathering context…",
+          },
+          ephemeral: true,
+        },
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: { type: "response", body: "runtime step completed" },
+        },
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: { type: "thought", body: "Still working (30 ms)." },
+        },
+        {
+          agentSessionId: "agent-session-progress-watchdog",
+          content: {
+            type: "error",
+            body: "This request was inactive for 500 ms and was stopped.",
+          },
+        },
+      ]);
+    } finally {
+      releaseActivity.resolve();
+      releaseNotice.resolve();
+      releaseRuntime.resolve();
+      vi.useRealTimers();
+    }
   });
 });

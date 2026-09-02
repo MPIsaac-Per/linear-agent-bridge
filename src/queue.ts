@@ -1,45 +1,53 @@
 /**
- * Serial task queue, concurrency fixed at 1.
+ * Serial lanes keyed by Linear agent-session id.
  *
- * Constraint (do not relax): parallel headless Claude invocations on this
- * machine have cross-contaminated content between sessions before
- * (documented 2026-04-26). All runtime sessions execute one at a time.
- * Follow-up prompts for a session that is already running are appended to
- * that session's pending prompts rather than queued as separate tasks.
+ * Turns in one Linear session run FIFO because they share a Claude
+ * conversation. Distinct sessions run concurrently because their SDK
+ * conversations are isolated by session UUID.
+ *
+ * Retired constraint: MPI-682 imported host-wide concurrency 1 from a
+ * 2026-04-26 `claude -p` file-write incident. That incident did not apply to
+ * the Claude Agent SDK's session-isolated conversations.
  */
-export class SerialQueue {
-  /**
-   * Tail of the serial chain. Always settles (fulfilled), even when a task
-   * rejects, so one failing task never stalls the tasks queued behind it.
-   */
-  private tail: Promise<void> = Promise.resolve();
-  private waiting = 0;
-  private running = 0;
+interface Lane {
+  tail: Promise<void>;
+  size: number;
+}
 
-  /** Enqueue a task; resolves when the task itself completes. */
-  enqueue<T>(task: () => Promise<T>): Promise<T> {
-    this.waiting++;
+export class SessionLanes {
+  private readonly lanes = new Map<string, Lane>();
 
-    const runPromise = this.tail.then(async () => {
-      this.waiting--;
-      this.running++;
-      try {
-        return await task();
-      } finally {
-        this.running--;
-      }
-    });
+  /** Enqueue a task in one session's FIFO lane. */
+  enqueue<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+    let lane = this.lanes.get(sessionId);
+    if (lane === undefined) {
+      lane = { tail: Promise.resolve(), size: 0 };
+      this.lanes.set(sessionId, lane);
+    }
+    lane.size += 1;
 
-    this.tail = runPromise.then(
-      () => undefined,
-      () => undefined,
+    const runPromise = lane.tail.then(task);
+    lane.tail = runPromise.then(
+      () => this.finish(sessionId, lane),
+      () => this.finish(sessionId, lane),
     );
-
     return runPromise;
   }
 
-  /** Number of tasks waiting or running. */
-  get size(): number {
-    return this.waiting + this.running;
+  /** Number of tasks waiting or running in one session's lane. */
+  size(sessionId: string): number {
+    return this.lanes.get(sessionId)?.size ?? 0;
+  }
+
+  /** Settle after every lane tail present at call time settles. */
+  async drain(): Promise<void> {
+    await Promise.all([...this.lanes.values()].map((lane) => lane.tail));
+  }
+
+  private finish(sessionId: string, lane: Lane): void {
+    lane.size -= 1;
+    if (lane.size === 0 && this.lanes.get(sessionId) === lane) {
+      this.lanes.delete(sessionId);
+    }
   }
 }

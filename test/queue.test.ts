@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SerialQueue } from "../src/queue.js";
+import { SessionLanes } from "../src/queue.js";
 
 function createDeferred<T>(): {
   promise: Promise<T>;
@@ -24,118 +24,163 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-describe("SerialQueue", () => {
+describe("SessionLanes", () => {
   it("resolves with the task's own return value", async () => {
-    const queue = new SerialQueue();
-    await expect(queue.enqueue(async () => 42)).resolves.toBe(42);
+    const lanes = new SessionLanes();
+    await expect(lanes.enqueue("session-a", async () => 42)).resolves.toBe(42);
   });
 
   it("rejects with the task's own error", async () => {
-    const queue = new SerialQueue();
+    const lanes = new SessionLanes();
     await expect(
-      queue.enqueue(async () => {
+      lanes.enqueue("session-a", async () => {
         throw new Error("boom");
       }),
     ).rejects.toThrow("boom");
   });
 
-  it("never overlaps two tasks in time", async () => {
-    const queue = new SerialQueue();
-    const events: string[] = [];
+  it("never overlaps tasks in the same session", async () => {
+    const lanes = new SessionLanes();
+    const firstRelease = createDeferred<void>();
+    const secondStarted = createDeferred<void>();
 
-    const p1 = queue.enqueue(async () => {
-      events.push("1-start");
-      await delay(20);
-      events.push("1-end");
-    });
-    const p2 = queue.enqueue(async () => {
-      events.push("2-start");
-      await delay(5);
-      events.push("2-end");
+    const first = lanes.enqueue("session-a", () => firstRelease.promise);
+    const second = lanes.enqueue("session-a", async () => {
+      secondStarted.resolve();
     });
 
-    await Promise.all([p1, p2]);
+    await tick();
+    expect(lanes.size("session-a")).toBe(2);
+    let secondRunning = false;
+    void secondStarted.promise.then(() => {
+      secondRunning = true;
+    });
+    await tick();
+    expect(secondRunning).toBe(false);
 
-    // Task 2 has the shorter delay; if the queue ran tasks concurrently,
-    // "2-end" (or "2-start") would land before "1-end".
-    expect(events).toEqual(["1-start", "1-end", "2-start", "2-end"]);
+    firstRelease.resolve();
+    await Promise.all([first, second]);
+    expect(secondRunning).toBe(true);
   });
 
-  it("executes tasks in strict FIFO order across 3+ tasks", async () => {
-    const queue = new SerialQueue();
+  it("executes one session's tasks in strict FIFO order", async () => {
+    const lanes = new SessionLanes();
     const order: number[] = [];
 
     const results = await Promise.all([
-      queue.enqueue(async () => {
+      lanes.enqueue("session-a", async () => {
         order.push(1);
         return "a";
       }),
-      queue.enqueue(async () => {
+      lanes.enqueue("session-a", async () => {
         order.push(2);
         return "b";
       }),
-      queue.enqueue(async () => {
+      lanes.enqueue("session-a", async () => {
         order.push(3);
         return "c";
       }),
-      queue.enqueue(async () => {
-        order.push(4);
-        return "d";
-      }),
     ]);
 
-    expect(order).toEqual([1, 2, 3, 4]);
-    expect(results).toEqual(["a", "b", "c", "d"]);
+    expect(order).toEqual([1, 2, 3]);
+    expect(results).toEqual(["a", "b", "c"]);
   });
 
-  it("does not stall the queue when a task rejects", async () => {
-    const queue = new SerialQueue();
+  it("does not stall a session lane when a task rejects", async () => {
+    const lanes = new SessionLanes();
     const order: string[] = [];
 
-    const p1 = queue.enqueue(async () => {
-      order.push("1");
+    const first = lanes.enqueue("session-a", async () => {
+      order.push("first");
       throw new Error("fail");
     });
-    const p2 = queue.enqueue(async () => {
-      order.push("2");
+    const second = lanes.enqueue("session-a", async () => {
+      order.push("second");
       return "ok";
     });
-    const p3 = queue.enqueue(async () => {
-      order.push("3");
-      return "ok2";
+
+    await expect(first).rejects.toThrow("fail");
+    await expect(second).resolves.toBe("ok");
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("runs different session lanes concurrently", async () => {
+    const lanes = new SessionLanes();
+    const release = createDeferred<void>();
+    const running = new Set<string>();
+    const bothRunning = createDeferred<void>();
+
+    const run = (sessionId: string): Promise<void> =>
+      lanes.enqueue(sessionId, async () => {
+        running.add(sessionId);
+        if (running.size === 2) {
+          bothRunning.resolve();
+        }
+        await release.promise;
+      });
+
+    const first = run("session-a");
+    const second = run("session-b");
+    await bothRunning.promise;
+    expect(running).toEqual(new Set(["session-a", "session-b"]));
+
+    release.resolve();
+    await Promise.all([first, second]);
+  });
+
+  it("reports waiting and running depth for one session only", async () => {
+    const lanes = new SessionLanes();
+    const firstRelease = createDeferred<void>();
+    const secondRelease = createDeferred<void>();
+
+    const first = lanes.enqueue("session-a", () => firstRelease.promise);
+    const second = lanes.enqueue("session-a", () => secondRelease.promise);
+    const other = lanes.enqueue("session-b", async () => undefined);
+    await tick();
+
+    expect(lanes.size("session-a")).toBe(2);
+    expect(lanes.size("session-b")).toBe(0);
+
+    firstRelease.resolve();
+    await first;
+    await tick();
+    expect(lanes.size("session-a")).toBe(1);
+
+    secondRelease.resolve();
+    await Promise.all([second, other]);
+    expect(lanes.size("session-a")).toBe(0);
+  });
+
+  it("drain waits for every current lane to settle", async () => {
+    const lanes = new SessionLanes();
+    const firstRelease = createDeferred<void>();
+    const secondRelease = createDeferred<void>();
+    const first = lanes.enqueue("session-a", () => firstRelease.promise);
+    const second = lanes.enqueue("session-b", () => secondRelease.promise);
+    const drained = lanes.drain();
+    let drainResolved = false;
+    void drained.then(() => {
+      drainResolved = true;
     });
 
-    await expect(p1).rejects.toThrow("fail");
-    await expect(p2).resolves.toBe("ok");
-    await expect(p3).resolves.toBe("ok2");
-    expect(order).toEqual(["1", "2", "3"]);
+    firstRelease.resolve();
+    await first;
+    await tick();
+    expect(drainResolved).toBe(false);
+
+    secondRelease.resolve();
+    await Promise.all([second, drained]);
+    expect(drainResolved).toBe(true);
   });
 
-  it("size is 0 when idle", () => {
-    const queue = new SerialQueue();
-    expect(queue.size).toBe(0);
-  });
+  it("drops an idle lane after its last task settles", async () => {
+    const lanes = new SessionLanes();
+    await lanes.enqueue("session-a", async () => undefined);
+    expect(lanes.size("session-a")).toBe(0);
 
-  it("size reflects waiting + running tasks through a task's lifecycle", async () => {
-    const queue = new SerialQueue();
-    const d1 = createDeferred<void>();
-    const d2 = createDeferred<void>();
-
-    const p1 = queue.enqueue(() => d1.promise);
-    await tick();
-    expect(queue.size).toBe(1); // task 1 running, nothing waiting
-
-    const p2 = queue.enqueue(() => d2.promise);
-    await tick();
-    expect(queue.size).toBe(2); // task 1 running, task 2 waiting
-
-    d1.resolve();
-    await p1;
-    await tick();
-    expect(queue.size).toBe(1); // task 2 now running
-
-    d2.resolve();
-    await p2;
-    expect(queue.size).toBe(0);
+    await expect(
+      lanes.enqueue("session-a", async () => "reused"),
+    ).resolves.toBe("reused");
+    expect(lanes.size("session-a")).toBe(0);
   });
 });

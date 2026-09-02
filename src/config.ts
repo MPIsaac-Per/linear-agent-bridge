@@ -15,6 +15,7 @@ export interface Config {
   bridgeStateStorePath: string;
   oauthTokenStorePath: string;
   runInactivityTimeoutMs: number;
+  progressNoticeIntervalMs: number;
   ingressRecoveryKey: string;
   ingressRecoveryPreviousKeys: string[];
   reconcileIntervalMs: number;
@@ -37,6 +38,7 @@ const DEFAULT_SESSION_STORE_PATH = "./data/sessions.json";
 const DEFAULT_BRIDGE_STATE_STORE_PATH = "./data/bridge-state.json";
 const DEFAULT_OAUTH_TOKEN_STORE_PATH = "./data/oauth-tokens.json";
 const DEFAULT_RUN_INACTIVITY_TIMEOUT_MS = "300000";
+const DEFAULT_PROGRESS_NOTICE_INTERVAL_MS = "120000";
 const DEFAULT_RECONCILE_INTERVAL_MS = "60000";
 const DEFAULT_RECONCILE_LOOKBACK_MS = "86400000";
 const DEFAULT_RECONCILE_MAX_SESSIONS = "250";
@@ -174,6 +176,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     inactivityTimeoutRaw ?? DEFAULT_RUN_INACTIVITY_TIMEOUT_MS,
     inactivityTimeoutKey,
   );
+  const progressNoticeIntervalMs = positiveInteger(
+    env.PROGRESS_NOTICE_INTERVAL_MS ?? DEFAULT_PROGRESS_NOTICE_INTERVAL_MS,
+    "PROGRESS_NOTICE_INTERVAL_MS",
+  );
 
   const agentOutputPathRaw = env.AGENT_OUTPUT_PATH;
   const reconcileLookbackMs = positiveInteger(
@@ -216,6 +222,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     oauthTokenStorePath:
       env.OAUTH_TOKEN_STORE_PATH ?? DEFAULT_OAUTH_TOKEN_STORE_PATH,
     runInactivityTimeoutMs,
+    progressNoticeIntervalMs,
     ingressRecoveryKey,
     ingressRecoveryPreviousKeys,
     reconcileIntervalMs: positiveInteger(
