@@ -5,7 +5,7 @@ import { LinearOAuthTokenManager } from "./linear/oauth.js";
 import { JsonSessionStore } from "./sessions/store.js";
 import { JsonBridgeStateStore } from "./state/store.js";
 import { createIngressRecoveryKeyring } from "./state/recovery-envelope.js";
-import { SerialQueue } from "./queue.js";
+import { SessionLanes } from "./queue.js";
 import { awaitReadyOrShutdown, installGracefulShutdown } from "./shutdown.js";
 import { ClaudeRuntime } from "./runtime/claude.js";
 import { CodexRuntime } from "./runtime/codex.js";
@@ -41,7 +41,7 @@ const server = startServer({
       config.ingressRecoveryPreviousKeys,
     ),
   }),
-  queue: new SerialQueue(),
+  queue: new SessionLanes(),
 });
 const shutdown = installGracefulShutdown(server, {
   timeoutMs: config.shutdownTimeoutMs,

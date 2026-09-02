@@ -32,6 +32,7 @@ describe("loadConfig", () => {
       bridgeStateStorePath: "./data/bridge-state.json",
       oauthTokenStorePath: "./data/oauth-tokens.json",
       runInactivityTimeoutMs: 300000,
+      progressNoticeIntervalMs: 120000,
       ingressRecoveryKey: "A".repeat(43),
       ingressRecoveryPreviousKeys: [],
       reconcileIntervalMs: 60000,
@@ -51,6 +52,7 @@ describe("loadConfig", () => {
       BRIDGE_STATE_STORE_PATH: "/tmp/bridge-state.json",
       OAUTH_TOKEN_STORE_PATH: "/tmp/oauth-tokens.json",
       RUN_INACTIVITY_TIMEOUT_MS: "45000",
+      PROGRESS_NOTICE_INTERVAL_MS: "125000",
       RECONCILE_INTERVAL_MS: "31000",
       RECONCILE_LOOKBACK_MS: "7200000",
       RECONCILE_MAX_SESSIONS: "125",
@@ -64,6 +66,7 @@ describe("loadConfig", () => {
     expect(config.bridgeStateStorePath).toBe("/tmp/bridge-state.json");
     expect(config.oauthTokenStorePath).toBe("/tmp/oauth-tokens.json");
     expect(config.runInactivityTimeoutMs).toBe(45000);
+    expect(config.progressNoticeIntervalMs).toBe(125000);
     expect(config.reconcileIntervalMs).toBe(31000);
     expect(config.reconcileLookbackMs).toBe(7200000);
     expect(config.reconcileMaxSessions).toBe(125);
@@ -106,6 +109,7 @@ describe("loadConfig", () => {
 
   it.each([
     "RECONCILE_INTERVAL_MS",
+    "PROGRESS_NOTICE_INTERVAL_MS",
     "RECONCILE_LOOKBACK_MS",
     "RECONCILE_MAX_SESSIONS",
     "AGENT_SESSION_ACK_GRACE_MS",

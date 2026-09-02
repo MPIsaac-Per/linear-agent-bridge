@@ -8,7 +8,7 @@ working directory it runs in (CLAUDE.md stack, MCP servers).
 ## Architecture
 
 Linear webhook (AgentSessionEvent) plus startup/interval activity
-reconciliation -> src/server.ts -> JsonBridgeStateStore -> SerialQueue ->
+reconciliation -> src/server.ts -> JsonBridgeStateStore -> SessionLanes ->
 AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities back via
 src/linear/client.ts (agentActivityCreate). Durable receipts, semantic claims,
 per-session watermarks, and stop fences prevent duplicate or post-stop dispatch
@@ -22,9 +22,12 @@ refreshes it after an authenticated request returns 401.
 
 ## Hard constraints
 
-- **Serial execution only.** Parallel headless Claude invocations sharing
-  one host have produced cross-session content contamination. SerialQueue
-  stays at concurrency 1.
+- **Runtime concurrency is per Linear agent-session.** Turns in one Linear
+  agent-session run FIFO and resume that session's runtime session. Distinct
+  Linear sessions run concurrently because the Claude Agent SDK isolates
+  conversations by session UUID. The host-wide concurrency-1 rule is retired:
+  MPI-682 imported it from a 2026-04-26 `claude -p` file-write incident, which
+  never applied to this SDK's session-isolated conversations.
 - **Never pass `model` or tool overrides** when invoking the Claude
   runtime. The operator's Claude Code config is the source of truth.
   Unattended runs use `permissionMode: "bypassPermissions"` paired with

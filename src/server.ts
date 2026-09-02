@@ -45,7 +45,7 @@ import {
   IngressRecoveryEnvelopeError,
   type IngressRecoveryPayload,
 } from "./state/recovery-envelope.js";
-import type { SerialQueue } from "./queue.js";
+import type { SessionLanes } from "./queue.js";
 
 /** Linear's OAuth2 token-exchange endpoint (linear.app/developers/oauth-2-0-authentication). */
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -60,7 +60,7 @@ const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
 /** Emitted immediately on `created` to satisfy Linear's 10s liveness rule. */
 const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
-/** Acknowledge follow-up turns before they enter the host-wide serial queue. */
+/** Acknowledge a follow-up when it starts after an earlier turn in its lane. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
 const STALLED_WARNING_INTERVAL_MS = 15 * 60 * 1000;
@@ -100,7 +100,7 @@ export interface ServerDeps {
   oauth: LinearOAuthTokenManager;
   store: JsonSessionStore;
   bridgeState: BridgeStateStore;
-  queue: SerialQueue;
+  queue: SessionLanes;
   /**
    * Fetch used for the OAuth token exchange in GET /oauth/callback.
    * Defaults to the global fetch; tests inject a fake so the real Linear
@@ -322,7 +322,7 @@ export function startServer(deps: ServerDeps): {
       await internalDeps.recoveryInFlight?.catch(() => undefined);
       await startupAttempt?.catch(() => undefined);
       await internalDeps.reconciliationInFlight?.catch(() => undefined);
-      await internalDeps.queue.enqueue(async () => {});
+      await internalDeps.queue.drain();
       await listenOutcome;
       if (!server.listening) {
         return;
@@ -1399,23 +1399,25 @@ async function processClaimedWebhook(
       );
     }
     dispatchSignal?.throwIfAborted();
-    await emitActivity(
-      deps,
-      identity.executionId,
-      "liveness",
-      sessionId,
-      {
-        type: "thought",
-        body: PROMPTED_THOUGHT_BODY,
-      },
-      {
-        ephemeral: true,
-        signal:
-          dispatchSignal === undefined
-            ? controller!.signal
-            : AbortSignal.any([controller!.signal, dispatchSignal]),
-      },
-    );
+    if (deps.queue.size(sessionId) === 0) {
+      await emitActivity(
+        deps,
+        identity.executionId,
+        "liveness",
+        sessionId,
+        {
+          type: "thought",
+          body: PROMPTED_THOUGHT_BODY,
+        },
+        {
+          ephemeral: true,
+          signal:
+            dispatchSignal === undefined
+              ? controller!.signal
+              : AbortSignal.any([controller!.signal, dispatchSignal]),
+        },
+      );
+    }
     dispatchSignal?.throwIfAborted();
     if (controller!.signal.aborted) {
       if (!deps.closing) {
@@ -1463,64 +1465,109 @@ function enqueueSessionRun(
   identity: IngressEventIdentity,
   options: { loadStoredSessionAtExecution?: boolean } = {},
 ): void {
-  void deps.queue
-    .enqueue(async () => {
-      let effectiveRequest = request;
-      let effectiveIssueIdentifier = issueIdentifier;
-      let terminalReason: TurnTerminalReason = controller.signal.aborted
-        ? "stopped"
-        : "failed";
-      try {
-        if (options.loadStoredSessionAtExecution === true) {
-          const storedSession = await deps.store.get(request.linearSessionId);
-          effectiveRequest = {
-            ...request,
-            ...(storedSession?.runtimeSessionId !== undefined
-              ? { resumeSessionId: storedSession.runtimeSessionId }
-              : {}),
-          };
-          effectiveIssueIdentifier ??= storedSession?.issueIdentifier;
-        }
+  const laneDepth = deps.queue.size(request.linearSessionId);
+  const isQueuedFollowUp =
+    options.loadStoredSessionAtExecution === true && laneDepth > 0;
+  const queuedNotice = isQueuedFollowUp
+    ? emitActivity(
+        deps,
+        identity.executionId,
+        "queued-notice",
+        request.linearSessionId,
+        {
+          type: "thought",
+          body: "Your follow-up is queued behind the current turn on this thread; I'll take it as soon as that turn finishes.",
+        },
+        { signal: controller.signal },
+      ).catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          console.log(
-            `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size}`,
+          console.error(
+            `[linear-agent-bridge] queued notice delivery failed: session=${request.linearSessionId} error=${boundedErrorClass(error)}`,
           );
-          terminalReason = await runSessionTask(
-            deps,
-            { ...effectiveRequest, abortController: controller },
-            effectiveIssueIdentifier,
-            identity.executionId,
-          );
+        }
+      })
+    : Promise.resolve();
+  const queuedRun = deps.queue.enqueue(request.linearSessionId, async () => {
+    let effectiveRequest = request;
+    let effectiveIssueIdentifier = issueIdentifier;
+    let terminalReason: TurnTerminalReason = controller.signal.aborted
+      ? "stopped"
+      : "failed";
+    try {
+      await queuedNotice;
+      if (options.loadStoredSessionAtExecution === true) {
+        const storedSession = await deps.store.get(request.linearSessionId);
+        effectiveRequest = {
+          ...request,
+          ...(storedSession?.runtimeSessionId !== undefined
+            ? { resumeSessionId: storedSession.runtimeSessionId }
+            : {}),
+        };
+        effectiveIssueIdentifier ??= storedSession?.issueIdentifier;
+      }
+      if (!controller.signal.aborted) {
+        console.log(
+          `[linear-agent-bridge] turn start: session=${request.linearSessionId} queue=${deps.queue.size(request.linearSessionId)}`,
+        );
+        if (isQueuedFollowUp) {
+          try {
+            await emitActivity(
+              deps,
+              identity.executionId,
+              "queued-start",
+              request.linearSessionId,
+              {
+                type: "thought",
+                body: PROMPTED_THOUGHT_BODY,
+              },
+              { ephemeral: true, signal: controller.signal },
+            );
+          } catch (error) {
+            if (controller.signal.aborted) {
+              terminalReason = "stopped";
+              return;
+            }
+            throw error;
+          }
+        }
+        terminalReason = await runSessionTask(
+          deps,
+          { ...effectiveRequest, abortController: controller },
+          effectiveIssueIdentifier,
+          identity.executionId,
+        );
+      }
+    } finally {
+      console.log(
+        `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size(request.linearSessionId) - 1)}`,
+      );
+      try {
+        if (!deps.closing) {
+          if (terminalReason === "failed" || terminalReason === "inactive") {
+            await deps.bridgeState.failEvent(
+              identity.webhookId,
+              terminalReason === "inactive"
+                ? "RuntimeTimeout"
+                : "RuntimeExecutionError",
+            );
+          } else {
+            await deps.bridgeState.completeEvent(identity.webhookId);
+          }
         }
       } finally {
-        console.log(
-          `[linear-agent-bridge] turn terminal: session=${request.linearSessionId} reason=${terminalReason} queue=${Math.max(0, deps.queue.size - 1)}`,
-        );
-        try {
-          if (!deps.closing) {
-            if (terminalReason === "failed" || terminalReason === "inactive") {
-              await deps.bridgeState.failEvent(
-                identity.webhookId,
-                terminalReason === "inactive"
-                  ? "RuntimeTimeout"
-                  : "RuntimeExecutionError",
-              );
-            } else {
-              await deps.bridgeState.completeEvent(identity.webhookId);
-            }
-          }
-        } finally {
-          unregisterRun(deps, request.linearSessionId, controller);
-        }
+        unregisterRun(deps, request.linearSessionId, controller);
       }
-    })
-    .catch((error: unknown) => {
-      if (!deps.closing) {
-        console.error(
-          `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
-        );
-      }
-    });
+    }
+  });
+
+
+  void queuedRun.catch((error: unknown) => {
+    if (!deps.closing) {
+      console.error(
+        `[linear-agent-bridge] queued turn finalization failed: webhook=${identity.webhookId} execution=${identity.executionId} error=${boundedErrorClass(error)}`,
+      );
+    }
+  });
 }
 
 function abortSessionRuns(
@@ -1617,6 +1664,10 @@ async function runSessionTask(
   executionId: string,
 ): Promise<TurnTerminalReason> {
   const controller = request.abortController;
+  const turnStartedAt = deps.now?.() ?? Date.now();
+  let lastNoticeAt = turnStartedAt;
+  let noticeSequence = 0;
+  let lastAction: { action: string; parameter: string } | undefined;
   let activitySequence = 0;
   let acceptEvents = true;
   let inactivityTriggered = false;
@@ -1683,6 +1734,31 @@ async function runSessionTask(
         );
         if (event.kind === "activity") {
           activitySequence += 1;
+        }
+        if (event.kind === "activity" && event.activity.type === "action") {
+          lastAction = {
+            action: event.activity.action,
+            parameter: event.activity.parameter,
+          };
+        }
+        const now = deps.now?.() ?? Date.now();
+        if (now - lastNoticeAt >= deps.config.progressNoticeIntervalMs) {
+          noticeSequence += 1;
+          await emitActivity(
+            deps,
+            executionId,
+            `progress-${noticeSequence}`,
+            request.linearSessionId,
+            {
+              type: "thought",
+              body:
+                lastAction === undefined
+                  ? `Still working (${formatDuration(now - turnStartedAt)}).`
+                  : `Still working (${formatDuration(now - turnStartedAt)}). Last step: ${lastAction.action} — ${lastAction.parameter}`,
+            },
+            controller !== undefined ? { signal: controller.signal } : {},
+          );
+          lastNoticeAt = now;
         }
       }
       return {};
