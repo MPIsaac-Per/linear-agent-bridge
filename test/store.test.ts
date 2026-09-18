@@ -56,6 +56,25 @@ describe("JsonSessionStore", () => {
     expect(Object.keys(raw)).toHaveLength(1);
   });
 
+  it("preserves every record when distinct sessions are written concurrently", async () => {
+    const store = new JsonSessionStore(path.join(tmpDir, "sessions.json"));
+    const records = Array.from({ length: 20 }, (_, index) =>
+      record({
+        linearSessionId: `linear-${index}`,
+        runtimeSessionId: `runtime-${index}`,
+      }),
+    );
+
+    await Promise.all(records.map((entry) => store.put(entry)));
+
+    await expect(store.listSessionIds()).resolves.toEqual(
+      records.map((entry) => entry.linearSessionId).sort(),
+    );
+    await expect(
+      Promise.all(records.map((entry) => store.get(entry.linearSessionId))),
+    ).resolves.toEqual(records);
+  });
+
   it("persists across a fresh instance pointed at the same path", async () => {
     const storePath = path.join(tmpDir, "sessions.json");
     const writer = new JsonSessionStore(storePath);

@@ -67,8 +67,8 @@ export type RuntimeEvent =
   | { kind: "done" };
 
 /**
- * The runtime seam. ClaudeRuntime is the default; CodexRuntime is the
- * priced exit if Anthropic un-pauses the Agent SDK credit pool.
+ * The runtime seam. ClaudeRuntime is the default; CodexRuntime is selected
+ * with RUNTIME=codex.
  */
 export interface AgentRuntime {
   readonly name: string;

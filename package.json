@@ -24,7 +24,8 @@
     "native:check": "node scripts/build-native.mjs --check"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.228"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.228",
+    "@openai/codex-sdk": "^0.155.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

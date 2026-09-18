@@ -5,6 +5,7 @@ import type {
   SessionRequest,
 } from "../types.js";
 import type { Options, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { withLinearAgentSessionContext } from "./prompt.js";
 
 /** Max length of a compact, one-line tool-input summary before truncation. */
 const MAX_ACTION_PARAMETER_LENGTH = 200;
@@ -154,10 +155,11 @@ export class ClaudeRuntime implements AgentRuntime {
    * and anything enforced inside the agent is advisory anyway.
    */
   private composePrompt(prompt: string): string {
+    const contextualPrompt = withLinearAgentSessionContext(prompt);
     if (this.agentOutputPath === undefined) {
-      return prompt;
+      return contextualPrompt;
     }
-    return `${prompt}\n\nWrite any files you produce to ${this.agentOutputPath}. The working directory may be read-only to this service, so a denied write there is expected rather than something to work around.`;
+    return `${contextualPrompt}\n\nWrite any files you produce to ${this.agentOutputPath}. The working directory may be read-only to this service, so a denied write there is expected rather than something to work around.`;
   }
 
   forceCloseSession(request: SessionRequest): void {

@@ -1,10 +1,9 @@
 # linear-agent-bridge
 
-Run your Claude Code setup as a Linear agent. Delegate an issue to it or
-message it in an agent session, and a Claude Agent SDK session runs on
-your machine, in a working directory you choose, with everything that
-directory carries: CLAUDE.md instructions, MCP servers, skills. Replies
-land in the issue's agent-session thread.
+Run Claude Code or Codex as a Linear agent. Delegate an issue to it or message
+it in an agent session, and the selected runtime works on your machine in a
+directory you choose, with the instructions, MCP servers, and skills available
+to that runtime. Replies land in the issue's agent-session thread.
 
 This is a compact reference implementation (no framework, tested). It is not
 a coding agent; for assign-an-issue-get-a-PR flows,
@@ -12,7 +11,8 @@ see [Cyrus](https://github.com/ceedaragents/cyrus). This bridge is for
 talking to an agent that knows your context: a knowledge base, an ops
 repo, a project directory.
 
-Runs on Claude Code subscription auth. No Anthropic API key.
+Runs on the selected CLI's stored subscription login. No Anthropic or OpenAI
+API key is required.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ Linear (mention / delegate / follow-up prompt)
   -> src/server.ts        verify HMAC, persist ingress, ack < 5s
   -> src/state/store.ts   durable receipt + semantic execution claim
   -> src/queue.ts         per-session FIFO lanes, concurrent across sessions
-  -> src/runtime/claude.ts  Agent SDK query(), cwd = KB_PATH, resume
+  -> src/runtime/{claude,codex}.ts  selected SDK, cwd = KB_PATH, resume
   -> src/linear/client.ts   agentActivityCreate (thought/action/response)
 ```
 
@@ -57,14 +57,20 @@ In-progress thoughts and tool calls use Linear's ephemeral activity UI. Tool
 results close the matching action, `stop` cancels the active and queued turns
 for that session, and `RUN_INACTIVITY_TIMEOUT_MS` stops a run only when its
 runtime has been silent for the configured interval (5 minutes by default).
-Completed assistant text is posted as a durable response as soon as Claude
-marks the turn `end_turn`; an identical trailing SDK result is suppressed,
-while a differing result is forwarded.
+Completed assistant text is posted as a durable response. Claude posts at its
+top-level `end_turn`; Codex posts at `turn.completed`.
+
+Every runtime turn begins with a delivery contract explaining that the agent is
+already operating inside a Linear Agent Session and that its final response is
+posted automatically. Linear tools remain available for deliberate issue
+mutations, but the agent is instructed not to edit fields or add comments merely
+to duplicate its conversation, progress, or final response.
 
 ## Prerequisites
 
-- Node 22+, a machine that stays on, and [Claude Code](https://claude.com/claude-code)
-  installed and logged in as the user who runs the service.
+- Node 22+ and a machine that stays on.
+- A stored login for the selected runtime, owned by the user who runs the
+  service: Claude Code for `RUNTIME=claude`, or Codex for `RUNTIME=codex`.
 - On macOS, Xcode Command Line Tools (`xcode-select --install`). The build uses
   the supported libproc API to compile a small local process-identity helper.
 - A Linear workspace where you can create OAuth applications.
@@ -108,6 +114,15 @@ The `dev`, `test`, `build`, and `start` scripts build the macOS helper when its
 source, target architecture, or compile flags change. The native step is
 skipped on other platforms. A required macOS rebuild fails closed with an
 installation command when Command Line Tools are unavailable.
+
+Set `RUNTIME=claude` or `RUNTIME=codex` in `.env`. Codex uses the normal login
+and `~/.codex/config.toml` of the service user. The bridge deliberately does not
+set a model or reasoning effort, so the service user's Codex defaults remain in
+control. It runs unattended with approval policy `never` and sandbox mode
+`danger-full-access`, matching the bridge's existing Claude permission posture.
+Changing `RUNTIME` requires a restart. A session already holding another
+provider's native session ID fails visibly instead of sending that ID to the
+wrong provider; start a new Linear agent session after switching.
 
 ### 3. Install the app as an agent (actor=app)
 
@@ -268,11 +283,14 @@ unit at `/etc/systemd/system/linear-agent-bridge.service`; override the
 directory with `SYSTEMD_UNIT_DIR`.
 
 **Which account runs it.** macOS runs the service as you, in your login session,
-so the Agent SDK finds your Claude Code credentials with no extra setup. Linux
-runs it as a dedicated system account, `linear-agent-bridge` by default and
-configurable with `SERVICE_USER`, created by the installer if absent. That
-account needs its own authenticated Claude Code login, and it is the boundary
-`AGENT_OUTPUT_PATH` relies on. macOS is the exception here on purpose: a
+so the selected SDK finds that account's stored credentials. Linux runs it as a
+dedicated system account, `linear-agent-bridge` by default and configurable
+with `SERVICE_USER`, created by the installer if absent. That account needs its
+own authenticated login for the selected runtime, and it is the boundary
+`AGENT_OUTPUT_PATH` relies on. For Codex, verify it with
+`sudo -u linear-agent-bridge -H node_modules/.bin/codex login status`; use
+`login --device-auth` under the same account when authorization is needed.
+macOS is the exception here on purpose: a
 dedicated account there means a system LaunchDaemon, sudo on every install, and
 a second login with no Keychain access, which buys little on a workstation.
 Because Linux manages a system account and a unit, the installer requires root
@@ -450,11 +468,12 @@ is never rewritten, so a restart does not make old sessions suddenly eligible.
 
 ### Confining what the agent can write
 
-A webhook-driven agent cannot answer a permission prompt, so unattended runs
-pass `permissionMode: "bypassPermissions"`. That is not changing. It means no
-prompt stands between the agent and the working directory, and for many
-operators `KB_PATH` is a knowledge base synced to other machines, where a
-mistaken write is recoverable by diff and a mistaken delete often is not.
+A webhook-driven agent cannot answer a permission prompt, so unattended Claude
+runs pass `permissionMode: "bypassPermissions"` and Codex runs use approval
+policy `never` with sandbox mode `danger-full-access`. No prompt stands between
+the agent and the working directory. For many operators `KB_PATH` is a
+knowledge base synced to other machines, where a mistaken write is recoverable
+by diff and a mistaken delete often is not.
 
 `AGENT_OUTPUT_PATH` makes a read-only working directory a supported posture. It
 is optional; unset, nothing changes. Set it and the runtime names the directory
@@ -521,12 +540,11 @@ deadline elapses the process logs a bounded diagnostic and exits 1 rather than
 hanging. A second signal during shutdown does not start a second close and does
 not shorten the deadline.
 
-## Billing note
+## Runtime authentication
 
-The Claude Agent SDK currently draws on Claude Code subscription
-credentials and standard plan limits. Anthropic announced, then paused, a
-change that would move Agent SDK usage to a separate metered credit pool.
-Check current terms before depending on the economics.
+The Claude adapter uses Claude Code subscription credentials. The Codex adapter
+uses the Codex CLI's stored ChatGPT login. Both inherit the selected service
+account's normal provider configuration and plan limits.
 
 ## License
 

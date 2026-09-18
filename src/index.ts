@@ -18,7 +18,7 @@ function buildRuntime(
 ): AgentRuntime {
   return runtime === "claude"
     ? new ClaudeRuntime(kbPath, undefined, agentOutputPath)
-    : new CodexRuntime();
+    : new CodexRuntime(kbPath, undefined, agentOutputPath);
 }
 
 const config = loadConfig();
