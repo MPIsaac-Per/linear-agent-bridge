@@ -683,6 +683,57 @@ describe("autonomous goals", () => {
     expect(linear.completionCalls).toBe(0);
   });
 
+  it("does not convert an existing untracked session from a later prompt", async () => {
+    const linear = control();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "legacy-session" };
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "Handled as one normal turn." },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-existing-session-prompt",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-existing-session",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Existing conversation",
+        },
+      },
+      agentActivity: {
+        id: "goal-existing-session-prompt-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "Continue this existing session." },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(
+          "goal-existing-session-prompt",
+        ))?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(1);
+    expect(runtime.requests[0]?.prompt).toBe("Continue this existing session.");
+    await expect(
+      harness.bridgeState.getAutonomousGoal("goal-existing-session"),
+    ).resolves.toBeUndefined();
+    expect(linear.completionCalls).toBe(0);
+  });
+
   it("emits one elicitation when blocked and resumes only after a user prompt", async () => {
     const linear = control();
     let turn = 0;

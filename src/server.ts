@@ -1620,6 +1620,7 @@ async function processClaimedWebhook(
 
     if (
       !isStop &&
+      event.action === "created" &&
       goal === undefined &&
       deps.config.autonomousGoalLabelId !== undefined &&
       event.agentSession.issue?.id !== undefined
