@@ -1,13 +1,13 @@
 /**
  * Serial lanes keyed by Linear agent-session id.
  *
- * Turns in one Linear session run FIFO because they share a Claude
- * conversation. Distinct sessions run concurrently because their SDK
- * conversations are isolated by session UUID.
+ * Turns in one Linear session run FIFO because they share one provider-native
+ * conversation. Distinct sessions run concurrently because their runtime
+ * conversations are isolated by provider-native session id.
  *
  * Retired constraint: MPI-682 imported host-wide concurrency 1 from a
  * 2026-04-26 `claude -p` file-write incident. That incident did not apply to
- * the Claude Agent SDK's session-isolated conversations.
+ * either SDK's session-isolated conversations.
  */
 interface Lane {
   tail: Promise<void>;

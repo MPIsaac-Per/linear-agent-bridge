@@ -1,7 +1,7 @@
 # Direct Funnel ingress cutover
 
 This runbook moves the Linear webhook to a Tailscale Funnel that terminates
-public HTTPS on the same Mac that runs `linear-agent-bridge`. Funnel proxies
+public HTTPS on the same host that runs `linear-agent-bridge`. Funnel proxies
 directly to `http://127.0.0.1:<PORT>`. There is no production TCP forwarder or
 second serving host in this topology.
 
@@ -10,7 +10,7 @@ Linear webhook delivery
   -> https://<serving-host>.<tailnet>.ts.net/webhook
   -> Tailscale Funnel on <serving-host>
   -> http://127.0.0.1:<PORT>/webhook
-  -> com.linear-agent-bridge
+  -> linear-agent-bridge service
 ```
 
 `deploy/tcp_forward.py` is diagnostic-only. It remains available to isolate a
@@ -120,7 +120,7 @@ Do not run, capture, or paste unfiltered `launchctl print` output, process
 environment blocks, or shell tracing. They can expose credentials inherited
 from `.env`. If any webhook, OAuth, or client credential is exposed, stop the
 cutover, rotate the affected credential at its authority, update `.env`,
-restart the launchd job, and repeat local health plus signed public verification
+restart the service, and repeat local health plus signed public verification
 before declaring readiness.
 
 A listener on
@@ -192,7 +192,9 @@ and authorization data are not printed or passed in curl arguments.
 
 Correlate records without copying prompt text:
 
-- `webhookId` identifies the Linear delivery and durable receipt.
+- The `Linear-Delivery` header identifies the Linear delivery and durable
+  receipt. The payload's `webhookId` identifies the webhook configuration and
+  repeats across deliveries.
 - execution identity is `created:<agentSession.id>` for a created session and
   `agentActivity.id` for a prompted session.
 - `agentSession.id` ties the receipt, reconciliation scan, queue lifecycle, and
@@ -203,7 +205,7 @@ Correlate records without copying prompt text:
 
 In Linear, open Settings, API, Applications, select the agent application, then
 inspect its webhook delivery history. Compare the delivery time, HTTP status,
-and webhook ID with the launchd log and durable receipt. Delivery history is
+and delivery ID with the service log and durable receipt. Delivery history is
 edge evidence; the receipt is execution evidence. A 200 delivery alone does
 not prove a turn ran.
 
@@ -215,7 +217,7 @@ not prove a turn ran.
 | TLS failure | Funnel certificate/public edge | Run the signed verifier and inspect Funnel status JSON | Do not bypass TLS; keep or restore the old URL |
 | Forwarder or tunnel failure | Diagnostic private hop only | Correlate the forwarder connection ID, confirm the local SSH tunnel endpoint, and inspect its bounded upstream failure class | Stop both diagnostic processes and restore direct Funnel before cutover |
 | HTTP 401 signature | Secret or exact body mismatch | Confirm the Linear app secret and verifier environment without printing either | Correct the secret; never disable HMAC validation |
-| Duplicate receipt | Linear delivery retry | Match `webhookId` in `BRIDGE_STATE_STORE_PATH` | Expected deduplication; do not delete the receipt |
+| Duplicate receipt | Linear delivery retry | Match the `Linear-Delivery` value to the receipt identity in `BRIDGE_STATE_STORE_PATH` | Expected deduplication; do not delete the receipt |
 | Duplicate activity | Outbound retry or semantic duplicate | Compare activity UUID and execution identity | Preserve state and investigate before replaying |
 | Recovery does not dispatch | Post-dispatch ambiguity or stop fence | Inspect receipt disposition, dispatch marker, and reconciliation watermark | Resolve manually; do not force a blind replay |
 | Inactivity stop | Runtime produced no progress | Find the session terminal reason and `RUN_INACTIVITY_TIMEOUT_MS` | Diagnose runtime health; ingress replay is not the fix |
@@ -250,8 +252,9 @@ operator completes them in order:
 
 - [ ] Record public-edge owner, serving host, canonical URL, previous URL,
   rollback owner, and cutover time.
-- [ ] Confirm `com.linear-agent-bridge`, its log path, loopback listener, local
-  health, durable state path, and reconciliation settings on the serving host.
+- [ ] Confirm the launchd job or systemd unit, its log path, loopback listener,
+  local health, durable state path, and reconciliation settings on the serving
+  host.
 - [ ] Build and install the accepted commit with `./deploy/install.sh`.
 - [ ] Confirm the installer preflight reported either an empty public Funnel
   state or the single existing exact target, with no unrelated public route.
@@ -259,8 +262,8 @@ operator completes them in order:
   loopback target reported by the installer.
 - [ ] Run `deploy/verify-ingress.sh` against the reported canonical URL.
 - [ ] Save the verified canonical URL in the existing Linear application.
-- [ ] Observe Linear delivery history for HTTP 200 and correlate its webhook ID
-  to the launchd log and durable receipt.
+- [ ] Observe Linear delivery history for HTTP 200 and correlate its delivery
+  ID to the service log and durable receipt.
 - [ ] Send one authorized agent-session prompt and confirm one receipt, one
   semantic claim, one activity sequence, and no stalled warning.
 - [ ] Confirm reconciliation remains healthy for at least one interval.
