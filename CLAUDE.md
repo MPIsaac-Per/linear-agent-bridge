@@ -17,6 +17,10 @@ until its durable dispatch marker is set; later cross-process retries remain
 ambiguous and undispatched.
 Session mapping persists in JsonSessionStore so `prompted` events
 resume the same runtime session.
+When `AUTONOMOUS_GOAL_LABEL_ID` is configured, JsonBridgeStateStore also owns a
+provider-neutral autonomous-goal lifecycle. The current issue label is the
+native authorization guard; provider sessions supply conversation continuity,
+not scheduling authority.
 LinearOAuthTokenManager persists Linear's rotating OAuth token pair and
 refreshes it after an authenticated request returns 401.
 
@@ -42,6 +46,33 @@ refreshes it after an authenticated request returns 401.
   Session and that the bridge posts its final response automatically. Linear
   tools remain available for deliberate issue mutations, not for duplicating
   conversation updates or the final response as comments.
+- **Do not infer delegation from `AgentSessionEvent.created`.** Linear uses the
+  same action for mention and delegation and provides no causal discriminator.
+  Autonomous work is opt-in through the configured visible issue label, which
+  must be checked before each provider turn and again before completion. Unset
+  configuration preserves one turn per message.
+- Autonomous scheduling is bridge-owned and provider-neutral. Persist each
+  state transition before its next side effect, keep every continuation in the
+  existing per-session FIFO lane, and never run more than
+  `AUTONOMOUS_GOAL_MAX_STEPS` between human messages. Yield before another
+  continuation when guidance is already durably claimed, even if its callback
+  has not entered the in-memory queue. A blocked goal emits one elicitation and
+  schedules nothing until a new prompt arrives.
+- A runtime's completion claim is necessary but insufficient. Require its
+  nonempty verification summary, recheck the label and issue state, durably
+  enter `completing`, then set the issue's completed workflow state. Reconcile
+  the stable completion activity ID before emission so crash recovery cannot
+  duplicate the final response. Cross a second durable dispatch boundary after
+  the label read and before `issueUpdate`; a stop that won before that boundary
+  must prevent the mutation.
+- A restart may resume a goal only between bounded provider turns. A goal left
+  `running` by another process has unknown side effects and must become blocked
+  with an elicitation rather than replaying the turn. A provider mismatch is
+  also blocked; provider-native session IDs never cross adapters. Reconcile a
+  recoverable goal's own Agent Session before dispatching accepted ingress or
+  enqueuing recovery so stops and guidance sent during downtime run first. A
+  failed goal-session preflight keeps startup unready; it must not fall through
+  to accepted-ingress dispatch.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Persist the bounded receipt and semantic claim before ack; do all
   external work after. Mark dispatch durably before the first external or

@@ -63,6 +63,29 @@ const AGENT_SESSION_ACTIVITIES_QUERY = `
   }
 `;
 
+const AUTONOMOUS_GOAL_ISSUE_QUERY = `
+  query AutonomousGoalIssue($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      identifier
+      labels(first: 250) { nodes { id } }
+      state { id type }
+      team {
+        states(first: 100) { nodes { id type position } }
+      }
+    }
+  }
+`;
+
+const COMPLETE_ISSUE_MUTATION = `
+  mutation CompleteAutonomousGoalIssue($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: { stateId: $stateId }) {
+      success
+      issue { id state { id type } }
+    }
+  }
+`;
+
 interface GraphQLError {
   message: string;
 }
@@ -115,6 +138,15 @@ export interface LinearAgentSessionActivities {
   appUserId: string;
   issueIdentifier?: string | undefined;
   activities: ReconciledAgentActivity[];
+}
+
+export interface AutonomousGoalIssueContext {
+  issueId: string;
+  issueIdentifier: string;
+  authorized: boolean;
+  alreadyCompleted: boolean;
+  currentStateId: string;
+  completedStateId?: string | undefined;
 }
 
 /** Static, body-free failure surfaced to ingress orchestration and logs. */
@@ -316,6 +348,90 @@ export class LinearAgentClient {
       after = nextPageCursor(pageInfo, seenCursors, nodes.length, "agentSessions");
     }
     return sessions;
+  }
+
+  async getAutonomousGoalIssueContext(
+    issueId: string,
+    labelId: string,
+    signal?: AbortSignal,
+  ): Promise<AutonomousGoalIssueContext> {
+    if (issueId.length === 0 || labelId.length === 0) {
+      throw new Error("issueId and labelId must not be empty");
+    }
+    const json = await this.queryGraphQL(
+      AUTONOMOUS_GOAL_ISSUE_QUERY,
+      { issueId },
+      "autonomousGoalIssue",
+      signal,
+    );
+    const issue = asRecord(asRecord(asRecord(json)?.data)?.issue);
+    const labels = asRecord(issue?.labels)?.nodes;
+    const state = asRecord(issue?.state);
+    const states = asRecord(asRecord(issue?.team)?.states)?.nodes;
+    if (
+      typeof issue?.id !== "string" ||
+      typeof issue.identifier !== "string" ||
+      !Array.isArray(labels) ||
+      typeof state?.id !== "string" ||
+      typeof state.type !== "string" ||
+      !Array.isArray(states)
+    ) {
+      throw new LinearQueryError("autonomousGoalIssue", "shape");
+    }
+    const labelIds = labels.map((value) => asRecord(value)?.id);
+    if (labelIds.some((value) => typeof value !== "string")) {
+      throw new LinearQueryError("autonomousGoalIssue", "shape");
+    }
+    const completedStates = states
+      .map((value) => asRecord(value))
+      .filter(
+        (value): value is Record<string, unknown> =>
+          typeof value?.id === "string" &&
+          value.type === "completed" &&
+          typeof value.position === "number",
+      )
+      .sort((left, right) =>
+        (left.position as number) - (right.position as number),
+      );
+    return {
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      authorized: labelIds.includes(labelId),
+      alreadyCompleted: state.type === "completed",
+      currentStateId: state.id,
+      ...(completedStates[0] !== undefined
+        ? { completedStateId: completedStates[0].id as string }
+        : {}),
+    };
+  }
+
+  async completeIssue(
+    issueId: string,
+    stateId: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (issueId.length === 0 || stateId.length === 0) {
+      throw new Error("issueId and stateId must not be empty");
+    }
+    const json = await this.queryGraphQL(
+      COMPLETE_ISSUE_MUTATION,
+      { issueId, stateId },
+      "completeAutonomousGoalIssue",
+      signal,
+    );
+    const payload = asRecord(
+      asRecord(asRecord(json)?.data)?.issueUpdate,
+    );
+    const issue = asRecord(payload?.issue);
+    const state = asRecord(issue?.state);
+    if (
+      payload?.success !== true ||
+      issue?.id !== issueId ||
+      state?.id !== stateId ||
+      state.type !== "completed"
+    ) {
+      throw new LinearQueryError("completeAutonomousGoalIssue", "shape");
+    }
   }
 
   async listAgentSessionActivities(

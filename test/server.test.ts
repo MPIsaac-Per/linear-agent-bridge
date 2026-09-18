@@ -49,6 +49,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     reconcileLookbackMs: 86400000,
     reconcileMaxSessions: 250,
     agentSessionAckGraceMs: 120000,
+    autonomousGoalMaxSteps: 8,
     ...overrides,
   };
 }
@@ -151,9 +152,95 @@ function fakeLinearFetch(calls: LinearCall[], activityIds: string[]): FetchFn {
   }) as FetchFn;
 }
 
+interface AutonomousLinearControl {
+  labelId: string;
+  issueId: string;
+  issueIdentifier: string;
+  authorized: boolean;
+  completionCalls: number;
+  completionFailuresRemaining: number;
+  completed: boolean;
+  activityIds: string[];
+}
+
+function autonomousLinearFetch(
+  calls: LinearCall[],
+  control: AutonomousLinearControl,
+): FetchFn {
+  return (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const parsed = JSON.parse(init?.body as string) as {
+      query: string;
+      variables: Record<string, unknown> & {
+        input?: {
+          id?: string;
+          agentSessionId: string;
+          content: AgentActivityContent;
+          ephemeral?: boolean;
+        };
+      };
+    };
+    if (parsed.query.includes("query AutonomousGoalIssue")) {
+      return jsonResponse({
+        data: {
+          issue: {
+            id: control.issueId,
+            identifier: control.issueIdentifier,
+            labels: {
+              nodes: control.authorized ? [{ id: control.labelId }] : [],
+            },
+            state: control.completed
+              ? { id: "state-done", type: "completed" }
+              : { id: "state-started", type: "started" },
+            team: {
+              states: {
+                nodes: [
+                  { id: "state-done", type: "completed", position: 1 },
+                ],
+              },
+            },
+          },
+        },
+      });
+    }
+    if (parsed.query.includes("CompleteAutonomousGoalIssue")) {
+      control.completionCalls += 1;
+      if (control.completionFailuresRemaining > 0) {
+        control.completionFailuresRemaining -= 1;
+        return jsonResponse(
+          { errors: [{ message: "synthetic completion failure" }] },
+          { ok: false, status: 503, statusText: "Service Unavailable" },
+        );
+      }
+      control.completed = true;
+      return jsonResponse({
+        data: {
+          issueUpdate: {
+            success: true,
+            issue: {
+              id: control.issueId,
+              state: { id: "state-done", type: "completed" },
+            },
+          },
+        },
+      });
+    }
+    const input = parsed.variables.input!;
+    calls.push({
+      agentSessionId: input.agentSessionId,
+      content: input.content,
+      ...(input.ephemeral !== undefined
+        ? { ephemeral: input.ephemeral }
+        : {}),
+    });
+    if (input.id !== undefined) {
+      control.activityIds.push(input.id);
+    }
+    return jsonResponse({ data: { agentActivityCreate: { success: true } } });
+  }) as FetchFn;
+}
+
 /** Fake AgentRuntime: records every request it's asked to run and yields a scripted event stream. */
 class FakeRuntime implements AgentRuntime {
-  readonly name = "fake";
   lastRequest: SessionRequest | undefined;
   requests: SessionRequest[] = [];
 
@@ -161,6 +248,7 @@ class FakeRuntime implements AgentRuntime {
     private readonly produce: (
       request: SessionRequest,
     ) => AsyncIterable<RuntimeEvent>,
+    readonly name = "fake",
   ) {}
 
   async *runSession(request: SessionRequest): AsyncIterable<RuntimeEvent> {
@@ -411,11 +499,1227 @@ function deliveryIdOf(body: string): string {
   return "delivery-unparsed";
 }
 
+async function postSignedWebhook(
+  harness: Harness,
+  payload: Record<string, unknown>,
+): Promise<Response> {
+  const body = JSON.stringify(payload);
+  return await fetch(serverUrl(harness.port, "/webhook"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "linear-signature": sign(body, WEBHOOK_SECRET),
+      "linear-delivery": deliveryIdOf(body),
+      connection: "close",
+    },
+    body,
+  });
+}
+
 let activeHarness: Harness | undefined;
 
 afterEach(async () => {
   await activeHarness?.close();
   activeHarness = undefined;
+});
+
+describe("autonomous goals", () => {
+  const labelId = "123e4567-e89b-42d3-a456-426614174000";
+
+  function control(
+    overrides: Partial<AutonomousLinearControl> = {},
+  ): AutonomousLinearControl {
+    return {
+      labelId,
+      issueId: "issue-autonomous",
+      issueIdentifier: "LIN-900",
+      authorized: true,
+      completionCalls: 0,
+      completionFailuresRemaining: 0,
+      completed: false,
+      activityIds: [],
+      ...overrides,
+    };
+  }
+
+  function createdPayload(
+    webhookId: string,
+    linearSessionId: string,
+    issueId = "issue-autonomous",
+  ): Record<string, unknown> {
+    return {
+      webhookId,
+      type: "AgentSessionEvent",
+      action: "created",
+      agentSession: {
+        id: linearSessionId,
+        createdAt: "2026-09-18T12:00:00.000Z",
+        issue: { id: issueId, identifier: "LIN-900", title: "Ship the fix" },
+      },
+      promptContext: "Implement and verify the assigned issue.",
+      webhookTimestamp: Date.now(),
+    };
+  }
+
+  it.each(["claude", "codex"])(
+    "runs bounded continuation and completes the issue for the %s runtime",
+    async (runtimeName) => {
+      const linear = control();
+      let turn = 0;
+      const runtime = new FakeRuntime(async function* () {
+        turn += 1;
+        yield {
+          kind: "session-started",
+          runtimeSessionId: `${runtimeName}-session`,
+        };
+        yield {
+          kind: "activity",
+          activity: {
+            type: "response",
+            body:
+              turn === 1
+                ? '<linear_autonomous_result>{"status":"continue","message":"Implementation is in place; running the remaining checks."}</linear_autonomous_result>'
+                : '<linear_autonomous_result>{"status":"completed","message":"The issue is finished.","verification":"Typecheck and focused tests passed."}</linear_autonomous_result>',
+          },
+        };
+        yield { kind: "done" };
+      }, runtimeName);
+      activeHarness = await startTestServer(runtime, {
+        configOverrides: {
+          runtime: runtimeName as "claude" | "codex",
+          autonomousGoalLabelId: labelId,
+          autonomousGoalMaxSteps: 4,
+        },
+        linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+      });
+      const harness = activeHarness;
+      const payload = createdPayload(
+        `goal-${runtimeName}-delivery`,
+        `goal-${runtimeName}-session`,
+      );
+
+      const response = await postSignedWebhook(harness, payload);
+      expect(response.status).toBe(200);
+      await response.text();
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getAutonomousGoal(
+            `goal-${runtimeName}-session`,
+          ))?.status === "completed",
+      );
+
+      expect(runtime.requests).toHaveLength(2);
+      expect(runtime.requests[0]?.prompt).toContain(
+        "AUTONOMOUS EXECUTION CONTRACT",
+      );
+      expect(runtime.requests[0]?.prompt).not.toContain("/goal");
+      expect(runtime.requests[1]?.resumeSessionId).toBe(
+        `${runtimeName}-session`,
+      );
+      expect(
+        harness.calls.some(
+          (call) =>
+            call.content.type === "thought" &&
+            call.content.body.includes("running the remaining checks"),
+        ),
+      ).toBe(true);
+      expect(
+        harness.calls.some(
+          (call) =>
+            call.content.type === "response" &&
+            call.content.body.includes("Typecheck and focused tests passed"),
+        ),
+      ).toBe(true);
+      expect(linear.completionCalls).toBe(1);
+
+      const duplicate = await postSignedWebhook(harness, payload);
+      expect(duplicate.status).toBe(200);
+      await duplicate.text();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(runtime.requests).toHaveLength(2);
+      expect(linear.completionCalls).toBe(1);
+    },
+  );
+
+  it("keeps one-turn behavior when the configured label is absent", async () => {
+    const linear = control({ authorized: false });
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "unlabeled-runtime" };
+      yield {
+        kind: "activity",
+        activity: { type: "response", body: "Handled as one ordinary turn." },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const response = await postSignedWebhook(
+      harness,
+      createdPayload("goal-unlabeled-created", "goal-unlabeled-session"),
+    );
+    await response.text();
+    await waitFor(() => runtime.requests.length === 1);
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-unlabeled-session"))
+          ?.status === "declined",
+    );
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt("goal-unlabeled-created"))
+          ?.status === "completed",
+    );
+
+    expect(runtime.requests[0]?.prompt).toBe(
+      "Implement and verify the assigned issue.",
+    );
+    expect(runtime.requests[0]?.prompt).not.toContain(
+      "AUTONOMOUS EXECUTION CONTRACT",
+    );
+    expect(linear.completionCalls).toBe(0);
+  });
+
+  it("emits one elicitation when blocked and resumes only after a user prompt", async () => {
+    const linear = control();
+    let turn = 0;
+    const runtime = new FakeRuntime(async function* () {
+      turn += 1;
+      yield { kind: "session-started", runtimeSessionId: "blocked-runtime" };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            turn === 1
+              ? '<linear_autonomous_result>{"status":"blocked","message":"Which deployment environment should I use?"}</linear_autonomous_result>'
+              : '<linear_autonomous_result>{"status":"completed","message":"Deployment configuration is complete.","verification":"The staging configuration test passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-blocked-created", "goal-blocked-session"),
+    );
+    await created.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-blocked-session"))
+          ?.status === "blocked",
+    );
+    await waitFor(() =>
+      harness.calls.some((call) => call.content.type === "elicitation"),
+    );
+    expect(runtime.requests).toHaveLength(1);
+    expect(
+      harness.calls.filter((call) => call.content.type === "elicitation"),
+    ).toEqual([
+      {
+        agentSessionId: "goal-blocked-session",
+        content: {
+          type: "elicitation",
+          body: "Which deployment environment should I use?",
+        },
+      },
+    ]);
+
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-blocked-answer",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-blocked-session",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Ship the fix",
+        },
+      },
+      agentActivity: {
+        id: "goal-blocked-answer-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "Use staging." },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-blocked-session"))
+          ?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(2);
+    expect(runtime.requests[1]?.prompt).toContain("Use staging.");
+    expect(linear.completionCalls).toBe(1);
+  });
+
+  it("yields autonomous continuation to guidance already waiting in the FIFO lane", async () => {
+    const linear = control();
+    const firstTurnStarted = createDeferred<void>();
+    const releaseFirstTurn = createDeferred<void>();
+    let turn = 0;
+    const runtime = new FakeRuntime(async function* () {
+      turn += 1;
+      yield { kind: "session-started", runtimeSessionId: "guided-runtime" };
+      if (turn === 1) {
+        firstTurnStarted.resolve();
+        await releaseFirstTurn.promise;
+      }
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            turn === 1
+              ? '<linear_autonomous_result>{"status":"continue","message":"Ready for the next unit."}</linear_autonomous_result>'
+              : '<linear_autonomous_result>{"status":"completed","message":"Applied the user guidance.","verification":"The guided fixture passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-guided-created", "goal-guided-session"),
+    );
+    await created.text();
+    await firstTurnStarted.promise;
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-guided-prompt",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-guided-session",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Ship the fix",
+        },
+      },
+      agentActivity: {
+        id: "goal-guided-prompt-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "Use the safer migration path." },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    releaseFirstTurn.resolve();
+
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-guided-session"))
+          ?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(2);
+    expect(runtime.requests[1]?.prompt).toContain(
+      "Use the safer migration path.",
+    );
+    expect(linear.completionCalls).toBe(1);
+  });
+
+  it("does not complete before guidance queued during a completed provider turn", async () => {
+    const linear = control();
+    const firstTurnStarted = createDeferred<void>();
+    const releaseFirstTurn = createDeferred<void>();
+    const guidedTurnStarted = createDeferred<void>();
+    const releaseGuidedTurn = createDeferred<void>();
+    let turn = 0;
+    const runtime = new FakeRuntime(async function* () {
+      turn += 1;
+      yield { kind: "session-started", runtimeSessionId: "completion-guided" };
+      if (turn === 1) {
+        firstTurnStarted.resolve();
+        await releaseFirstTurn.promise;
+      } else {
+        guidedTurnStarted.resolve();
+        await releaseGuidedTurn.promise;
+      }
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            turn === 1
+              ? '<linear_autonomous_result>{"status":"completed","message":"Initial work is complete.","verification":"Initial checks passed."}</linear_autonomous_result>'
+              : '<linear_autonomous_result>{"status":"completed","message":"The added requirement is complete.","verification":"The guided checks passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-completed-guidance-created", "goal-completed-guidance"),
+    );
+    await created.text();
+    await firstTurnStarted.promise;
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-completed-guidance-prompt",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-completed-guidance",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Ship the fix",
+        },
+      },
+      agentActivity: {
+        id: "goal-completed-guidance-prompt-activity",
+        createdAt: new Date().toISOString(),
+        content: {
+          type: "prompt",
+          body: "Also cover the missing acceptance requirement.",
+        },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    releaseFirstTurn.resolve();
+    await guidedTurnStarted.promise;
+
+    expect(linear.completionCalls).toBe(0);
+    expect(runtime.requests[1]?.prompt).toContain(
+      "Also cover the missing acceptance requirement.",
+    );
+
+    releaseGuidedTurn.resolve();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal(
+          "goal-completed-guidance",
+        ))?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(2);
+    expect(linear.completionCalls).toBe(1);
+  });
+
+  it("atomically yields completion when guidance is claimed at the dispatch boundary", async () => {
+    const linear = control();
+    const completionDispatchEntered = createDeferred<void>();
+    const releaseCompletionDispatch = createDeferred<void>();
+    let turn = 0;
+    const runtime = new FakeRuntime(async function* () {
+      turn += 1;
+      yield {
+        kind: "session-started",
+        runtimeSessionId: "completion-dispatch-guidance",
+      };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            turn === 1
+              ? '<linear_autonomous_result>{"status":"completed","message":"Initial work is complete.","verification":"Initial checks passed."}</linear_autonomous_result>'
+              : '<linear_autonomous_result>{"status":"blocked","message":"Please confirm the added requirement."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+    const originalDispatch =
+      harness.bridgeState.beginAutonomousGoalCompletionDispatch.bind(
+        harness.bridgeState,
+      );
+    harness.bridgeState.beginAutonomousGoalCompletionDispatch = async (
+      linearSessionId,
+    ) => {
+      completionDispatchEntered.resolve();
+      await releaseCompletionDispatch.promise;
+      return await originalDispatch(linearSessionId);
+    };
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload(
+        "goal-dispatch-guidance-created",
+        "goal-dispatch-guidance",
+      ),
+    );
+    await created.text();
+    await completionDispatchEntered.promise;
+
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-dispatch-guidance-prompt",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-dispatch-guidance",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Ship the fix",
+        },
+      },
+      agentActivity: {
+        id: "goal-dispatch-guidance-prompt-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "Add the newly supplied requirement." },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    await expect(
+      harness.bridgeState.getAutonomousGoal("goal-dispatch-guidance"),
+    ).resolves.toMatchObject({
+      status: "completing",
+      pendingGuidanceIds: ["goal-dispatch-guidance-prompt-activity"],
+    });
+
+    releaseCompletionDispatch.resolve();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal(
+          "goal-dispatch-guidance",
+        ))?.status === "blocked",
+    );
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt(
+          "goal-dispatch-guidance-prompt",
+        ))?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(2);
+    expect(runtime.requests[1]?.prompt).toContain(
+      "Add the newly supplied requirement.",
+    );
+    expect(linear.completionCalls).toBe(0);
+  });
+
+  it("retries a failed issue completion after guidance and emits one final response", async () => {
+    const linear = control({ completionFailuresRemaining: 1 });
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "completion-retry" };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            '<linear_autonomous_result>{"status":"completed","message":"The work is complete.","verification":"The completion fixture passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-completion-retry-created", "goal-completion-retry"),
+    );
+    await created.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-completion-retry"))
+          ?.status === "blocked",
+    );
+    await waitFor(() =>
+      harness.calls.some(
+        (call) =>
+          call.content.type === "elicitation" &&
+          call.content.body.includes("could not move the issue"),
+      ),
+    );
+
+    const prompted = await postSignedWebhook(harness, {
+      webhookId: "goal-completion-retry-answer",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: {
+        id: "goal-completion-retry",
+        issue: {
+          id: linear.issueId,
+          identifier: linear.issueIdentifier,
+          title: "Ship the fix",
+        },
+      },
+      agentActivity: {
+        id: "goal-completion-retry-answer-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "Retry the Linear update." },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await prompted.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-completion-retry"))
+          ?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(1);
+    expect(linear.completionCalls).toBe(2);
+    expect(
+      harness.calls.filter((call) => call.content.type === "response"),
+    ).toEqual([
+      {
+        agentSessionId: "goal-completion-retry",
+        content: {
+          type: "response",
+          body: "Completed and verified. The issue has been moved to its completed workflow state.",
+        },
+      },
+    ]);
+  });
+
+  it("pauses at the configured step cap without consuming another provider turn", async () => {
+    const linear = control();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "capped-runtime" };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            '<linear_autonomous_result>{"status":"continue","message":"One bounded unit is complete."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: {
+        autonomousGoalLabelId: labelId,
+        autonomousGoalMaxSteps: 1,
+      },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const response = await postSignedWebhook(
+      harness,
+      createdPayload("goal-capped-created", "goal-capped-session"),
+    );
+    await response.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-capped-session"))
+          ?.status === "blocked",
+    );
+    await waitFor(() =>
+      harness.calls.some((call) => call.content.type === "elicitation"),
+    );
+
+    expect(runtime.requests).toHaveLength(1);
+    expect(
+      harness.calls.some(
+        (call) =>
+          call.content.type === "elicitation" &&
+          call.content.body.includes("autonomous-step limit"),
+      ),
+    ).toBe(true);
+    expect(linear.completionCalls).toBe(0);
+  });
+
+  it("a Linear stop durably halts an active goal and prevents issue completion", async () => {
+    const linear = control();
+    const runtimeStarted = createDeferred<void>();
+    const runtime = new FakeRuntime(async function* (request) {
+      yield { kind: "session-started", runtimeSessionId: "stopped-runtime" };
+      runtimeStarted.resolve();
+      await new Promise<void>((resolve) => {
+        request.abortController?.signal.addEventListener("abort", () => resolve(), {
+          once: true,
+        });
+      });
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-stop-created", "goal-stop-session"),
+    );
+    await created.text();
+    await runtimeStarted.promise;
+    const stopCreatedAt = new Date().toISOString();
+    const stopped = await postSignedWebhook(harness, {
+      webhookId: "goal-stop-delivery",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "goal-stop-session" },
+      agentActivity: {
+        id: "goal-stop-activity",
+        createdAt: stopCreatedAt,
+        content: { type: "prompt", body: "", signal: "stop" },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await stopped.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-stop-session"))
+          ?.status === "stopped",
+    );
+    await waitFor(
+      () => runtime.requests[0]?.abortController?.signal.aborted === true,
+    );
+
+    expect(runtime.requests).toHaveLength(1);
+    expect(runtime.requests[0]?.abortController?.signal.aborted).toBe(true);
+    expect(linear.completionCalls).toBe(0);
+  });
+
+  it("does not dispatch issue completion after a stop persisted during the label query", async () => {
+    const linear = control();
+    const completionQueryStarted = createDeferred<void>();
+    const releaseCompletionQuery = createDeferred<void>();
+    let issueQueryCount = 0;
+    let heldStopWork: (() => void) | undefined;
+    let scheduledWorkCount = 0;
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "stop-completion" };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            '<linear_autonomous_result>{"status":"completed","message":"Work complete.","verification":"The fixture passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => {
+        const fetch = autonomousLinearFetch(calls, linear);
+        return async (url, init) => {
+          const parsed = JSON.parse(init?.body as string) as { query: string };
+          if (parsed.query.includes("query AutonomousGoalIssue")) {
+            issueQueryCount += 1;
+            if (issueQueryCount === 4) {
+              completionQueryStarted.resolve();
+              await releaseCompletionQuery.promise;
+            }
+          }
+          return await fetch(url, init);
+        };
+      },
+      schedulePostResponseWork: (work) => {
+        scheduledWorkCount += 1;
+        if (scheduledWorkCount === 1) {
+          setImmediate(work);
+        } else {
+          heldStopWork = work;
+        }
+      },
+    });
+    const harness = activeHarness;
+
+    const created = await postSignedWebhook(
+      harness,
+      createdPayload("goal-stop-completion-created", "goal-stop-completion"),
+    );
+    await created.text();
+    await completionQueryStarted.promise;
+
+    const stopped = await postSignedWebhook(harness, {
+      webhookId: "goal-stop-completion-stop",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "goal-stop-completion" },
+      agentActivity: {
+        id: "goal-stop-completion-stop-activity",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "", signal: "stop" },
+      },
+      webhookTimestamp: Date.now(),
+    });
+    await stopped.text();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-stop-completion"))
+          ?.status === "stopped",
+    );
+    expect(heldStopWork).toBeDefined();
+
+    releaseCompletionQuery.resolve();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt("goal-stop-completion-created"))
+          ?.status === "completed",
+    );
+    expect(linear.completionCalls).toBe(0);
+
+    heldStopWork!();
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getReceipt("goal-stop-completion-stop"))
+          ?.status === "completed",
+    );
+  });
+
+  it("recovers an active goal after restart and completes it once", async () => {
+    const linear = control();
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "session-started", runtimeSessionId: "recovered-runtime" };
+      yield {
+        kind: "activity",
+        activity: {
+          type: "response",
+          body:
+            '<linear_autonomous_result>{"status":"completed","message":"Recovered work is complete.","verification":"Recovery fixture passed."}</linear_autonomous_result>',
+        },
+      };
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, { ownerId: "prior" });
+        await prior.prepareAutonomousGoal({
+          linearSessionId: "goal-restart-active",
+          // Reconciled session payloads carry only the human identifier here;
+          // completion must use the canonical UUID returned by the issue read.
+          issueId: linear.issueIdentifier,
+          issueIdentifier: linear.issueIdentifier,
+          runtime: "claude",
+        });
+        await prior.activateAutonomousGoal("goal-restart-active");
+      },
+    });
+    const harness = activeHarness;
+
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal("goal-restart-active"))
+          ?.status === "completed",
+    );
+
+    expect(runtime.requests).toHaveLength(1);
+    expect(runtime.requests[0]?.prompt).toContain("Resume autonomous work");
+    expect(linear.completionCalls).toBe(1);
+  });
+
+  it.each(["active", "completing"] as const)(
+    "reconciles a stop sent during downtime before recovering a %s goal",
+    async (status) => {
+      const linear = control();
+      const runtime = new FakeRuntime(async function* () {
+        yield { kind: "done" };
+      }, "claude");
+      const stopCreatedAt = new Date(Date.now() + 1_000).toISOString();
+      activeHarness = await startTestServer(runtime, {
+        configOverrides: { autonomousGoalLabelId: labelId },
+        linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+        reconciliationFetchImpl: async (_url, init) => {
+          const parsed = JSON.parse(init?.body as string) as { query: string };
+          if (parsed.query.includes("ReconciliationAgentSessionActivities")) {
+            return jsonResponse({
+              data: {
+                agentSession: {
+                  id: `goal-downtime-stop-${status}`,
+                  createdAt: "2026-09-18T12:00:00.000Z",
+                  appUser: { id: "app-user-test" },
+                  issue: { identifier: linear.issueIdentifier },
+                  activities: {
+                    nodes: [
+                      {
+                        id: `goal-downtime-stop-${status}-activity`,
+                        createdAt: stopCreatedAt,
+                        signal: "stop",
+                        user: { id: "human-user" },
+                        content: {
+                          __typename: "AgentActivityPromptContent",
+                          body: "",
+                        },
+                      },
+                    ],
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                  },
+                },
+              },
+            });
+          }
+          return jsonResponse({
+            data: {
+              viewer: { id: "app-user-test" },
+              agentSessions: {
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          });
+        },
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, { ownerId: "prior" });
+          const sessionId = `goal-downtime-stop-${status}`;
+          await prior.prepareAutonomousGoal({
+            linearSessionId: sessionId,
+            issueId: linear.issueId,
+            issueIdentifier: linear.issueIdentifier,
+            runtime: "claude",
+          });
+          await prior.activateAutonomousGoal(sessionId);
+          if (status === "completing") {
+            await prior.beginAutonomousGoalStep(sessionId);
+            await prior.beginAutonomousGoalCompletion(
+              sessionId,
+              "state-done",
+              "goal-step-1-completion",
+            );
+          }
+        },
+      });
+      const harness = activeHarness;
+
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getAutonomousGoal(
+            `goal-downtime-stop-${status}`,
+          ))?.status === "stopped",
+      );
+
+      expect(runtime.requests).toHaveLength(0);
+      expect(linear.completionCalls).toBe(0);
+    },
+  );
+
+  it("reconciles a newer downtime stop before recovered goal guidance can run", async () => {
+    const linear = control();
+    const activityQueryStarted = createDeferred<void>();
+    const releaseActivityQuery = createDeferred<void>();
+    const sessionId = "goal-recovered-guidance-stop";
+    const guidanceCreatedAt = "2026-09-18T12:00:01.000Z";
+    const stopCreatedAt = "2026-09-18T12:00:02.000Z";
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" };
+    }, "claude");
+    activeHarness = await startTestServer(runtime, {
+      awaitReady: false,
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+      reconciliationFetchImpl: async (_url, init) => {
+        const parsed = JSON.parse(init?.body as string) as { query: string };
+        if (parsed.query.includes("ReconciliationAgentSessionActivities")) {
+          activityQueryStarted.resolve();
+          await releaseActivityQuery.promise;
+          return jsonResponse({
+            data: {
+              agentSession: {
+                id: sessionId,
+                createdAt: "2026-09-18T12:00:00.000Z",
+                appUser: { id: "app-user-test" },
+                issue: { identifier: linear.issueIdentifier },
+                activities: {
+                  nodes: [
+                    {
+                      id: `${sessionId}-stop`,
+                      createdAt: stopCreatedAt,
+                      signal: "stop",
+                      user: { id: "human-user" },
+                      content: {
+                        __typename: "AgentActivityPromptContent",
+                        body: "",
+                      },
+                    },
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          });
+        }
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-test" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      },
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, {
+          ownerId: "prior",
+          recoveryKeyring: createIngressRecoveryKeyring(INGRESS_RECOVERY_KEY),
+        });
+        await prior.prepareAutonomousGoal({
+          linearSessionId: sessionId,
+          issueId: linear.issueId,
+          issueIdentifier: linear.issueIdentifier,
+          runtime: "claude",
+        });
+        await prior.activateAutonomousGoal(sessionId);
+        await prior.claimEvent(
+          {
+            webhookId: `${sessionId}-guidance-delivery`,
+            executionId: `${sessionId}-guidance`,
+            linearSessionId: sessionId,
+            action: "prompted",
+          },
+          {
+            action: "prompted",
+            prompt: "Recovered guidance that predates the stop.",
+            occurredAt: guidanceCreatedAt,
+            stop: false,
+          },
+        );
+      },
+    });
+    const harness = activeHarness;
+
+    await activityQueryStarted.promise;
+    expect(runtime.requests).toHaveLength(0);
+    expect(linear.completionCalls).toBe(0);
+
+    releaseActivityQuery.resolve();
+    await harness.ready;
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal(sessionId))?.status ===
+        "stopped",
+    );
+
+    expect(runtime.requests).toHaveLength(0);
+    expect(linear.completionCalls).toBe(0);
+    await expect(
+      harness.bridgeState.getReceipt(`${sessionId}-guidance-delivery`),
+    ).resolves.toMatchObject({ status: "superseded" });
+  });
+
+  it("keeps recovered goal guidance unavailable when its startup preflight fails", async () => {
+    const linear = control();
+    const sessionId = "goal-recovered-guidance-preflight-failure";
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" };
+    }, "claude");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      activeHarness = await startTestServer(runtime, {
+        awaitReady: false,
+        configOverrides: { autonomousGoalLabelId: labelId },
+        linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+        reconciliationFetchImpl: async (_url, init) => {
+          const parsed = JSON.parse(init?.body as string) as { query: string };
+          if (parsed.query.includes("ReconciliationAgentSessionActivities")) {
+            throw new Error("synthetic activity query failure");
+          }
+          return jsonResponse({
+            data: {
+              viewer: { id: "app-user-test" },
+              agentSessions: {
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          });
+        },
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, {
+            ownerId: "prior",
+            recoveryKeyring: createIngressRecoveryKeyring(
+              INGRESS_RECOVERY_KEY,
+            ),
+          });
+          await prior.prepareAutonomousGoal({
+            linearSessionId: sessionId,
+            issueId: linear.issueId,
+            issueIdentifier: linear.issueIdentifier,
+            runtime: "claude",
+          });
+          await prior.activateAutonomousGoal(sessionId);
+          await prior.claimEvent(
+            {
+              webhookId: `${sessionId}-guidance-delivery`,
+              executionId: `${sessionId}-guidance`,
+              linearSessionId: sessionId,
+              action: "prompted",
+            },
+            {
+              action: "prompted",
+              prompt: "Recovered guidance behind an unverified downtime window.",
+              occurredAt: "2026-09-18T12:00:01.000Z",
+              stop: false,
+            },
+          );
+        },
+      });
+      const harness = activeHarness;
+
+      await expect(harness.ready).rejects.toThrow(
+        "synthetic activity query failure",
+      );
+      expect(runtime.requests).toHaveLength(0);
+      expect(linear.completionCalls).toBe(0);
+      await expect(
+        harness.bridgeState.getReceipt(`${sessionId}-guidance-delivery`),
+      ).resolves.toMatchObject({ status: "claimed" });
+      expect(
+        errorSpy.mock.calls.some((call) =>
+          call.join(" ").includes("autonomous goal recovery preflight failed"),
+        ),
+      ).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("reconciles a completion activity after restart without duplicating it", async () => {
+    const linear = control({ completed: true });
+    const runtime = new FakeRuntime(async function* () {
+      yield { kind: "done" };
+    }, "claude");
+    let existingActivityId: string | undefined;
+    activeHarness = await startTestServer(runtime, {
+      configOverrides: { autonomousGoalLabelId: labelId },
+      linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+      reconciliationFetchImpl: async (_url, init) => {
+        const parsed = JSON.parse(init?.body as string) as { query: string };
+        if (parsed.query.includes("ReconciliationAgentSessionActivities")) {
+          return jsonResponse({
+            data: {
+              agentSession: {
+                id: "goal-restart-completion",
+                createdAt: "2026-09-18T12:00:00.000Z",
+                appUser: { id: "app-user-test" },
+                activities: {
+                  nodes: [
+                    {
+                      id: existingActivityId,
+                      createdAt: new Date(Date.now() + 1_000).toISOString(),
+                      signal: null,
+                      user: null,
+                      content: { __typename: "AgentActivityResponseContent" },
+                    },
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          });
+        }
+        return jsonResponse({
+          data: {
+            viewer: { id: "app-user-test" },
+            agentSessions: {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        });
+      },
+      prepareBridgeState: async (storePath) => {
+        const prior = new JsonBridgeStateStore(storePath, { ownerId: "prior" });
+        await prior.prepareAutonomousGoal({
+          linearSessionId: "goal-restart-completion",
+          issueId: linear.issueId,
+          issueIdentifier: linear.issueIdentifier,
+          runtime: "claude",
+        });
+        await prior.activateAutonomousGoal("goal-restart-completion");
+        await prior.beginAutonomousGoalStep("goal-restart-completion");
+        await prior.beginAutonomousGoalCompletion(
+          "goal-restart-completion",
+          "state-done",
+          "goal-step-1-completion",
+        );
+        existingActivityId =
+          await prior.getOrCreateAutonomousGoalActivityId(
+            "goal-restart-completion",
+            "goal-step-1-completion",
+          );
+      },
+    });
+    const harness = activeHarness;
+
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getAutonomousGoal(
+          "goal-restart-completion",
+        ))?.status === "completed",
+    );
+
+    expect(existingActivityId).toBeDefined();
+    expect(runtime.requests).toHaveLength(0);
+    expect(linear.completionCalls).toBe(0);
+    expect(harness.calls).toHaveLength(0);
+  });
+
+  it("pauses an in-flight crash record and a provider switch instead of replaying", async () => {
+    for (const scenario of ["crash", "provider-switch"] as const) {
+      await activeHarness?.close();
+      activeHarness = undefined;
+      const linear = control();
+      const runtime = new FakeRuntime(async function* () {
+        yield { kind: "done" };
+      }, scenario === "crash" ? "claude" : "codex");
+      activeHarness = await startTestServer(runtime, {
+        configOverrides: {
+          runtime: scenario === "crash" ? "claude" : "codex",
+          autonomousGoalLabelId: labelId,
+        },
+        linearFetchImpl: (calls) => autonomousLinearFetch(calls, linear),
+        prepareBridgeState: async (storePath) => {
+          const prior = new JsonBridgeStateStore(storePath, { ownerId: "prior" });
+          await prior.prepareAutonomousGoal({
+            linearSessionId: `goal-${scenario}`,
+            issueId: linear.issueId,
+            issueIdentifier: linear.issueIdentifier,
+            runtime: "claude",
+          });
+          await prior.activateAutonomousGoal(`goal-${scenario}`);
+          if (scenario === "crash") {
+            await prior.beginAutonomousGoalStep(`goal-${scenario}`);
+          }
+        },
+      });
+      const harness = activeHarness;
+
+      await waitFor(
+        async () =>
+          (await harness.bridgeState.getAutonomousGoal(`goal-${scenario}`))
+            ?.status === "blocked",
+      );
+      await waitFor(() =>
+        harness.calls.some((call) => call.content.type === "elicitation"),
+      );
+      expect(runtime.requests).toHaveLength(0);
+      expect(
+        harness.calls.some((call) => call.content.type === "elicitation"),
+      ).toBe(true);
+      expect(linear.completionCalls).toBe(0);
+    }
+  });
 });
 
 describe("startServer", () => {
