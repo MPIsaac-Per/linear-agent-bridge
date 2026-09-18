@@ -123,8 +123,9 @@ Linear supplies automatically:
 1. **Authorizing:** after the Agent Session ingress claim reaches its durable
    dispatch boundary, persist the session/issue/runtime goal record, read the
    issue, and activate only if the configured label is present and the issue is
-   not already completed. Store identifiers and counters, never prompt or
-   runtime-response text.
+   not already completed. Preserve the opening objective only in a
+   recovery-key AES-GCM envelope so guidance that races goal preparation cannot
+   replace it; never store prompt or runtime-response text in plaintext.
 2. **Active:** start one provider turn for that session. Emit a prompt-safe
    thought within Linear's ten-second `created` liveness window. Persist every
    runtime-session mapping and lifecycle transition before scheduling the next
@@ -145,21 +146,25 @@ Linear supplies automatically:
    continuation or issue-completion mutation may begin after that fence.
 6. **Completing:** require a structured `completed` result with a nonempty
    verification summary, recheck the label and issue state, persist the target
-   completed workflow state and pending response key, then apply the idempotent
-   issue-state update. Before emitting the final response, query the stable
-   caller-generated activity ID; this reconciles a crash between the two Linear
-   writes without duplicating the response. A separate durable completion
-   dispatch boundary after the label query prevents a stop that already won its
-   state transaction from being followed by `issueUpdate`.
+   completed workflow state, pending response key, and exact response body in
+   an authenticated recovery envelope, then apply the idempotent issue-state
+   update. Before emitting the final response, query the stable caller-generated
+   activity ID; this reconciles a crash between the two Linear writes without
+   duplicating the response. A separate durable completion dispatch boundary
+   after the label query prevents a stop that already won its state transaction
+   from being followed by `issueUpdate`.
 7. **Restart:** resume `active`, `authorizing`, and `completing` boundaries.
-   Recover pending activities by stable ID. A goal found `running` belonged to
-   an interrupted provider turn with unknown side effects, so block and ask the
-   user instead of replaying it. A provider mismatch is handled the same way.
-   Before accepted ingress recovery, any recovery turn, or a completion update
-   can restart autonomous work, reconcile that session's activities so a stop
-   or guidance message sent during downtime runs first. If a goal-session
-   preflight cannot read Linear activity, keep startup unready rather than
-   dispatching accepted work through an unverified downtime window.
+   Recover pending activities by stable ID and decrypt the exact notice only
+   when Linear does not already contain that activity. A goal found `running`
+   belonged to an interrupted provider turn with unknown side effects, so
+   persist its blocked state and encrypted elicitation before reconciling
+   downtime ingress. Emit the elicitation before processing any recovered
+   guidance instead of replaying the interrupted turn. A provider mismatch is
+   handled the same way. Before accepted ingress recovery, any recovery turn,
+   or a completion update can restart autonomous work, reconcile that session's
+   activities so a stop or guidance message sent during downtime wins. If a
+   goal-session preflight cannot read Linear activity, keep startup unready
+   rather than dispatching accepted work through an unverified downtime window.
 
 The existing bridge's durable ingress claims, per-session FIFO lanes, stop
 fences, provider-session guard, and restart recovery remain the required

@@ -8,10 +8,16 @@ import { promisify } from "node:util";
 import {
   IngressRecoveryEnvelopeError,
   isCanonicalRecoveryTimestamp,
+  openAutonomousGoalObjective,
+  openAutonomousGoalNotice,
   openIngressRecoveryPayload,
+  sealAutonomousGoalObjective,
+  sealAutonomousGoalNotice,
   sealIngressRecoveryPayload,
   type IngressRecoveryKeyring,
   type IngressRecoveryPayload,
+  type SealedAutonomousGoalObjectiveEnvelope,
+  type SealedAutonomousGoalNoticeEnvelope,
   type SealedIngressRecoveryEnvelope,
 } from "./recovery-envelope.js";
 
@@ -105,6 +111,7 @@ export interface IngressClaim {
   ownerId: string;
   claimedAt: string;
   updatedAt: string;
+  recoverySequence?: number | undefined;
   dispatchStartedAt?: string | undefined;
   activityIds: Record<string, string>;
 }
@@ -137,6 +144,7 @@ export type AutonomousGoalStatus =
 export interface AutonomousGoalPendingNotice {
   kind: "elicitation" | "completion";
   activityKey: string;
+  envelope: SealedAutonomousGoalNoticeEnvelope;
 }
 
 /**
@@ -148,6 +156,7 @@ export interface AutonomousGoalState {
   issueId: string;
   issueIdentifier?: string | undefined;
   runtime: string;
+  objectiveEnvelope?: SealedAutonomousGoalObjectiveEnvelope | undefined;
   status: AutonomousGoalStatus;
   step: number;
   stepsSinceGuidance: number;
@@ -164,6 +173,7 @@ export interface AutonomousGoalState {
 
 export type AutonomousGoalStepResult =
   | { disposition: "started"; goal: AutonomousGoalState }
+  | { disposition: "guidance_pending"; goal: AutonomousGoalState }
   | { disposition: "not_active"; goal: AutonomousGoalState | undefined };
 
 export type ClaimEventResult =
@@ -247,6 +257,8 @@ export interface BridgeStateStore {
     issueId: string;
     issueIdentifier?: string | undefined;
     runtime: string;
+    openingRecoverySequence: number;
+    objective: string;
   }): Promise<AutonomousGoalState>;
   activateAutonomousGoal(linearSessionId: string): Promise<AutonomousGoalState>;
   declineAutonomousGoal(linearSessionId: string): Promise<AutonomousGoalState>;
@@ -257,10 +269,15 @@ export interface BridgeStateStore {
   beginAutonomousGoalStep(
     linearSessionId: string,
   ): Promise<AutonomousGoalStepResult>;
+  beginAutonomousGoalGuidanceStep(
+    linearSessionId: string,
+  ): Promise<AutonomousGoalStepResult>;
   continueAutonomousGoal(linearSessionId: string): Promise<AutonomousGoalState>;
   blockAutonomousGoal(
     linearSessionId: string,
     activityKey: string,
+    body: string,
+    guidanceExecutionId?: string,
   ): Promise<AutonomousGoalState>;
   resumeAutonomousGoal(
     linearSessionId: string,
@@ -270,6 +287,7 @@ export interface BridgeStateStore {
     linearSessionId: string,
     completionStateId: string,
     activityKey: string,
+    body: string,
   ): Promise<AutonomousGoalState>;
   beginAutonomousGoalCompletionDispatch(
     linearSessionId: string,
@@ -282,6 +300,13 @@ export interface BridgeStateStore {
     linearSessionId: string,
     activityKey: string,
   ): Promise<AutonomousGoalState>;
+  getAutonomousGoalPendingNoticeBody(
+    linearSessionId: string,
+    activityKey: string,
+  ): Promise<string | undefined>;
+  getAutonomousGoalObjective(
+    linearSessionId: string,
+  ): Promise<string | undefined>;
   getOrCreateAutonomousGoalActivityId(
     linearSessionId: string,
     activityKey: string,
@@ -741,6 +766,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         existingClaim.ownerId = this.ownerId;
         existingClaim.claimedAt = timestamp;
         existingClaim.updatedAt = timestamp;
+        if (receipt.recoverySequence !== undefined) {
+          existingClaim.recoverySequence = receipt.recoverySequence;
+        }
         delete existingClaim.dispatchStartedAt;
         await this.writeState(state);
         return { disposition: "claimed", receipt };
@@ -795,6 +823,9 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       ownerId: this.ownerId,
       claimedAt: timestamp,
       updatedAt: timestamp,
+      ...(receipt.recoverySequence !== undefined
+        ? { recoverySequence: receipt.recoverySequence }
+        : {}),
       activityIds: {},
     };
     this.recordAutonomousGuidanceInState(
@@ -1321,12 +1352,20 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     issueId: string;
     issueIdentifier?: string | undefined;
     runtime: string;
+    openingRecoverySequence: number;
+    objective: string;
   }): Promise<AutonomousGoalState> {
     validateIdentifier(input.linearSessionId, "linearSessionId");
     validateIdentifier(input.issueId, "issueId");
     validateIdentifier(input.runtime, "runtime");
     if (input.issueIdentifier !== undefined) {
       validateIdentifier(input.issueIdentifier, "issueIdentifier");
+    }
+    if (
+      !Number.isSafeInteger(input.openingRecoverySequence) ||
+      input.openingRecoverySequence <= 0
+    ) {
+      throw new IngressRecoveryEnvelopeError();
     }
     return this.mutate(async () => {
       const state = await this.readState();
@@ -1342,6 +1381,42 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         return copyAutonomousGoal(existing);
       }
       const timestamp = this.timestamp();
+      if (this.recoveryKeyring === undefined) {
+        throw new IngressRecoveryEnvelopeError();
+      }
+      const stopFence = state.recoveryStopFences?.[input.linearSessionId];
+      const stoppedBeforePreparation =
+        stopFence !== undefined &&
+        stopFence.sequence > input.openingRecoverySequence;
+      const pendingGuidance = stoppedBeforePreparation
+        ? []
+        : Object.values(state.claims)
+            .filter(
+              (claim) =>
+                claim.linearSessionId === input.linearSessionId &&
+                claim.action === "prompted" &&
+                claim.status === "claimed",
+            )
+            .map((claim) => ({
+              claim,
+              sequence: claim.recoverySequence,
+            }))
+            .filter(
+              (
+                candidate,
+              ): candidate is { claim: IngressClaim; sequence: number } =>
+                candidate.sequence !== undefined &&
+                Number.isSafeInteger(candidate.sequence) &&
+                candidate.sequence > input.openingRecoverySequence,
+            )
+            .sort(
+              (left, right) =>
+                left.sequence - right.sequence ||
+                left.claim.executionId.localeCompare(right.claim.executionId),
+            );
+      if (pendingGuidance.length > MAX_ACTIVITY_IDS_PER_CLAIM) {
+        throw new Error("Too many pending autonomous goal guidance activities");
+      }
       const goal: AutonomousGoalState = {
         linearSessionId: input.linearSessionId,
         issueId: input.issueId,
@@ -1349,12 +1424,22 @@ export class JsonBridgeStateStore implements BridgeStateStore {
           ? { issueIdentifier: input.issueIdentifier }
           : {}),
         runtime: input.runtime,
-        status: "authorizing",
+        objectiveEnvelope: sealAutonomousGoalObjective(
+          this.recoveryKeyring,
+          {
+            linearSessionId: input.linearSessionId,
+            issueId: input.issueId,
+          },
+          input.objective,
+        ),
+        status: stoppedBeforePreparation ? "stopped" : "authorizing",
         step: 0,
         stepsSinceGuidance: 0,
         createdAt: timestamp,
         updatedAt: timestamp,
-        pendingGuidanceIds: [],
+        pendingGuidanceIds: pendingGuidance.map(
+          ({ claim }) => claim.executionId,
+        ),
         activityIds: {},
       };
       goals[input.linearSessionId] = goal;
@@ -1416,6 +1501,19 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   beginAutonomousGoalStep(
     linearSessionId: string,
   ): Promise<AutonomousGoalStepResult> {
+    return this.beginAutonomousGoalStepInState(linearSessionId, false);
+  }
+
+  beginAutonomousGoalGuidanceStep(
+    linearSessionId: string,
+  ): Promise<AutonomousGoalStepResult> {
+    return this.beginAutonomousGoalStepInState(linearSessionId, true);
+  }
+
+  private beginAutonomousGoalStepInState(
+    linearSessionId: string,
+    guidanceStep: boolean,
+  ): Promise<AutonomousGoalStepResult> {
     validateIdentifier(linearSessionId, "linearSessionId");
     return this.mutate(async () => {
       const state = await this.readState();
@@ -1424,6 +1522,12 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         return {
           disposition: "not_active",
           goal: goal === undefined ? undefined : copyAutonomousGoal(goal),
+        };
+      }
+      if (!guidanceStep && goal.pendingGuidanceIds.length > 0) {
+        return {
+          disposition: "guidance_pending",
+          goal: copyAutonomousGoal(goal),
         };
       }
       goal.status = "running";
@@ -1449,8 +1553,17 @@ export class JsonBridgeStateStore implements BridgeStateStore {
   blockAutonomousGoal(
     linearSessionId: string,
     activityKey: string,
+    body: string,
+    guidanceExecutionId?: string,
   ): Promise<AutonomousGoalState> {
     validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
+    if (guidanceExecutionId !== undefined) {
+      validateIdentifier(
+        guidanceExecutionId,
+        "guidanceExecutionId",
+        MAX_EXECUTION_ID_LENGTH,
+      );
+    }
     return this.transitionAutonomousGoal(linearSessionId, (goal) => {
       if (
         goal.status === "completed" ||
@@ -1459,10 +1572,24 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       ) {
         throw new Error(`Cannot block autonomous goal from ${goal.status}`);
       }
+      if (guidanceExecutionId !== undefined) {
+        const guidanceIndex = goal.pendingGuidanceIds.indexOf(
+          guidanceExecutionId,
+        );
+        if (guidanceIndex < 0) {
+          throw new Error("Autonomous goal guidance was not durably pending");
+        }
+        goal.pendingGuidanceIds.splice(guidanceIndex, 1);
+      }
       goal.status = "blocked";
       delete goal.runningOwnerId;
       delete goal.completionDispatchStartedAt;
-      goal.pendingNotice = { kind: "elicitation", activityKey };
+      goal.pendingNotice = this.sealAutonomousGoalNotice(
+        goal,
+        "elicitation",
+        activityKey,
+        body,
+      );
     });
   }
 
@@ -1494,24 +1621,11 @@ export class JsonBridgeStateStore implements BridgeStateStore {
         }
         goal.pendingGuidanceIds.splice(guidanceIndex, 1);
       }
-      const wasBlocked = goal.status === "blocked";
-      if (
-        wasBlocked &&
-        goal.completionStateId !== undefined &&
-        goal.completionActivityKey !== undefined
-      ) {
-        goal.status = "completing";
-        goal.pendingNotice = {
-          kind: "completion",
-          activityKey: goal.completionActivityKey,
-        };
-      } else {
-        goal.status = "active";
-        delete goal.pendingNotice;
-        delete goal.completionStateId;
-        delete goal.completionActivityKey;
-        delete goal.completionDispatchStartedAt;
-      }
+      goal.status = "active";
+      delete goal.pendingNotice;
+      delete goal.completionStateId;
+      delete goal.completionActivityKey;
+      delete goal.completionDispatchStartedAt;
       goal.stepsSinceGuidance = 0;
     });
   }
@@ -1520,6 +1634,7 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     linearSessionId: string,
     completionStateId: string,
     activityKey: string,
+    body: string,
   ): Promise<AutonomousGoalState> {
     validateIdentifier(completionStateId, "completionStateId");
     validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
@@ -1529,7 +1644,12 @@ export class JsonBridgeStateStore implements BridgeStateStore {
       goal.completionStateId = completionStateId;
       goal.completionActivityKey = activityKey;
       delete goal.runningOwnerId;
-      goal.pendingNotice = { kind: "completion", activityKey };
+      goal.pendingNotice = this.sealAutonomousGoalNotice(
+        goal,
+        "completion",
+        activityKey,
+        body,
+      );
     });
   }
 
@@ -1609,6 +1729,52 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     });
   }
 
+  async getAutonomousGoalPendingNoticeBody(
+    linearSessionId: string,
+    activityKey: string,
+  ): Promise<string | undefined> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    validateIdentifier(activityKey, "activityKey", MAX_ACTIVITY_KEY_LENGTH);
+    const goal = (await this.readState()).autonomousGoals?.[linearSessionId];
+    const pending = goal?.pendingNotice;
+    if (goal === undefined || pending?.activityKey !== activityKey) {
+      return undefined;
+    }
+    if (this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    return openAutonomousGoalNotice(
+      this.recoveryKeyring,
+      {
+        linearSessionId,
+        activityKey,
+        kind: pending.kind,
+      },
+      pending.envelope,
+    );
+  }
+
+  async getAutonomousGoalObjective(
+    linearSessionId: string,
+  ): Promise<string | undefined> {
+    validateIdentifier(linearSessionId, "linearSessionId");
+    const goal = (await this.readState()).autonomousGoals?.[linearSessionId];
+    if (goal?.objectiveEnvelope === undefined) {
+      return undefined;
+    }
+    if (this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    return openAutonomousGoalObjective(
+      this.recoveryKeyring,
+      {
+        linearSessionId,
+        issueId: goal.issueId,
+      },
+      goal.objectiveEnvelope,
+    );
+  }
+
   getOrCreateAutonomousGoalActivityId(
     linearSessionId: string,
     activityKey: string,
@@ -1659,6 +1825,30 @@ export class JsonBridgeStateStore implements BridgeStateStore {
     if (goal.status !== "running" || goal.runningOwnerId !== this.ownerId) {
       throw new Error("Autonomous goal step is not owned by this process");
     }
+  }
+
+  private sealAutonomousGoalNotice(
+    goal: AutonomousGoalState,
+    kind: AutonomousGoalPendingNotice["kind"],
+    activityKey: string,
+    body: string,
+  ): AutonomousGoalPendingNotice {
+    if (this.recoveryKeyring === undefined) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    return {
+      kind,
+      activityKey,
+      envelope: sealAutonomousGoalNotice(
+        this.recoveryKeyring,
+        {
+          linearSessionId: goal.linearSessionId,
+          activityKey,
+          kind,
+        },
+        body,
+      ),
+    };
   }
 
   private stopAutonomousGoalInState(goal: AutonomousGoalState): boolean {
@@ -2497,8 +2687,16 @@ function emptyState(): PersistedBridgeState {
 function copyAutonomousGoal(goal: AutonomousGoalState): AutonomousGoalState {
   return {
     ...goal,
+    ...(goal.objectiveEnvelope !== undefined
+      ? { objectiveEnvelope: { ...goal.objectiveEnvelope } }
+      : {}),
     ...(goal.pendingNotice !== undefined
-      ? { pendingNotice: { ...goal.pendingNotice } }
+      ? {
+          pendingNotice: {
+            ...goal.pendingNotice,
+            envelope: { ...goal.pendingNotice.envelope },
+          },
+        }
       : {}),
     pendingGuidanceIds: [...goal.pendingGuidanceIds],
     activityIds: { ...goal.activityIds },

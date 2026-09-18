@@ -50,6 +50,23 @@ export interface SealedIngressRecoveryEnvelope {
   tag: string;
 }
 
+export interface AutonomousGoalNoticeIdentity {
+  linearSessionId: string;
+  activityKey: string;
+  kind: "elicitation" | "completion";
+}
+
+export type SealedAutonomousGoalNoticeEnvelope =
+  SealedIngressRecoveryEnvelope;
+
+export interface AutonomousGoalObjectiveIdentity {
+  linearSessionId: string;
+  issueId: string;
+}
+
+export type SealedAutonomousGoalObjectiveEnvelope =
+  SealedIngressRecoveryEnvelope;
+
 interface RecoveryKey {
   id: string;
   bytes: Buffer;
@@ -115,6 +132,113 @@ export function sealIngressRecoveryPayload(
   validateSequence(sequence);
   validateRecoveryPayload(identity, payload);
   const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+  return sealEnvelope(keyring, plaintext, (keyId) =>
+    canonicalAad(identity, sequence, keyId),
+  );
+}
+
+export function openIngressRecoveryPayload(
+  keyring: IngressRecoveryKeyring,
+  identity: IngressRecoveryIdentity,
+  sequence: number,
+  value: unknown,
+): IngressRecoveryPayload {
+  validateSequence(sequence);
+  try {
+    const plaintext = openEnvelope(keyring, value, (keyId) =>
+      canonicalAad(identity, sequence, keyId),
+    );
+    const payload = JSON.parse(plaintext.toString("utf8")) as unknown;
+    validateRecoveryPayload(identity, payload);
+    return payload;
+  } catch {
+    throw new IngressRecoveryEnvelopeError();
+  }
+}
+
+export function sealAutonomousGoalNotice(
+  keyring: IngressRecoveryKeyring,
+  identity: AutonomousGoalNoticeIdentity,
+  body: string,
+): SealedAutonomousGoalNoticeEnvelope {
+  validateAutonomousGoalNotice(identity, body);
+  const plaintext = Buffer.from(JSON.stringify({ body }), "utf8");
+  return sealEnvelope(keyring, plaintext, (keyId) =>
+    canonicalAutonomousGoalNoticeAad(identity, keyId),
+  );
+}
+
+export function openAutonomousGoalNotice(
+  keyring: IngressRecoveryKeyring,
+  identity: AutonomousGoalNoticeIdentity,
+  value: unknown,
+): string {
+  try {
+    const plaintext = openEnvelope(keyring, value, (keyId) =>
+      canonicalAutonomousGoalNoticeAad(identity, keyId),
+    );
+    const payload = JSON.parse(plaintext.toString("utf8")) as unknown;
+    if (
+      payload === null ||
+      typeof payload !== "object" ||
+      Array.isArray(payload) ||
+      !hasExactKeys(payload as Record<string, unknown>, ["body"], []) ||
+      typeof (payload as Record<string, unknown>).body !== "string"
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const body = (payload as { body: string }).body;
+    validateAutonomousGoalNotice(identity, body);
+    return body;
+  } catch {
+    throw new IngressRecoveryEnvelopeError();
+  }
+}
+
+export function sealAutonomousGoalObjective(
+  keyring: IngressRecoveryKeyring,
+  identity: AutonomousGoalObjectiveIdentity,
+  objective: string,
+): SealedAutonomousGoalObjectiveEnvelope {
+  validateAutonomousGoalObjective(identity, objective);
+  const plaintext = Buffer.from(JSON.stringify({ objective }), "utf8");
+  return sealEnvelope(keyring, plaintext, (keyId) =>
+    canonicalAutonomousGoalObjectiveAad(identity, keyId),
+  );
+}
+
+export function openAutonomousGoalObjective(
+  keyring: IngressRecoveryKeyring,
+  identity: AutonomousGoalObjectiveIdentity,
+  value: unknown,
+): string {
+  try {
+    const plaintext = openEnvelope(keyring, value, (keyId) =>
+      canonicalAutonomousGoalObjectiveAad(identity, keyId),
+    );
+    const payload = JSON.parse(plaintext.toString("utf8")) as unknown;
+    if (
+      payload === null ||
+      typeof payload !== "object" ||
+      Array.isArray(payload) ||
+      !hasExactKeys(payload as Record<string, unknown>, ["objective"], []) ||
+      typeof (payload as Record<string, unknown>).objective !== "string"
+    ) {
+      throw new IngressRecoveryEnvelopeError();
+    }
+    const objective = (payload as { objective: string }).objective;
+    validateAutonomousGoalObjective(identity, objective);
+    return objective;
+  } catch {
+    throw new IngressRecoveryEnvelopeError();
+  }
+}
+
+function sealEnvelope(
+  keyring: IngressRecoveryKeyring,
+  plaintext: Buffer,
+  aad: (keyId: string) => Buffer,
+): SealedIngressRecoveryEnvelope {
   if (plaintext.length > MAX_CIPHERTEXT_BYTES) {
     throw new IngressRecoveryEnvelopeError();
   }
@@ -122,7 +246,7 @@ export function sealIngressRecoveryPayload(
   const cipher = createCipheriv("aes-256-gcm", keyring.primary.bytes, nonce, {
     authTagLength: TAG_BYTES,
   });
-  cipher.setAAD(canonicalAad(identity, sequence, keyring.primary.id), {
+  cipher.setAAD(aad(keyring.primary.id), {
     plaintextLength: plaintext.length,
   });
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
@@ -135,13 +259,11 @@ export function sealIngressRecoveryPayload(
   };
 }
 
-export function openIngressRecoveryPayload(
+function openEnvelope(
   keyring: IngressRecoveryKeyring,
-  identity: IngressRecoveryIdentity,
-  sequence: number,
   value: unknown,
-): IngressRecoveryPayload {
-  validateSequence(sequence);
+  aad: (keyId: string) => Buffer,
+): Buffer {
   const envelope = parseEnvelope(value);
   const key = keyring.keysById.get(envelope.keyId);
   if (key === undefined) {
@@ -158,7 +280,7 @@ export function openIngressRecoveryPayload(
     const decipher = createDecipheriv("aes-256-gcm", key.bytes, nonce, {
       authTagLength: TAG_BYTES,
     });
-    decipher.setAAD(canonicalAad(identity, sequence, envelope.keyId), {
+    decipher.setAAD(aad(envelope.keyId), {
       plaintextLength: ciphertext.length,
     });
     decipher.setAuthTag(tag);
@@ -169,9 +291,7 @@ export function openIngressRecoveryPayload(
     if (plaintext.length > MAX_CIPHERTEXT_BYTES) {
       throw new IngressRecoveryEnvelopeError();
     }
-    const payload = JSON.parse(plaintext.toString("utf8")) as unknown;
-    validateRecoveryPayload(identity, payload);
-    return payload;
+    return plaintext;
   } catch {
     throw new IngressRecoveryEnvelopeError();
   }
@@ -194,6 +314,71 @@ function canonicalAad(
     ]),
     "utf8",
   );
+}
+
+function canonicalAutonomousGoalNoticeAad(
+  identity: AutonomousGoalNoticeIdentity,
+  keyId: string,
+): Buffer {
+  return Buffer.from(
+    JSON.stringify([
+      ENVELOPE_VERSION,
+      keyId,
+      "autonomous-goal-notice",
+      identity.linearSessionId,
+      identity.activityKey,
+      identity.kind,
+    ]),
+    "utf8",
+  );
+}
+
+function canonicalAutonomousGoalObjectiveAad(
+  identity: AutonomousGoalObjectiveIdentity,
+  keyId: string,
+): Buffer {
+  return Buffer.from(
+    JSON.stringify([
+      ENVELOPE_VERSION,
+      keyId,
+      "autonomous-goal-objective",
+      identity.linearSessionId,
+      identity.issueId,
+    ]),
+    "utf8",
+  );
+}
+
+function validateAutonomousGoalNotice(
+  identity: AutonomousGoalNoticeIdentity,
+  body: string,
+): void {
+  if (
+    identity.linearSessionId.length === 0 ||
+    identity.linearSessionId.length > 512 ||
+    identity.activityKey.length === 0 ||
+    identity.activityKey.length > 128 ||
+    (identity.kind !== "elicitation" && identity.kind !== "completion") ||
+    body.length === 0 ||
+    Buffer.byteLength(body, "utf8") > MAX_PROMPT_BYTES
+  ) {
+    throw new IngressRecoveryEnvelopeError();
+  }
+}
+
+function validateAutonomousGoalObjective(
+  identity: AutonomousGoalObjectiveIdentity,
+  objective: string,
+): void {
+  if (
+    identity.linearSessionId.length === 0 ||
+    identity.linearSessionId.length > 512 ||
+    identity.issueId.length === 0 ||
+    identity.issueId.length > 512 ||
+    Buffer.byteLength(objective, "utf8") > MAX_PROMPT_BYTES
+  ) {
+    throw new IngressRecoveryEnvelopeError();
+  }
 }
 
 function parseEnvelope(value: unknown): SealedIngressRecoveryEnvelope {

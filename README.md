@@ -196,16 +196,20 @@ recovery ciphertext for accepted turns whose dispatch marker is absent. When
 autonomous goals are enabled it also contains issue/session identifiers,
 runtime name, lifecycle status, bounded step counters, the selected completed
 state ID, completion-dispatch timestamp, pending guidance/activity IDs, and
-caller-generated activity keys. It does not persist autonomous prompt or
-runtime-response text. If the process exits after a pending response is
-recorded but before Linear receives it, recovery uses safe generic wording;
-the exact unposted question or verification text is deliberately not stored.
+caller-generated activity keys. The opening autonomous objective is stored in
+an AES-256-GCM envelope so guidance claimed before goal preparation cannot
+displace it. Autonomous prompts and provider transcripts are not stored in
+plaintext. A blocked elicitation or verified completion response that has not
+reached Linear is likewise stored as an encrypted envelope, so restart recovery
+can emit the exact question or verification text without leaving it readable in
+the state file.
 Plaintext recovery routing metadata includes the action,
 session/webhook/execution IDs, recovery sequence, event timestamp, envelope
-`keyId`, and stop-fence provenance. Prompt, issue, and comment text, the raw
-signal, and the stop/body semantics remain inside the encrypted envelope until
-the dispatch marker is committed. Ciphertext length still reveals an
-approximate prompt length, so protect the state file and its backups as
+`keyId`, autonomous notice kind/activity key, and stop-fence provenance.
+Prompt, issue, comment, pending elicitation, and pending completion text, the
+raw signal, and stop/body semantics remain inside encrypted envelopes until
+their delivery boundary is committed. Ciphertext length still reveals an
+approximate content length, so protect the state file and its backups as
 sensitive data.
 
 AES-256-GCM authenticates each encrypted payload against its routing identity,
@@ -492,13 +496,17 @@ opening the session; otherwise each message remains a single runtime turn.
 The loopback-only webhook endpoint verifies signatures, rejects stale timestamps, and does
 not return 200 for a valid agent event unless its receipt and claim are durable.
 Marker-free accepted turns retain encrypted prompt material until the dispatch
-marker is durable. Bounded action, identity, sequence, timestamp, `keyId`, and
-stop-fence provenance remain plaintext for routing. Prompt, issue, and comment
-text, raw signal, and stop/body semantics remain encrypted, while ciphertext
-size leaks an approximate length. The envelope authenticates its payload and
-routing association, not the whole state file. Keep `.env`, the state file, and
-their backups owner-only; losing every reader key for an active envelope blocks
-startup rather than dropping accepted work.
+marker is durable. An autonomous goal's opening objective and undelivered
+elicitation or completion notices retain their exact text in separate encrypted
+envelopes until their lifecycle boundary is committed. Bounded action,
+identity, sequence, timestamp, `keyId`, notice kind/activity key, and stop-fence
+provenance remain plaintext for routing. Prompt, issue, comment, objective, and
+notice text, raw signal, and stop/body semantics remain encrypted, while
+ciphertext size leaks an approximate length.
+Each envelope authenticates its payload and routing association, not the whole
+state file. Keep `.env`, the state file, and their backups owner-only; losing
+every reader key for an active envelope blocks recovery rather than replacing
+the exact content with generic text.
 The OAuth callback consumes a random, expiring state value before exchanging an
 authorization code; only the local service log receives the matching setup
 URL. `/healthz` and `/oauth/callback` are the only other routes. Understand

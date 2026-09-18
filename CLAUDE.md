@@ -67,12 +67,18 @@ refreshes it after an authenticated request returns 401.
   must prevent the mutation.
 - A restart may resume a goal only between bounded provider turns. A goal left
   `running` by another process has unknown side effects and must become blocked
-  with an elicitation rather than replaying the turn. A provider mismatch is
-  also blocked; provider-native session IDs never cross adapters. Reconcile a
-  recoverable goal's own Agent Session before dispatching accepted ingress or
-  enqueuing recovery so stops and guidance sent during downtime run first. A
-  failed goal-session preflight keeps startup unready; it must not fall through
-  to accepted-ingress dispatch.
+  durably before reconciliation can dispatch downtime guidance. Emit that
+  restart elicitation before processing the guidance; never replay the
+  interrupted turn. A provider mismatch is also blocked; provider-native
+  session IDs never cross adapters. Reconcile a recoverable goal's own Agent
+  Session before dispatching accepted ingress or enqueuing recovery so stops
+  and guidance sent during downtime run first. A failed goal-session preflight
+  keeps startup unready; it must not fall through to accepted-ingress dispatch.
+- Persist the opening objective and every exact pending elicitation or
+  completion response in recovery-key AES-GCM envelopes. Reconcile stable
+  activity IDs after restart and decrypt notice content only when emission is
+  still required; never store this user-visible text in plaintext or replace
+  it with generic crash-recovery wording.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Persist the bounded receipt and semantic claim before ack; do all
   external work after. Mark dispatch durably before the first external or

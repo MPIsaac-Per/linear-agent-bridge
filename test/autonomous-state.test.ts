@@ -33,6 +33,8 @@ describe("autonomous goal durable state", () => {
       issueId: ISSUE_ID,
       issueIdentifier: "LIN-1",
       runtime: "claude",
+      openingRecoverySequence: 1,
+      objective: "Complete session 1.",
     });
     await state.activateAutonomousGoal("session-1");
 
@@ -41,14 +43,25 @@ describe("autonomous goal durable state", () => {
       disposition: "started",
       goal: { status: "running", step: 1, stepsSinceGuidance: 1 },
     });
-    await state.blockAutonomousGoal("session-1", "goal-step-1-blocked");
+    await state.blockAutonomousGoal(
+      "session-1",
+      "goal-step-1-blocked",
+      "Which environment should I use?",
+    );
     expect(await state.getAutonomousGoal("session-1")).toMatchObject({
       status: "blocked",
       pendingNotice: {
         kind: "elicitation",
         activityKey: "goal-step-1-blocked",
+        envelope: expect.any(Object),
       },
     });
+    await expect(
+      state.getAutonomousGoalPendingNoticeBody(
+        "session-1",
+        "goal-step-1-blocked",
+      ),
+    ).resolves.toBe("Which environment should I use?");
 
     await state.clearAutonomousGoalPendingNotice(
       "session-1",
@@ -67,6 +80,8 @@ describe("autonomous goal durable state", () => {
       linearSessionId: "session-concurrent",
       issueId: ISSUE_ID,
       runtime: "codex",
+      openingRecoverySequence: 1,
+      objective: "Complete the concurrent session.",
     });
     await state.activateAutonomousGoal("session-concurrent");
 
@@ -87,11 +102,16 @@ describe("autonomous goal durable state", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "goal-restart-"));
     tempDirs.push(dir);
     const statePath = path.join(dir, "bridge-state.json");
-    const first = new JsonBridgeStateStore(statePath, { ownerId: "first" });
+    const first = new JsonBridgeStateStore(statePath, {
+      ownerId: "first",
+      recoveryKeyring: createIngressRecoveryKeyring("A".repeat(43)),
+    });
     await first.prepareAutonomousGoal({
       linearSessionId: "session-restart",
       issueId: ISSUE_ID,
       runtime: "claude",
+      openingRecoverySequence: 1,
+      objective: "Complete the restarted session.",
     });
     await first.activateAutonomousGoal("session-restart");
     await first.beginAutonomousGoalStep("session-restart");
@@ -109,6 +129,8 @@ describe("autonomous goal durable state", () => {
       linearSessionId: "session-stop",
       issueId: ISSUE_ID,
       runtime: "claude",
+      openingRecoverySequence: 1,
+      objective: "Complete the stoppable session.",
     });
     await state.activateAutonomousGoal("session-stop");
     await state.beginAutonomousGoalStep("session-stop");
@@ -135,6 +157,8 @@ describe("autonomous goal durable state", () => {
       linearSessionId: "session-guidance",
       issueId: ISSUE_ID,
       runtime: "claude",
+      openingRecoverySequence: 1,
+      objective: "Complete the guided session.",
     });
     await state.activateAutonomousGoal("session-guidance");
     await state.beginAutonomousGoalStep("session-guidance");
@@ -159,11 +183,129 @@ describe("autonomous goal durable state", () => {
       pendingGuidanceIds: ["guidance-1"],
     });
     await state.continueAutonomousGoal("session-guidance");
+    await expect(
+      state.beginAutonomousGoalStep("session-guidance"),
+    ).resolves.toMatchObject({
+      disposition: "guidance_pending",
+      goal: { status: "active", pendingGuidanceIds: ["guidance-1"] },
+    });
     await state.resumeAutonomousGoal("session-guidance", "guidance-1");
     expect(await state.getAutonomousGoal("session-guidance")).toMatchObject({
       status: "active",
       pendingGuidanceIds: [],
       stepsSinceGuidance: 0,
     });
+  });
+
+  it("adopts guidance claimed after the opening event but before goal preparation", async () => {
+    const state = await store();
+    const opening = await state.claimEvent(
+      {
+        webhookId: "delivery-opening-race",
+        executionId: "created:session-opening-race",
+        linearSessionId: "session-opening-race",
+        action: "created",
+      },
+      {
+        action: "created",
+        prompt: "Start the goal.",
+        occurredAt: "2026-09-18T12:00:00.000Z",
+        issueIdentifier: "LIN-1",
+      },
+    );
+    expect(opening.disposition).toBe("claimed");
+    const openingSequence = opening.receipt.recoverySequence!;
+
+    await state.claimEvent(
+      {
+        webhookId: "delivery-guidance-race",
+        executionId: "guidance-race",
+        linearSessionId: "session-opening-race",
+        action: "prompted",
+      },
+      {
+        action: "prompted",
+        prompt: "Apply this before starting.",
+        occurredAt: "2026-09-18T12:00:01.000Z",
+        stop: false,
+      },
+    );
+
+    await state.prepareAutonomousGoal({
+      linearSessionId: "session-opening-race",
+      issueId: ISSUE_ID,
+      runtime: "claude",
+      openingRecoverySequence: openingSequence,
+      objective: "Start the goal.",
+    });
+
+    expect(await state.getAutonomousGoal("session-opening-race")).toMatchObject({
+      status: "authorizing",
+      pendingGuidanceIds: ["guidance-race"],
+    });
+  });
+
+  it("persists a terminal goal when a stop fence wins before preparation", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "goal-stop-prepare-"));
+    tempDirs.push(dir);
+    const statePath = path.join(dir, "bridge-state.json");
+    const recoveryKeyring = createIngressRecoveryKeyring("A".repeat(43));
+    const state = new JsonBridgeStateStore(statePath, {
+      ownerId: "goal-stop-prepare-first",
+      recoveryKeyring,
+    });
+    const opening = await state.claimEvent(
+      {
+        webhookId: "delivery-stop-prepare-opening",
+        executionId: "created:session-stop-prepare",
+        linearSessionId: "session-stop-prepare",
+        action: "created",
+      },
+      {
+        action: "created",
+        prompt: "Start the goal.",
+        occurredAt: "2026-09-18T12:00:00.000Z",
+        issueIdentifier: "LIN-1",
+      },
+    );
+    const stopCursor = {
+      createdAt: "2026-09-18T12:00:01.000Z",
+      id: "stop-before-prepare",
+    };
+    await state.claimStopEvent(
+      {
+        webhookId: "delivery-stop-before-prepare",
+        executionId: stopCursor.id,
+        linearSessionId: "session-stop-prepare",
+        action: "prompted",
+      },
+      stopCursor,
+      {
+        action: "prompted",
+        prompt: "stop",
+        occurredAt: stopCursor.createdAt,
+        stop: true,
+      },
+    );
+
+    await state.prepareAutonomousGoal({
+      linearSessionId: "session-stop-prepare",
+      issueId: ISSUE_ID,
+      runtime: "claude",
+      openingRecoverySequence: opening.receipt.recoverySequence!,
+      objective: "Start the goal unless stopped.",
+    });
+
+    const reopened = new JsonBridgeStateStore(statePath, {
+      ownerId: "goal-stop-prepare-reopened",
+      recoveryKeyring,
+    });
+    expect(await reopened.getAutonomousGoal("session-stop-prepare")).toMatchObject(
+      {
+        status: "stopped",
+        pendingGuidanceIds: [],
+      },
+    );
+    await expect(reopened.listRecoverableAutonomousGoals()).resolves.toEqual([]);
   });
 });

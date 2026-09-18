@@ -18,6 +18,10 @@ Changes awaiting a tagged release remain under Unreleased.
 - Complete an issue only after the runtime returns a verified-completion result
   and the bridge rechecks its label and workflow state. Completion uses stable
   Agent Activity IDs so restart recovery does not duplicate the final response.
+- Encrypt the opening objective, exact pending blocked question, and completion
+  verification with the recovery key. This preserves the objective across an
+  early-guidance race and lets crash recovery emit the original notice content
+  without storing any of it as plaintext.
 
 ### Changed
 
@@ -26,6 +30,10 @@ Changes awaiting a tagged release remain under Unreleased.
   unchanged. The bridge does not treat mention or delegation alone as an
   autonomous grant because Linear exposes both as the same session-created
   event.
+- Give durably claimed guidance priority at autonomous step admission and after
+  a failed issue update. Interrupted running goals become blocked before
+  downtime ingress dispatch, and inactivity finalization persists that block
+  with a service-scoped cancellation signal.
 
 ## [0.2.0] - 2026-09-18
 
