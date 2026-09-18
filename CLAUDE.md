@@ -1,15 +1,15 @@
 # linear-agent-bridge
 
-Bridge between Linear's Agent Interaction API and a local agent runtime
-(Claude Agent SDK by default). Mention or assign the agent in Linear; it
-answers in the issue's agent-session thread with the full context of the
-working directory it runs in (CLAUDE.md stack, MCP servers).
+Bridge between Linear's Agent Interaction API and a local agent runtime.
+`RUNTIME` selects the Claude Agent SDK or Codex SDK (`claude` by default).
+Mention or assign the agent in Linear; it answers in the issue's agent-session
+thread with the selected runtime's full working-directory context.
 
 ## Architecture
 
 Linear webhook (AgentSessionEvent) plus startup/interval activity
 reconciliation -> src/server.ts -> JsonBridgeStateStore -> SessionLanes ->
-AgentRuntime (src/runtime/claude.ts, cwd=KB_PATH) -> activities back via
+AgentRuntime (src/runtime/{claude,codex}.ts, cwd=KB_PATH) -> activities back via
 src/linear/client.ts (agentActivityCreate). Durable receipts, semantic claims,
 per-session watermarks, and stop fences prevent duplicate or post-stop dispatch
 across delivery and process retries. A claim can transfer after restart only
@@ -23,19 +23,25 @@ refreshes it after an authenticated request returns 401.
 ## Hard constraints
 
 - **Runtime concurrency is per Linear agent-session.** Turns in one Linear
-  agent-session run FIFO and resume that session's runtime session. Distinct
-  Linear sessions run concurrently because the Claude Agent SDK isolates
-  conversations by session UUID. The host-wide concurrency-1 rule is retired:
+  agent-session run FIFO and resume that session's provider-native session.
+  Distinct Linear sessions run concurrently because both adapters isolate
+  conversations by provider-native session id. The host-wide concurrency-1
+  rule is retired:
   MPI-682 imported it from a 2026-04-26 `claude -p` file-write incident, which
-  never applied to this SDK's session-isolated conversations.
-- **Never pass `model` or tool overrides** when invoking the Claude
-  runtime. The operator's Claude Code config is the source of truth.
-  Unattended runs use `permissionMode: "bypassPermissions"` paired with
-  `allowDangerouslySkipPermissions: true` (the SDK requires the pair).
-- **Auth is subscription-based.** No ANTHROPIC_API_KEY anywhere; the Agent
-  SDK resolves Claude Code's stored credentials.
-- The runtime runs with cwd=KB_PATH; that directory's own CLAUDE.md rules
-  apply inside runtime sessions automatically.
+  never applied to these SDKs' session-isolated conversations.
+- **Never pass model, reasoning-effort, or tool overrides.** The selected
+  service account's Claude Code or Codex configuration is the source of truth.
+  Claude unattended runs pair `permissionMode: "bypassPermissions"` with
+  `allowDangerouslySkipPermissions: true`; Codex uses approval policy `never`
+  and sandbox mode `danger-full-access`.
+- **Auth is subscription-based.** Neither adapter uses an API key. Each SDK
+  resolves the selected service account's stored Claude Code or Codex login.
+- The runtime runs with cwd=KB_PATH, where it loads its normal instruction,
+  skill, and MCP configuration stack.
+- Every runtime prompt states that the agent is already inside a Linear Agent
+  Session and that the bridge posts its final response automatically. Linear
+  tools remain available for deliberate issue mutations, not for duplicating
+  conversation updates or the final response as comments.
 - Linear timing rules: ack webhooks < 5s; emit a first activity < 10s on
   `created`. Persist the bounded receipt and semantic claim before ack; do all
   external work after. Mark dispatch durably before the first external or

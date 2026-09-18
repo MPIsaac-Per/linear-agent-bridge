@@ -1,7 +1,7 @@
 // Core domain types for the Linear <-> agent-runtime bridge.
 
 interface LinearAgentSessionEventBase {
-  /** Linear's unique delivery id, used for durable receipt deduplication. */
+  /** Linear webhook configuration id; the Linear-Delivery header identifies a delivery. */
   webhookId: string;
   agentSession: {
     id: string;

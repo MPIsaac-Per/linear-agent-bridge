@@ -7,7 +7,18 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-18
+
 ### Added
+
+- Add a Codex runtime backed by `@openai/codex-sdk`. Select it with
+  `RUNTIME=codex`; it uses the service account's stored Codex login and inherits
+  that account's default model and reasoning effort.
+- Tell both runtimes that they are already operating inside a Linear Agent
+  Session and that the bridge posts their final response automatically, so
+  routine progress and final answers are not duplicated through Linear tools.
+- Reject provider-native session IDs created by the other runtime instead of
+  attempting an invalid cross-provider resume.
 
 - Linux deployment. `deploy/install.sh` detects the platform and branches only
   at the service-manager boundary, rendering a systemd unit from the new
@@ -128,8 +139,9 @@ Changes awaiting a tagged release remain under Unreleased.
 
 - Persist bounded webhook receipts, semantic execution claims, and
   caller-generated Linear activity UUIDs before acknowledging valid agent
-  events. Delivery retries deduplicate by `webhookId`; created and prompted
-  turns claim `created:<agentSession.id>` and `agentActivity.id` respectively.
+  events. Delivery retries deduplicate by the per-payload `Linear-Delivery`
+  identity; created and prompted turns claim `created:<agentSession.id>` and
+  `agentActivity.id` respectively.
   Terminal entries expire after seven days and are capped at 10,000 while
   active claims are preserved.
 - Mark dispatch durably before any external or runtime side effect. A replacement
@@ -151,6 +163,11 @@ Changes awaiting a tagged release remain under Unreleased.
   outstanding envelopes from earlier deployments.
 
 ### Changed
+
+- Run distinct Linear agent sessions concurrently while preserving FIFO order
+  for follow-up turns in the same provider-native session.
+- Serialize session-map writes so concurrent first turns cannot discard one
+  another's Linear-to-runtime session mappings.
 
 - Bind the bridge HTTP listener explicitly to `127.0.0.1`. The macOS installer
   now fails on local health or ingress setup errors, targets Funnel directly at
@@ -233,5 +250,6 @@ Changes awaiting a tagged release remain under Unreleased.
   cancellation before asynchronous follow-up setup, preventing work from being
   queued after a stop response. ([#3](https://github.com/MPIsaac-Per/linear-claude-bridge/pull/3))
 
-[Unreleased]: https://github.com/MPIsaac-Per/linear-agent-bridge/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MPIsaac-Per/linear-agent-bridge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MPIsaac-Per/linear-agent-bridge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MPIsaac-Per/linear-agent-bridge/releases/tag/v0.1.0

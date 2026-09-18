@@ -33,8 +33,10 @@ twice, accepted work survives a process exit before dispatch, missed prompt and
 stop webhooks recover through reconciliation, and access
 refreshes without another browser authorization.
 
-For each valid agent event, the bridge durably persists a receipt keyed by
-Linear's `webhookId` and a semantic execution claim before returning 200.
+For each valid agent event, the bridge durably persists a receipt keyed by the
+per-payload `Linear-Delivery` header and a semantic execution claim before
+returning 200. The payload's `webhookId` identifies the webhook configuration,
+not an individual delivery.
 Created turns use `created:<agentSession.id>` as the execution identity;
 prompted turns use `agentActivity.id`. A claim left active by a process crash is
 reclaimed by a replacement process only when dispatch never started. The bridge
@@ -74,7 +76,7 @@ to duplicate its conversation, progress, or final response.
 - On macOS, Xcode Command Line Tools (`xcode-select --install`). The build uses
   the supported libproc API to compile a small local process-identity helper.
 - A Linear workspace where you can create OAuth applications.
-- A public HTTPS route to the loopback-bound service. The supported macOS
+- A public HTTPS route to the loopback-bound service. The supported deployment
   topology uses Tailscale Funnel directly on the bridge host.
 
 ## Setup
@@ -127,7 +129,7 @@ wrong provider; start a new Linear agent session after switching.
 ### 3. Install the app as an agent (actor=app)
 
 Start the service, then open the `OAuth authorization URL` printed in its
-console or launchd log. The URL contains a random, one-time `state` value
+service log. The URL contains a random, one-time `state` value
 and is valid for 10 minutes. Restart the service to issue another URL if it
 expires.
 
@@ -246,7 +248,7 @@ asymmetric sequence/envelope pair as `invalid`:
 node -e 'const s=require("./data/bridge-state.json"); for(const r of Object.values(s.receipts??{})){if(!["received","claimed"].includes(r.status)||r.dispatchStartedAt)continue; const q=r.recoverySequence!==undefined,e=r.recoveryEnvelope!==undefined; if(!q||!e)console.log(!q&&!e?"awaiting-redelivery":"invalid",r.webhookId,r.linearSessionId,r.executionId)}'
 ```
 
-The macOS installer polls health for a bounded window. If Linear does not
+The installer polls health for a bounded window. If Linear does not
 redeliver during that window, the installer restores the previous build. Back
 up the state file, reconcile the affected Linear session manually, and remove
 or archive that stale receipt and its matching claim before retrying. An
@@ -384,7 +386,7 @@ session takes.
 - Serialize runtime turns per Linear agent-session, and run distinct sessions
   concurrently. The retired host-wide concurrency-1 rule came from MPI-682,
   which imported a 2026-04-26 `claude -p` file-write incident that did not
-  apply to the Agent SDK's session-isolated conversations.
+  apply to the adapters' provider-native, session-isolated conversations.
 - Claude Agent SDK tool results arrive as `user` messages containing
   `tool_result` blocks. Pair them to the preceding `tool_use` ID so Linear
   receives a completed action instead of a permanent spinner.
@@ -490,10 +492,12 @@ Surfacing the path is for usability and nothing else. Three tiers:
 | Agent tooling state inside the working directory | see below |
 | `AGENT_OUTPUT_PATH` | writable |
 
-The middle tier is conditional, and on current versions it is empty. Measured on
-a real deployment (Agent SDK, Node 22, Linux, 2026-08-19), a complete turn wrote
-nothing into the working directory. Session transcripts and runtime state went
-to the service account's own home, under `$HOME/.claude/projects/<encoded-cwd>/`.
+The middle tier is conditional, and neither current adapter requires it.
+Measured on a real Claude deployment (Agent SDK, Node 22, Linux, 2026-08-19), a
+complete turn wrote nothing into the working directory. Session transcripts and
+runtime state went to the service account's own home, under
+`$HOME/.claude/projects/<encoded-cwd>/`. Codex likewise keeps its configuration
+and session state under `$CODEX_HOME` (normally `$HOME/.codex`).
 
 So start with the working directory read-only in full, including `.claude`,
 which the runtime reads for settings and skills but does not write. Grant read,
