@@ -63,6 +63,8 @@ const CREATED_THOUGHT_BODY = "Reading the issue and gathering context…";
 /** Acknowledge a follow-up when it starts after an earlier turn in its lane. */
 const PROMPTED_THOUGHT_BODY = "Working on it…";
 const STOPPED_RESPONSE_BODY = "Stopped.";
+const RUNTIME_PROVIDER_MISMATCH_BODY =
+  "This agent session was started with a different runtime and cannot be resumed safely. Start a new Linear agent session after changing RUNTIME.";
 const STALLED_WARNING_INTERVAL_MS = 15 * 60 * 1000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
 
@@ -1497,6 +1499,20 @@ function enqueueSessionRun(
       await queuedNotice;
       if (options.loadStoredSessionAtExecution === true) {
         const storedSession = await deps.store.get(request.linearSessionId);
+        if (
+          storedSession?.runtimeSessionId !== undefined &&
+          storedSession.runtime !== deps.runtime.name
+        ) {
+          await emitActivity(
+            deps,
+            identity.executionId,
+            "runtime-provider-mismatch",
+            request.linearSessionId,
+            { type: "error", body: RUNTIME_PROVIDER_MISMATCH_BODY },
+            { signal: controller.signal },
+          );
+          return;
+        }
         effectiveRequest = {
           ...request,
           ...(storedSession?.runtimeSessionId !== undefined

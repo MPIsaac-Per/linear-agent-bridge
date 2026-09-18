@@ -3117,6 +3117,65 @@ describe("startServer", () => {
     );
   });
 
+  it("fails a follow-up visibly instead of passing a foreign runtime session id", async () => {
+    const runtime = new FakeRuntime(
+      async function* (): AsyncGenerator<RuntimeEvent> {
+        yield { kind: "done" };
+      },
+    );
+    activeHarness = await startTestServer(runtime);
+    const harness = activeHarness;
+
+    await harness.store.put({
+      linearSessionId: "agent-session-provider-mismatch",
+      runtimeSessionId: "claude-session-id",
+      runtime: "claude",
+      issueIdentifier: "MPI-3",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+    });
+
+    const payload = {
+      webhookId: "webhook-provider-mismatch",
+      type: "AgentSessionEvent",
+      action: "prompted",
+      agentSession: { id: "agent-session-provider-mismatch" },
+      agentActivity: {
+        id: "activity-provider-mismatch",
+        createdAt: new Date().toISOString(),
+        content: { type: "prompt", body: "please continue" },
+      },
+      webhookTimestamp: Date.now(),
+    };
+    const body = JSON.stringify(payload);
+    expect(
+      (
+        await fetch(serverUrl(harness.port, "/webhook"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "linear-signature": sign(body, WEBHOOK_SECRET),
+            "linear-delivery": deliveryIdOf(body),
+          },
+          body,
+        })
+      ).status,
+    ).toBe(200);
+
+    await waitFor(
+      async () =>
+        (await harness.bridgeState.getClaim("activity-provider-mismatch"))
+          ?.status === "failed",
+    );
+    expect(runtime.lastRequest).toBeUndefined();
+    expect(harness.calls).toContainEqual({
+      agentSessionId: "agent-session-provider-mismatch",
+      content: {
+        type: "error",
+        body: "This agent session was started with a different runtime and cannot be resumed safely. Start a new Linear agent session after changing RUNTIME.",
+      },
+    });
+  });
+
   it("accepts explicit null prompt signals from Linear as absent", async () => {
     const runtime = new FakeRuntime(
       async function* (): AsyncGenerator<RuntimeEvent> {
@@ -5562,15 +5621,18 @@ describe("startServer", () => {
     const releaseFirst = createDeferred<void>();
     const order: string[] = [];
     const queryFn: QueryFn = ({ prompt }) => {
-      order.push(`started:${prompt}`);
+      const requestPrompt = prompt.endsWith("claude-close-first")
+        ? "claude-close-first"
+        : "claude-close-next";
+      order.push(`started:${requestPrompt}`);
       const stream = (async function* () {
-        if (prompt === "claude-close-first") {
+        if (requestPrompt === "claude-close-first") {
           await releaseFirst.promise;
         }
       })();
       return Object.assign(stream, {
         close(): void {
-          order.push(`closed:${prompt}`);
+          order.push(`closed:${requestPrompt}`);
         },
       });
     };

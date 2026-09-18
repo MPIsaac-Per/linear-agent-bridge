@@ -18,6 +18,8 @@ type SessionMap = Record<string, SessionRecord>;
  * writes are atomic (write temp, rename).
  */
 export class JsonSessionStore {
+  private pendingWrite: Promise<void> = Promise.resolve();
+
   constructor(private readonly path: string) {}
 
   async get(linearSessionId: string): Promise<SessionRecord | undefined> {
@@ -26,9 +28,13 @@ export class JsonSessionStore {
   }
 
   async put(record: SessionRecord): Promise<void> {
-    const sessions = await this.readAll();
-    sessions[record.linearSessionId] = record;
-    await this.writeAll(sessions);
+    const operation = this.pendingWrite.then(async () => {
+      const sessions = await this.readAll();
+      sessions[record.linearSessionId] = record;
+      await this.writeAll(sessions);
+    });
+    this.pendingWrite = operation.catch(() => undefined);
+    await operation;
   }
 
   async listSessionIds(): Promise<string[]> {

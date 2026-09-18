@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClaudeRuntime, type QueryFn } from "../src/runtime/claude.js";
+import { LINEAR_AGENT_SESSION_CONTEXT } from "../src/runtime/prompt.js";
 import type { RuntimeEvent, SessionRequest } from "../src/types.js";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -221,7 +222,7 @@ describe("ClaudeRuntime", () => {
     expect(seenPrompt.split(outputPath)).toHaveLength(2);
   });
 
-  it("leaves the prompt untouched when no output path is configured", async () => {
+  it("adds Linear delivery context when no output path is configured", async () => {
     const sessionId = "sdk-session-no-output-path";
     let seenPrompt = "";
     const stub = ((args: { prompt: string; options: Options }) => {
@@ -240,7 +241,9 @@ describe("ClaudeRuntime", () => {
       // drain
     }
 
-    expect(seenPrompt).toBe("write the summary");
+    expect(seenPrompt).toBe(
+      `${LINEAR_AGENT_SESSION_CONTEXT}\n\nwrite the summary`,
+    );
   });
 
   it("does not pass tool or permission overrides alongside the output path", async () => {
@@ -909,7 +912,7 @@ describe("ClaudeRuntime", () => {
     expect(captured).not.toHaveProperty("tools");
   });
 
-  it("passes the request prompt straight through to the query function", async () => {
+  it("prepends the Linear delivery contract to the request prompt", async () => {
     let capturedPrompt: string | undefined;
     async function* stub(params: {
       prompt: string;
@@ -925,7 +928,9 @@ describe("ClaudeRuntime", () => {
       runtime,
     );
 
-    expect(capturedPrompt).toBe("what is the weather");
+    expect(capturedPrompt).toBe(
+      `${LINEAR_AGENT_SESSION_CONTEXT}\n\nwhat is the weather`,
+    );
   });
 
   it("yields an error activity then rethrows when the stream throws mid-session", async () => {
