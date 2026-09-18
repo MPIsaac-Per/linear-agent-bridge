@@ -425,6 +425,76 @@ describe("LinearAgentClient.createActivity", () => {
   });
 });
 
+describe("LinearAgentClient autonomous goal issue operations", () => {
+  it("verifies the configured label and deterministically chooses the first completed state", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        data: {
+          issue: {
+            id: "issue-1",
+            identifier: "LIN-1",
+            labels: { nodes: [{ id: "label-other" }, { id: "label-goal" }] },
+            state: { id: "state-started", type: "started" },
+            team: {
+              states: {
+                nodes: [
+                  { id: "state-done-2", type: "completed", position: 5 },
+                  { id: "state-canceled", type: "canceled", position: 6 },
+                  { id: "state-done-1", type: "completed", position: 4 },
+                ],
+              },
+            },
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await expect(
+      client.getAutonomousGoalIssueContext("issue-1", "label-goal"),
+    ).resolves.toEqual({
+      issueId: "issue-1",
+      issueIdentifier: "LIN-1",
+      authorized: true,
+      alreadyCompleted: false,
+      currentStateId: "state-started",
+      completedStateId: "state-done-1",
+    });
+
+    const request = JSON.parse(fetchFn.mock.calls[0]?.[1]?.body as string);
+    expect(request.query).toContain("query AutonomousGoalIssue");
+    expect(request.variables).toEqual({ issueId: "issue-1" });
+  });
+
+  it("updates only the issue state and verifies the completed result", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        data: {
+          issueUpdate: {
+            success: true,
+            issue: {
+              id: "issue-2",
+              state: { id: "state-done", type: "completed" },
+            },
+          },
+        },
+      }),
+    );
+    const client = new LinearAgentClient("test-token", fetchFn);
+
+    await expect(
+      client.completeIssue("issue-2", "state-done"),
+    ).resolves.toBeUndefined();
+
+    const request = JSON.parse(fetchFn.mock.calls[0]?.[1]?.body as string);
+    expect(request.query).toContain("mutation CompleteAutonomousGoalIssue");
+    expect(request.variables).toEqual({
+      issueId: "issue-2",
+      stateId: "state-done",
+    });
+  });
+});
+
 describe("LinearAgentClient reconciliation reads", () => {
   it("paginates recent sessions, filters by the authenticated app user client-side, and caps results", async () => {
     const fetchFn = vi

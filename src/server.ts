@@ -28,6 +28,7 @@ import type {
 import type { JsonSessionStore } from "./sessions/store.js";
 import type {
   BridgeStateStore,
+  AutonomousGoalState,
   IngressEventIdentity,
   RecoverableIngressEvent,
   ReconciliationCursor,
@@ -46,6 +47,10 @@ import {
   type IngressRecoveryPayload,
 } from "./state/recovery-envelope.js";
 import type { SessionLanes } from "./queue.js";
+import {
+  autonomousGoalPrompt,
+  parseAutonomousGoalDecision,
+} from "./goals/protocol.js";
 
 /** Linear's OAuth2 token-exchange endpoint (linear.app/developers/oauth-2-0-authentication). */
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -67,6 +72,21 @@ const RUNTIME_PROVIDER_MISMATCH_BODY =
   "This agent session was started with a different runtime and cannot be resumed safely. Start a new Linear agent session after changing RUNTIME.";
 const STALLED_WARNING_INTERVAL_MS = 15 * 60 * 1000;
 type TurnTerminalReason = "completed" | "inactive" | "stopped" | "failed";
+
+const GOAL_PROTOCOL_ERROR_BODY =
+  "I paused autonomous work because the runtime did not return a valid lifecycle result. Reply here to resume.";
+const GOAL_STEP_LIMIT_BODY =
+  "I reached the configured autonomous-step limit. Reply here to authorize another bounded set of steps.";
+const GOAL_LABEL_REMOVED_BODY =
+  "I paused because the configured autonomous-goal label is no longer on this issue. Add the label back and reply here to resume.";
+const GOAL_INTERRUPTED_BODY =
+  "The service restarted after a provider turn had begun, so I paused rather than risk repeating side effects. Review the activity above and reply here to resume.";
+const GOAL_RUNTIME_FAILED_BODY =
+  "The provider turn stopped before it produced a safe lifecycle result. Reply here after reviewing the error to resume.";
+const GOAL_COMPLETION_STATE_BODY =
+  "The work is verified, but this issue has no completed workflow state available. Configure a completed state and reply here to retry completion.";
+const GOAL_COMPLETION_RETRY_BODY =
+  "The work is verified, but I could not move the issue to completed. Reply here to retry the Linear update.";
 
 interface InternalServerDeps extends ServerDeps {
   activeRuns: Map<string, Set<ActiveRun>>;
@@ -94,6 +114,15 @@ interface ActiveRun {
   controller: AbortController;
   recoveryOrder: RecoveryOrder;
 }
+
+interface RuntimeTurnOutcome {
+  terminalReason: TurnTerminalReason;
+  response?: string | undefined;
+}
+
+type ActivityScope =
+  | { kind: "ingress"; executionId: string }
+  | { kind: "goal"; linearSessionId: string; prefix: string };
 
 export interface ServerDeps {
   config: Config;
@@ -253,6 +282,21 @@ export function startServer(deps: ServerDeps): {
     }
     const attempt = (async () => {
       try {
+        let preflightedGoalSessionIds: ReadonlySet<string>;
+        try {
+          preflightedGoalSessionIds =
+            await preflightAutonomousGoalRecovery(internalDeps);
+        } catch (error) {
+          if (!internalDeps.closing) {
+            console.error(
+              `[linear-agent-bridge] autonomous goal recovery preflight failed: error=${boundedErrorClass(error)}`,
+            );
+          }
+          throw error;
+        }
+        if (internalDeps.closing) {
+          return;
+        }
         await scheduleAcceptedIngressRecovery(internalDeps);
         if (internalDeps.closing) {
           return;
@@ -263,6 +307,10 @@ export function startServer(deps: ServerDeps): {
         }
         internalDeps.recoveryAwaitingRedelivery = false;
         internalDeps.dispatchReady = true;
+        await scheduleAutonomousGoalRecovery(
+          internalDeps,
+          preflightedGoalSessionIds,
+        );
         scheduleReconciliation(internalDeps);
         internalDeps.reconciliationTimer ??= setInterval(
           () => scheduleReconciliation(internalDeps),
@@ -367,6 +415,226 @@ function scheduleReconciliation(deps: InternalServerDeps): void {
       }
     });
   deps.reconciliationInFlight = reconciliation;
+}
+
+async function scheduleAutonomousGoalRecovery(
+  deps: InternalServerDeps,
+  preflightedSessionIds: ReadonlySet<string>,
+): Promise<void> {
+  if (deps.closing) {
+    return;
+  }
+  const recovery = recoverAutonomousGoals(
+    deps,
+    preflightedSessionIds,
+  ).catch((error: unknown) => {
+    if (!deps.closing) {
+      console.error(
+        `[linear-agent-bridge] autonomous goal recovery failed: error=${boundedErrorClass(error)}`,
+      );
+    }
+  });
+  deps.processingInFlight.add(recovery);
+  void recovery.finally(() => deps.processingInFlight.delete(recovery));
+  await recovery;
+}
+
+async function preflightAutonomousGoalRecovery(
+  deps: InternalServerDeps,
+): Promise<ReadonlySet<string>> {
+  const goals = await deps.bridgeState.listRecoverableAutonomousGoals();
+  if (goals.length === 0) {
+    return new Set();
+  }
+  const now = deps.now?.() ?? Date.now();
+  const watchingSince = await deps.bridgeState.ensureWatchingSince();
+  const preflighted = new Set<string>();
+  for (const goal of goals) {
+    if (deps.closing) {
+      return preflighted;
+    }
+    // A provider turn left running across process death has unknown side
+    // effects. Persist the blocked boundary before reconciliation can dispatch
+    // downtime guidance. The pending notice stays encrypted until either a
+    // stop removes it or recovery/guidance emits it.
+    if (goal.status === "running") {
+      await deps.bridgeState.blockAutonomousGoal(
+        goal.linearSessionId,
+        `goal-interrupted-${goal.step}`,
+        GOAL_INTERRUPTED_BODY,
+      );
+    }
+    // A stop or guidance prompt may have landed while the process was down.
+    // Reconcile this known goal session before its recovery task enters the
+    // FIFO lane. The goal's durable preparation initializes reconciliation,
+    // so this never adopts post-goal activity as pre-existing history.
+    try {
+      await reconcileAgentSession(
+        deps,
+        goal.linearSessionId,
+        now,
+        watchingSince,
+      );
+    } catch (error) {
+      if (isExpectedReconciliationShutdown(deps, error)) {
+        return preflighted;
+      }
+      console.error(
+        `[linear-agent-bridge] autonomous recovery reconciliation failed: session=${boundedLogValue(goal.linearSessionId)} error=${boundedErrorClass(error)}`,
+      );
+      // Fail the startup recovery barrier closed. Accepted ingress for this
+      // session may be older than an unseen stop, so it cannot run safely
+      // merely because explicit goal recovery was excluded.
+      throw error;
+    }
+    preflighted.add(goal.linearSessionId);
+  }
+  return preflighted;
+}
+
+async function recoverAutonomousGoals(
+  deps: InternalServerDeps,
+  preflightedSessionIds: ReadonlySet<string>,
+): Promise<void> {
+  const goals = await deps.bridgeState.listRecoverableAutonomousGoals();
+  for (const goal of goals) {
+    if (deps.closing) {
+      return;
+    }
+    if (preflightedSessionIds.has(goal.linearSessionId)) {
+      enqueueAutonomousGoalRecovery(deps, goal);
+    }
+  }
+}
+
+function enqueueAutonomousGoalRecovery(
+  deps: InternalServerDeps,
+  recoveredGoal: AutonomousGoalState,
+): void {
+  const controller = registerSessionRun(deps, recoveredGoal.linearSessionId, {
+    action: "created",
+    occurredAt: recoveredGoal.updatedAt,
+    sequence: Number.MAX_SAFE_INTEGER,
+  });
+  const queued = deps.queue.enqueue(recoveredGoal.linearSessionId, async () => {
+    let terminalReason: TurnTerminalReason = controller.signal.aborted
+      ? "stopped"
+      : "failed";
+    try {
+      let goal = await deps.bridgeState.getAutonomousGoal(
+        recoveredGoal.linearSessionId,
+      );
+      if (
+        goal === undefined ||
+        goal.status === "completed" ||
+        goal.status === "stopped" ||
+        goal.status === "declined"
+      ) {
+        terminalReason = goal?.status === "stopped" ? "stopped" : "completed";
+        return;
+      }
+      if (goal.status === "blocked") {
+        await recoverAutonomousGoalPendingNotice(
+          deps,
+          goal,
+          controller.signal,
+        );
+        terminalReason = "completed";
+        return;
+      }
+      if (deps.config.autonomousGoalLabelId === undefined) {
+        await blockAutonomousGoalWithNotice(
+          deps,
+          goal,
+          `goal-configuration-removed-${goal.step}`,
+          GOAL_LABEL_REMOVED_BODY,
+          controller.signal,
+        );
+        terminalReason = "completed";
+        return;
+      }
+      if (goal.runtime !== deps.runtime.name) {
+        await blockAutonomousGoalWithNotice(
+          deps,
+          goal,
+          `goal-provider-mismatch-${goal.step}`,
+          RUNTIME_PROVIDER_MISMATCH_BODY,
+          controller.signal,
+        );
+        terminalReason = "completed";
+        return;
+      }
+      if (goal.status === "running") {
+        await blockAutonomousGoalWithNotice(
+          deps,
+          goal,
+          `goal-interrupted-${goal.step}`,
+          GOAL_INTERRUPTED_BODY,
+          controller.signal,
+        );
+        terminalReason = "completed";
+        return;
+      }
+      if (goal.status === "authorizing") {
+        goal = await resolveAutonomousGoalAuthorization(
+          deps,
+          goal,
+          controller.signal,
+        );
+        if (goal.status !== "active") {
+          terminalReason = "completed";
+          return;
+        }
+      }
+      if (goal.status === "completing") {
+        terminalReason = await finishAutonomousGoalCompletion(
+          deps,
+          goal,
+          controller.signal,
+        );
+        return;
+      }
+      const stored = await deps.store.get(goal.linearSessionId);
+      if (
+        stored?.runtimeSessionId !== undefined &&
+        stored.runtime !== deps.runtime.name
+      ) {
+        await blockAutonomousGoalWithNotice(
+          deps,
+          goal,
+          `goal-provider-mismatch-${goal.step}`,
+          RUNTIME_PROVIDER_MISMATCH_BODY,
+          controller.signal,
+        );
+        terminalReason = "completed";
+        return;
+      }
+      terminalReason = await runAutonomousGoalTask(
+        deps,
+        {
+          linearSessionId: goal.linearSessionId,
+          prompt: `Resume autonomous work on ${goal.issueIdentifier ?? "the attached Linear issue"} from the durable goal state.`,
+          ...(stored?.runtimeSessionId !== undefined
+            ? { resumeSessionId: stored.runtimeSessionId }
+            : {}),
+          abortController: controller,
+        },
+        goal.issueIdentifier,
+      );
+    } finally {
+      console.log(
+        `[linear-agent-bridge] autonomous recovery terminal: session=${recoveredGoal.linearSessionId} reason=${terminalReason}`,
+      );
+      unregisterRun(deps, recoveredGoal.linearSessionId, controller);
+    }
+  });
+  void queued.catch((error: unknown) => {
+    if (!deps.closing) {
+      console.error(
+        `[linear-agent-bridge] autonomous recovery queue failed: session=${recoveredGoal.linearSessionId} error=${boundedErrorClass(error)}`,
+      );
+    }
+  });
 }
 
 async function reconcileAgentSessions(deps: InternalServerDeps): Promise<void> {
@@ -505,7 +773,11 @@ async function reconcileAgentSession(
   // this fetched set. claimStopEvent writes the semantic claim and fence while
   // holding the same inter-process lock.
   if (newestStop !== undefined) {
-    const newestStopEvent = reconciledPromptEvent(sessionId, newestStop);
+    const newestStopEvent = reconciledPromptEvent(
+      sessionId,
+      newestStop,
+      snapshot.issueIdentifier,
+    );
     newestStopClaim = await deps.bridgeState.claimStopEvent(
       reconciliationIdentity(sessionId, newestStop.id),
       activityCursor(newestStop),
@@ -534,7 +806,11 @@ async function reconcileAgentSession(
       continue;
     }
 
-    const event = reconciledPromptEvent(sessionId, activity);
+    const event = reconciledPromptEvent(
+      sessionId,
+      activity,
+      snapshot.issueIdentifier,
+    );
     const identity = reconciliationIdentity(sessionId, activity.id);
     const recoverablePayload = recoveryPayload(event);
     const claim =
@@ -652,11 +928,23 @@ function reconciliationIdentity(
 function reconciledPromptEvent(
   sessionId: string,
   activity: ReconciledAgentActivity,
+  issueIdentifier?: string,
 ): LinearAgentSessionEvent {
   return {
     webhookId: `reconcile:${activity.id}`,
     action: "prompted",
-    agentSession: { id: sessionId },
+    agentSession: {
+      id: sessionId,
+      ...(issueIdentifier !== undefined
+        ? {
+            issue: {
+              id: issueIdentifier,
+              identifier: issueIdentifier,
+              title: "",
+            },
+          }
+        : {}),
+    },
     webhookTimestamp: Date.parse(activity.createdAt),
     agentActivity: {
       id: activity.id,
@@ -848,6 +1136,12 @@ async function handleWebhook(
         claimResult.receipt.recoverySequence,
         recoverablePayload,
       );
+      // The stop fence is already durable. Abort matching in-memory work
+      // before acknowledging the delivery so no finalizer can cross an
+      // avoidable post-stop side-effect window while post-response work waits.
+      if (isStopEvent(event)) {
+        abortSessionRuns(deps, event.agentSession.id, recoveryOrder);
+      }
     }
     if (
       repairingLegacyReceipt &&
@@ -1124,6 +1418,18 @@ function parseAgentSessionEvent(payload: unknown): LinearAgentSessionEvent | und
   if (!isBoundedIdentifier((agentSession as Record<string, unknown>).id)) {
     return undefined;
   }
+  const issue = asRecord((agentSession as Record<string, unknown>).issue);
+  if (
+    ((agentSession as Record<string, unknown>).issue !== undefined &&
+      issue === undefined) ||
+    (issue !== undefined &&
+      ((issue.id !== undefined && !isBoundedIdentifier(issue.id)) ||
+        (issue.identifier !== undefined &&
+          !isBoundedIdentifier(issue.identifier)) ||
+        (issue.title !== undefined && typeof issue.title !== "string")))
+  ) {
+    return undefined;
+  }
   if (obj.action === "prompted") {
     const agentActivity = asRecord(obj.agentActivity);
     if (
@@ -1272,8 +1578,10 @@ async function processClaimedWebhook(
   const controller = isStop
     ? undefined
     : registerSessionRun(deps, sessionId, recoveryOrder);
+  const queuedBehindExistingRun =
+    controller !== undefined && (deps.activeRuns.get(sessionId)?.size ?? 0) > 1;
   const dispatchCursor =
-    scope === "reconciliation" && event.action === "prompted" && !isStop
+    scope !== "webhook" && event.action === "prompted" && !isStop
       ? eventActivityCursor(event)
       : undefined;
   let enqueued = false;
@@ -1325,7 +1633,11 @@ async function processClaimedWebhook(
     if (event.action === "created") {
       // 10s liveness rule: emit a thought before doing anything else.
       dispatchSignal?.throwIfAborted();
-      await emitActivity(
+      // Start the outbound liveness write, then reserve this event's FIFO lane
+      // position synchronously. The queued task waits for the write before it
+      // performs any work, while a later prompt cannot overtake the opening
+      // event during the outbound await.
+      const liveness = emitActivity(
         deps,
         identity.executionId,
         "liveness",
@@ -1341,24 +1653,36 @@ async function processClaimedWebhook(
               ? controller!.signal
               : AbortSignal.any([controller!.signal, dispatchSignal]),
         },
-      );
-      dispatchSignal?.throwIfAborted();
-      if (controller!.signal.aborted) {
-        if (!deps.closing) {
-          await deps.bridgeState.completeEvent(identity.webhookId);
-        }
-        return;
-      }
+      ).then(() => dispatchSignal?.throwIfAborted());
 
-      dispatchSignal?.throwIfAborted();
       enqueueSessionRun(
         deps,
         { linearSessionId: sessionId, prompt },
         issueIdentifier,
         controller!,
         identity,
+        deps.config.autonomousGoalLabelId !== undefined &&
+          event.agentSession.issue?.id !== undefined
+          ? {
+              autonomousGoalMode: "start",
+              autonomousGoalIssueId: event.agentSession.issue.id,
+              autonomousGoalOpeningSequence: recoveryOrder.sequence,
+              executionBarrier: liveness,
+            }
+          : { executionBarrier: liveness },
       );
       enqueued = true;
+      try {
+        await liveness;
+      } catch (error) {
+        if (controller!.signal.aborted) {
+          if (!deps.closing) {
+            await deps.bridgeState.completeEvent(identity.webhookId);
+          }
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
@@ -1401,42 +1725,56 @@ async function processClaimedWebhook(
       );
     }
     dispatchSignal?.throwIfAborted();
-    if (deps.queue.size(sessionId) === 0) {
-      await emitActivity(
-        deps,
-        identity.executionId,
-        "liveness",
-        sessionId,
-        {
-          type: "thought",
-          body: PROMPTED_THOUGHT_BODY,
-        },
-        {
-          ephemeral: true,
-          signal:
-            dispatchSignal === undefined
-              ? controller!.signal
-              : AbortSignal.any([controller!.signal, dispatchSignal]),
-        },
-      );
-    }
-    dispatchSignal?.throwIfAborted();
-    if (controller!.signal.aborted) {
-      if (!deps.closing) {
-        await deps.bridgeState.completeEvent(identity.webhookId);
-      }
-      return;
-    }
-    dispatchSignal?.throwIfAborted();
+    const liveness =
+      deps.queue.size(sessionId) === 0 && !queuedBehindExistingRun
+        ? emitActivity(
+            deps,
+            identity.executionId,
+            "liveness",
+            sessionId,
+            {
+              type: "thought",
+              body: PROMPTED_THOUGHT_BODY,
+            },
+            {
+              ephemeral: true,
+              signal:
+                dispatchSignal === undefined
+                  ? controller!.signal
+                  : AbortSignal.any([controller!.signal, dispatchSignal]),
+            },
+          ).then(() => dispatchSignal?.throwIfAborted())
+        : undefined;
     enqueueSessionRun(
       deps,
       { linearSessionId: sessionId, prompt },
       issueIdentifier,
       controller!,
       identity,
-      { loadStoredSessionAtExecution: true },
+      {
+        loadStoredSessionAtExecution: true,
+        queuedBehindExistingRun,
+        ...(liveness !== undefined ? { executionBarrier: liveness } : {}),
+        // The lane loads goal state at execution time. This recognizes an
+        // existing goal even after configuration is removed without putting
+        // an await before enqueue that could invert per-session FIFO order.
+        autonomousGoalMode: "guidance",
+      },
     );
     enqueued = true;
+    if (liveness !== undefined) {
+      try {
+        await liveness;
+      } catch (error) {
+        if (controller!.signal.aborted) {
+          if (!deps.closing) {
+            await deps.bridgeState.completeEvent(identity.webhookId);
+          }
+          return;
+        }
+        throw error;
+      }
+    }
   } finally {
     if (controller !== undefined && !enqueued) {
       unregisterRun(deps, sessionId, controller);
@@ -1465,11 +1803,19 @@ function enqueueSessionRun(
   issueIdentifier: string | undefined,
   controller: AbortController,
   identity: IngressEventIdentity,
-  options: { loadStoredSessionAtExecution?: boolean } = {},
+  options: {
+    loadStoredSessionAtExecution?: boolean;
+    autonomousGoalMode?: "start" | "guidance";
+    autonomousGoalIssueId?: string;
+    autonomousGoalOpeningSequence?: number;
+    queuedBehindExistingRun?: boolean;
+    executionBarrier?: Promise<void>;
+  } = {},
 ): void {
   const laneDepth = deps.queue.size(request.linearSessionId);
   const isQueuedFollowUp =
-    options.loadStoredSessionAtExecution === true && laneDepth > 0;
+    options.loadStoredSessionAtExecution === true &&
+    (laneDepth > 0 || options.queuedBehindExistingRun === true);
   const queuedNotice = isQueuedFollowUp
     ? emitActivity(
         deps,
@@ -1489,6 +1835,13 @@ function enqueueSessionRun(
         }
       })
     : Promise.resolve();
+  // Observe a barrier rejection immediately even when this item is queued
+  // behind another turn. Re-throw it only from the lane callback so shutdown
+  // cannot leave an unhandled rejected promise waiting for its FIFO slot.
+  const executionBarrier = options.executionBarrier?.then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
   const queuedRun = deps.queue.enqueue(request.linearSessionId, async () => {
     let effectiveRequest = request;
     let effectiveIssueIdentifier = issueIdentifier;
@@ -1496,13 +1849,47 @@ function enqueueSessionRun(
       ? "stopped"
       : "failed";
     try {
+      const barrierResult = await executionBarrier;
+      if (barrierResult?.ok === false) {
+        if (controller.signal.aborted) {
+          terminalReason = "stopped";
+          return;
+        }
+        throw barrierResult.error;
+      }
+      if (controller.signal.aborted) {
+        terminalReason = "stopped";
+        return;
+      }
       await queuedNotice;
+      let goal = await deps.bridgeState.getAutonomousGoal(
+        request.linearSessionId,
+      );
       if (options.loadStoredSessionAtExecution === true) {
         const storedSession = await deps.store.get(request.linearSessionId);
         if (
           storedSession?.runtimeSessionId !== undefined &&
           storedSession.runtime !== deps.runtime.name
         ) {
+          if (
+            goal !== undefined &&
+            goal.status !== "completed" &&
+            goal.status !== "stopped" &&
+            goal.status !== "declined"
+          ) {
+            await blockAutonomousGoalWithNotice(
+              deps,
+              goal,
+              `goal-provider-mismatch-${goal.step}`,
+              RUNTIME_PROVIDER_MISMATCH_BODY,
+              controller.signal,
+              options.autonomousGoalMode === "guidance"
+                ? identity.executionId
+                : undefined,
+            );
+            terminalReason = "completed";
+            return;
+          }
           await emitActivity(
             deps,
             identity.executionId,
@@ -1546,12 +1933,164 @@ function enqueueSessionRun(
             throw error;
           }
         }
-        terminalReason = await runSessionTask(
-          deps,
-          { ...effectiveRequest, abortController: controller },
-          effectiveIssueIdentifier,
-          identity.executionId,
-        );
+        if (
+          options.autonomousGoalMode === "start" &&
+          goal === undefined &&
+          options.autonomousGoalIssueId !== undefined &&
+          options.autonomousGoalOpeningSequence !== undefined
+        ) {
+          goal = await deps.bridgeState.prepareAutonomousGoal({
+            linearSessionId: request.linearSessionId,
+            issueId: options.autonomousGoalIssueId,
+            ...(effectiveIssueIdentifier !== undefined
+              ? { issueIdentifier: effectiveIssueIdentifier }
+              : {}),
+            runtime: deps.runtime.name,
+            openingRecoverySequence: options.autonomousGoalOpeningSequence,
+            objective: request.prompt,
+          });
+        }
+        if (
+          options.autonomousGoalMode === "start" &&
+          goal?.status === "stopped"
+        ) {
+          terminalReason = "stopped";
+          return;
+        }
+        if (
+          goal !== undefined &&
+          goal.status !== "completed" &&
+          goal.status !== "stopped" &&
+          goal.status !== "declined" &&
+          goal.runtime !== deps.runtime.name
+        ) {
+          await blockAutonomousGoalWithNotice(
+            deps,
+            goal,
+            `goal-provider-mismatch-${goal.step}`,
+            RUNTIME_PROVIDER_MISMATCH_BODY,
+            controller.signal,
+            options.autonomousGoalMode === "guidance"
+              ? identity.executionId
+              : undefined,
+          );
+          terminalReason = "completed";
+          return;
+        }
+        if (goal !== undefined && options.autonomousGoalMode === "guidance") {
+          if (goal.status === "blocked" && goal.pendingNotice !== undefined) {
+            await recoverAutonomousGoalPendingNotice(
+              deps,
+              goal,
+              controller.signal,
+            );
+            goal =
+              (await deps.bridgeState.getAutonomousGoal(
+                request.linearSessionId,
+              )) ?? goal;
+            if (goal.status === "stopped") {
+              terminalReason = "stopped";
+              return;
+            }
+          }
+          if (
+            goal.status !== "completed" &&
+            goal.status !== "stopped" &&
+            goal.status !== "declined" &&
+            deps.config.autonomousGoalLabelId === undefined
+          ) {
+            await blockAutonomousGoalWithNotice(
+              deps,
+              goal,
+              `goal-configuration-removed-${goal.step}`,
+              GOAL_LABEL_REMOVED_BODY,
+              controller.signal,
+              identity.executionId,
+            );
+            terminalReason = "completed";
+            return;
+          }
+          if (goal.status === "authorizing") {
+            goal = await resolveAutonomousGoalAuthorization(
+              deps,
+              goal,
+              controller.signal,
+            );
+          }
+          if (
+            goal.status === "blocked" ||
+            goal.status === "active" ||
+            goal.status === "completing"
+          ) {
+            const context = await currentGoalIssueContext(
+              deps,
+              goal,
+              controller.signal,
+            );
+            if (!context.authorized) {
+              await blockAutonomousGoalWithNotice(
+                deps,
+                goal,
+                `goal-label-removed-${goal.step}`,
+                GOAL_LABEL_REMOVED_BODY,
+                controller.signal,
+                identity.executionId,
+              );
+              terminalReason = "completed";
+              return;
+            }
+            goal = await deps.bridgeState.resumeAutonomousGoal(
+              request.linearSessionId,
+              identity.executionId,
+            );
+          }
+        }
+        if (
+          goal?.status === "authorizing" &&
+          options.autonomousGoalMode === "start"
+        ) {
+          goal = await resolveAutonomousGoalAuthorization(
+            deps,
+            goal,
+            controller.signal,
+          );
+        }
+        if (goal?.status === "completing") {
+          terminalReason = await finishAutonomousGoalCompletion(
+            deps,
+            goal,
+            controller.signal,
+          );
+        } else if (goal?.status === "active") {
+          terminalReason = await runAutonomousGoalTask(
+            deps,
+            { ...effectiveRequest, abortController: controller },
+            effectiveIssueIdentifier,
+            options.autonomousGoalMode === "guidance"
+              ? { firstStepIsGuidance: true }
+              : {},
+          );
+        } else if (
+          goal !== undefined &&
+          goal.status !== "completed" &&
+          goal.status !== "stopped" &&
+          goal.status !== "declined"
+        ) {
+          // Nonterminal autonomous state never falls through to an ordinary
+          // runtime turn. Recovery or guidance must first cross its explicit
+          // goal transition and preserve the lifecycle fences.
+          terminalReason = "completed";
+          return;
+        } else {
+          terminalReason = (
+            await runSessionTask(
+              deps,
+              { ...effectiveRequest, abortController: controller },
+              effectiveIssueIdentifier,
+              { kind: "ingress", executionId: identity.executionId },
+            )
+          ).terminalReason;
+        }
       }
     } finally {
       console.log(
@@ -1667,6 +2206,496 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+async function currentGoalIssueContext(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  signal?: AbortSignal,
+) {
+  const labelId = deps.config.autonomousGoalLabelId;
+  if (labelId === undefined) {
+    throw new Error("Autonomous goal label configuration is unavailable");
+  }
+  return await deps.linear.getAutonomousGoalIssueContext(
+    goal.issueId,
+    labelId,
+    signal,
+  );
+}
+
+async function resolveAutonomousGoalAuthorization(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  signal?: AbortSignal,
+): Promise<AutonomousGoalState> {
+  const context = await currentGoalIssueContext(deps, goal, signal);
+  if (!context.authorized || context.alreadyCompleted) {
+    return await deps.bridgeState.declineAutonomousGoal(goal.linearSessionId);
+  }
+  return await deps.bridgeState.activateAutonomousGoal(goal.linearSessionId);
+}
+
+async function blockAutonomousGoalWithNotice(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  activityKey: string,
+  body: string,
+  signal?: AbortSignal,
+  guidanceExecutionId?: string,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const blocked = await deps.bridgeState.blockAutonomousGoal(
+    goal.linearSessionId,
+    activityKey,
+    body,
+    guidanceExecutionId,
+  );
+  await emitAutonomousGoalActivity(
+    deps,
+    blocked.linearSessionId,
+    activityKey,
+    { type: "elicitation", body },
+    signal !== undefined ? { signal } : {},
+  );
+  await deps.bridgeState.clearAutonomousGoalPendingNotice(
+    blocked.linearSessionId,
+    activityKey,
+  );
+}
+
+async function goalActivityExists(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  activityKey: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const activityId =
+    await deps.bridgeState.getOrCreateAutonomousGoalActivityId(
+      goal.linearSessionId,
+      activityKey,
+    );
+  const snapshot = await deps.linear.listAgentSessionActivities(
+    goal.linearSessionId,
+    {
+      lookbackAfter: goal.createdAt,
+      ...(signal !== undefined ? { signal } : {}),
+    },
+  );
+  return snapshot.activities.some((activity) => activity.id === activityId);
+}
+
+async function recoverAutonomousGoalPendingNotice(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  signal?: AbortSignal,
+): Promise<void> {
+  const pending = goal.pendingNotice;
+  if (pending === undefined) {
+    return;
+  }
+  if (!(await goalActivityExists(deps, goal, pending.activityKey, signal))) {
+    const body = await deps.bridgeState.getAutonomousGoalPendingNoticeBody(
+      goal.linearSessionId,
+      pending.activityKey,
+    );
+    if (body === undefined) {
+      return;
+    }
+    await emitAutonomousGoalActivity(
+      deps,
+      goal.linearSessionId,
+      pending.activityKey,
+      pending.kind === "completion"
+        ? { type: "response", body }
+        : { type: "elicitation", body },
+      signal !== undefined ? { signal } : {},
+    );
+  }
+  const current = await deps.bridgeState.getAutonomousGoal(goal.linearSessionId);
+  if (current?.status === "stopped") {
+    return;
+  }
+  if (pending.kind === "completion") {
+    await deps.bridgeState.completeAutonomousGoal(goal.linearSessionId);
+  } else {
+    await deps.bridgeState.clearAutonomousGoalPendingNotice(
+      goal.linearSessionId,
+      pending.activityKey,
+    );
+  }
+}
+
+async function finishAutonomousGoalCompletion(
+  deps: InternalServerDeps,
+  goal: AutonomousGoalState,
+  signal?: AbortSignal,
+): Promise<TurnTerminalReason> {
+  signal?.throwIfAborted();
+  const current = await deps.bridgeState.getAutonomousGoal(goal.linearSessionId);
+  if (current?.status === "stopped") {
+    return "stopped";
+  }
+  if (current?.status !== "completing" || current.completionStateId === undefined) {
+    return "failed";
+  }
+  const context = await currentGoalIssueContext(deps, current, signal);
+  const postQueryGoal = await deps.bridgeState.getAutonomousGoal(
+    current.linearSessionId,
+  );
+  if (postQueryGoal?.status === "stopped") {
+    return "stopped";
+  }
+  if ((postQueryGoal?.pendingGuidanceIds.length ?? 0) > 0) {
+    await deps.bridgeState.resumeAutonomousGoal(current.linearSessionId);
+    return "completed";
+  }
+  if (!context.authorized) {
+    await blockAutonomousGoalWithNotice(
+      deps,
+      current,
+      `goal-label-removed-${current.step}`,
+      GOAL_LABEL_REMOVED_BODY,
+      signal,
+    );
+    return "completed";
+  }
+  if (!context.alreadyCompleted) {
+    const dispatched =
+      await deps.bridgeState.beginAutonomousGoalCompletionDispatch(
+        current.linearSessionId,
+      );
+    if (dispatched.status === "stopped") {
+      return "stopped";
+    }
+    if (dispatched.status === "active") {
+      return "completed";
+    }
+    signal?.throwIfAborted();
+    try {
+      await deps.linear.completeIssue(
+        context.issueId,
+        current.completionStateId,
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted === true) {
+        return "stopped";
+      }
+      await blockAutonomousGoalWithNotice(
+        deps,
+        current,
+        `goal-completion-retry-${current.step}`,
+        GOAL_COMPLETION_RETRY_BODY,
+        signal,
+      );
+      return "completed";
+    }
+  }
+  signal?.throwIfAborted();
+  const latest = await deps.bridgeState.getAutonomousGoal(current.linearSessionId);
+  if (latest?.status === "stopped") {
+    return "stopped";
+  }
+  const pending = latest?.pendingNotice;
+  if (latest?.status !== "completing" || pending?.kind !== "completion") {
+    return "failed";
+  }
+  // The issue mutation and activity emission cannot share one transaction.
+  // Reconcile by the stable Linear activity id before emitting so a crash
+  // between those writes does not duplicate the completion response.
+  await recoverAutonomousGoalPendingNotice(deps, latest, signal);
+  return "completed";
+}
+
+async function runAutonomousGoalTask(
+  deps: InternalServerDeps,
+  initialRequest: SessionRequest,
+  issueIdentifier: string | undefined,
+  options: { firstStepIsGuidance?: boolean } = {},
+): Promise<TurnTerminalReason> {
+  let firstStep = true;
+  const goalSignal =
+    initialRequest.abortController?.signal ?? deps.shutdownController.signal;
+  while (!deps.closing && !goalSignal.aborted) {
+    const goal = await deps.bridgeState.getAutonomousGoal(
+      initialRequest.linearSessionId,
+    );
+    if (goal?.status === "stopped") {
+      return "stopped";
+    }
+    if (goal?.status !== "active") {
+      return goal?.status === "completed" || goal?.status === "blocked"
+        ? "completed"
+        : "failed";
+    }
+    if (goal.stepsSinceGuidance >= deps.config.autonomousGoalMaxSteps) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        goal,
+        `goal-step-limit-${goal.step}`,
+        GOAL_STEP_LIMIT_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    const context = await currentGoalIssueContext(
+      deps,
+      goal,
+      goalSignal,
+    );
+    if (!context.authorized) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        goal,
+        `goal-label-removed-${goal.step}`,
+        GOAL_LABEL_REMOVED_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    const started =
+      firstStep && options.firstStepIsGuidance === true
+        ? await deps.bridgeState.beginAutonomousGoalGuidanceStep(
+            goal.linearSessionId,
+          )
+        : await deps.bridgeState.beginAutonomousGoalStep(goal.linearSessionId);
+    if (started.disposition !== "started") {
+      return started.goal?.status === "stopped" ? "stopped" : "completed";
+    }
+    const step = started.goal.step;
+    const storedSession = await deps.store.get(goal.linearSessionId);
+    if (
+      storedSession?.runtimeSessionId !== undefined &&
+      storedSession.runtime !== deps.runtime.name
+    ) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        started.goal,
+        `goal-provider-mismatch-${step}`,
+        RUNTIME_PROVIDER_MISMATCH_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    const openingObjective =
+      storedSession?.runtimeSessionId === undefined
+        ? await deps.bridgeState.getAutonomousGoalObjective(
+            goal.linearSessionId,
+          )
+        : undefined;
+    const stepPrompt =
+      openingObjective !== undefined &&
+      openingObjective !== initialRequest.prompt
+        ? `${openingObjective}\n\nCurrent guidance:\n${initialRequest.prompt}`
+        : initialRequest.prompt;
+    const request: SessionRequest = {
+      linearSessionId: goal.linearSessionId,
+      prompt: autonomousGoalPrompt(stepPrompt, {
+        step,
+        maxSteps: deps.config.autonomousGoalMaxSteps,
+        continuation: !firstStep,
+      }),
+      ...(storedSession?.runtimeSessionId !== undefined
+        ? { resumeSessionId: storedSession.runtimeSessionId }
+        : initialRequest.resumeSessionId !== undefined
+          ? { resumeSessionId: initialRequest.resumeSessionId }
+          : {}),
+      ...(initialRequest.abortController !== undefined
+        ? { abortController: initialRequest.abortController }
+        : {}),
+    };
+    const outcome = await runSessionTask(
+      deps,
+      request,
+      issueIdentifier ?? goal.issueIdentifier,
+      {
+        kind: "goal",
+        linearSessionId: goal.linearSessionId,
+        prefix: `goal-step-${step}`,
+      },
+      { captureResponse: true },
+    );
+    if (outcome.terminalReason !== "completed") {
+      // Inactivity has already aborted the provider-turn controller. Register
+      // a fresh, session-scoped finalizer so the durable block can complete,
+      // while a Linear stop or service shutdown can still abort its notice.
+      const finalizationController =
+        outcome.terminalReason === "inactive"
+          ? registerSessionRun(deps, goal.linearSessionId, {
+              action: "created",
+              occurredAt: started.goal.updatedAt,
+              sequence: Number.MAX_SAFE_INTEGER,
+            })
+          : undefined;
+      const lifecycleSignal = finalizationController?.signal ?? goalSignal;
+      try {
+        const latest = await deps.bridgeState.getAutonomousGoal(
+          goal.linearSessionId,
+        );
+        if (latest?.status === "stopped" || deps.closing) {
+          return "stopped";
+        }
+        await blockAutonomousGoalWithNotice(
+          deps,
+          latest ?? started.goal,
+          `goal-runtime-failed-${step}`,
+          GOAL_RUNTIME_FAILED_BODY,
+          lifecycleSignal,
+        );
+        const finalized = await deps.bridgeState.getAutonomousGoal(
+          goal.linearSessionId,
+        );
+        if (finalized?.status === "stopped") {
+          return "stopped";
+        }
+        return outcome.terminalReason;
+      } catch (error) {
+        if (lifecycleSignal.aborted) {
+          const latest = await deps.bridgeState.getAutonomousGoal(
+            goal.linearSessionId,
+          );
+          if (latest?.status === "stopped" || deps.closing) {
+            return "stopped";
+          }
+        }
+        throw error;
+      } finally {
+        if (finalizationController !== undefined) {
+          unregisterRun(deps, goal.linearSessionId, finalizationController);
+        }
+      }
+    }
+    const decision =
+      outcome.response === undefined
+        ? undefined
+        : parseAutonomousGoalDecision(outcome.response);
+    if (decision === undefined) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        started.goal,
+        `goal-protocol-error-${step}`,
+        GOAL_PROTOCOL_ERROR_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    // Human guidance already waiting in this session's FIFO lane supersedes
+    // every provider decision, including completion. Return the durable goal
+    // to active and yield before interpreting the result so no issue mutation
+    // can race ahead of requirements the user has already supplied.
+    const decisionGoal = await deps.bridgeState.getAutonomousGoal(
+      goal.linearSessionId,
+    );
+    if (decisionGoal?.status === "stopped") {
+      return "stopped";
+    }
+    if (
+      deps.queue.size(goal.linearSessionId) > 1 ||
+      (decisionGoal?.pendingGuidanceIds.length ?? 0) > 0
+    ) {
+      await deps.bridgeState.continueAutonomousGoal(goal.linearSessionId);
+      await emitAutonomousGoalActivity(
+        deps,
+        goal.linearSessionId,
+        `goal-step-${step}-summary`,
+        {
+          type: "thought",
+          body:
+            decision.status === "completed"
+              ? `${decision.message} I will apply the guidance already queued before completing the issue.`
+              : decision.message,
+        },
+        { signal: goalSignal },
+      );
+      return "completed";
+    }
+    if (decision.status === "continue") {
+      await deps.bridgeState.continueAutonomousGoal(goal.linearSessionId);
+      await emitAutonomousGoalActivity(
+        deps,
+        goal.linearSessionId,
+        `goal-step-${step}-summary`,
+        { type: "thought", body: decision.message },
+        { signal: goalSignal },
+      );
+      firstStep = false;
+      continue;
+    }
+    if (decision.status === "blocked") {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        started.goal,
+        `goal-step-${step}-blocked`,
+        decision.message,
+        goalSignal,
+      );
+      return "completed";
+    }
+
+    const completionContext = await currentGoalIssueContext(
+      deps,
+      started.goal,
+      goalSignal,
+    );
+    const postCompletionQueryGoal = await deps.bridgeState.getAutonomousGoal(
+      goal.linearSessionId,
+    );
+    if (postCompletionQueryGoal?.status === "stopped") {
+      return "stopped";
+    }
+    if ((postCompletionQueryGoal?.pendingGuidanceIds.length ?? 0) > 0) {
+      await deps.bridgeState.continueAutonomousGoal(goal.linearSessionId);
+      await emitAutonomousGoalActivity(
+        deps,
+        goal.linearSessionId,
+        `goal-step-${step}-summary`,
+        {
+          type: "thought",
+          body: `${decision.message} I will apply the guidance already queued before completing the issue.`,
+        },
+        { signal: goalSignal },
+      );
+      return "completed";
+    }
+    if (!completionContext.authorized) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        started.goal,
+        `goal-label-removed-${step}`,
+        GOAL_LABEL_REMOVED_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    const completionStateId = completionContext.alreadyCompleted
+      ? completionContext.currentStateId
+      : completionContext.completedStateId;
+    if (completionStateId === undefined) {
+      await blockAutonomousGoalWithNotice(
+        deps,
+        started.goal,
+        `goal-completion-state-${step}`,
+        GOAL_COMPLETION_STATE_BODY,
+        goalSignal,
+      );
+      return "completed";
+    }
+    const completionKey = `goal-step-${step}-completion`;
+    const finalBody = `${decision.message}\n\nVerification: ${decision.verification}\n\n${completionContext.issueIdentifier} was moved to completed.`;
+    const completing = await deps.bridgeState.beginAutonomousGoalCompletion(
+      goal.linearSessionId,
+      completionStateId,
+      completionKey,
+      finalBody,
+    );
+    return await finishAutonomousGoalCompletion(
+      deps,
+      completing,
+      goalSignal,
+    );
+  }
+  return "stopped";
+}
+
 /**
  * Runs one session turn: iterates the runtime, persisting the runtime
  * session id and forwarding activities as they arrive. Swallows nothing —
@@ -1677,14 +2706,16 @@ async function runSessionTask(
   deps: InternalServerDeps,
   request: SessionRequest,
   issueIdentifier: string | undefined,
-  executionId: string,
-): Promise<TurnTerminalReason> {
+  activityScope: ActivityScope,
+  options: { captureResponse?: boolean } = {},
+): Promise<RuntimeTurnOutcome> {
   const controller = request.abortController;
   const turnStartedAt = deps.now?.() ?? Date.now();
   let lastNoticeAt = turnStartedAt;
   let noticeSequence = 0;
   let lastAction: { action: string; parameter: string } | undefined;
   let activitySequence = 0;
+  let capturedResponse: string | undefined;
   let acceptEvents = true;
   let inactivityTriggered = false;
   let inactivityTimer: ReturnType<typeof setTimeout>;
@@ -1740,14 +2771,22 @@ async function runSessionTask(
         // Reset before persistence or outbound Linear delivery. Those
         // operations and any retries they perform are not runtime progress.
         armWatchdog();
-        await handleRuntimeEvent(
-          deps,
-          request,
-          issueIdentifier,
-          event,
-          executionId,
-          activitySequence,
-        );
+        if (
+          options.captureResponse === true &&
+          event.kind === "activity" &&
+          event.activity.type === "response"
+        ) {
+          capturedResponse = event.activity.body;
+        } else {
+          await handleRuntimeEvent(
+            deps,
+            request,
+            issueIdentifier,
+            event,
+            activityScope,
+            activitySequence,
+          );
+        }
         if (event.kind === "activity") {
           activitySequence += 1;
         }
@@ -1760,9 +2799,9 @@ async function runSessionTask(
         const now = deps.now?.() ?? Date.now();
         if (now - lastNoticeAt >= deps.config.progressNoticeIntervalMs) {
           noticeSequence += 1;
-          await emitActivity(
+          await emitScopedActivity(
             deps,
-            executionId,
+            activityScope,
             `progress-${noticeSequence}`,
             request.linearSessionId,
             {
@@ -1794,9 +2833,9 @@ async function runSessionTask(
     inactivityTriggered ||
     (outcome.source === "watchdog" && outcome.reason === "inactive")
   ) {
-    void emitActivity(
+    void emitScopedActivity(
       deps,
-      executionId,
+      activityScope,
       "inactivity-error",
       request.linearSessionId,
       {
@@ -1809,15 +2848,15 @@ async function runSessionTask(
           `[linear-agent-bridge] failed to emit inactivity activity: session=${request.linearSessionId} error=${boundedErrorClass(activityErr)}`,
         );
       });
-    return "inactive";
+    return { terminalReason: "inactive" };
   }
 
   if (outcome.source === "watchdog") {
-    return "stopped";
+    return { terminalReason: "stopped" };
   }
   if (outcome.error !== undefined) {
     if (controller?.signal.aborted === true) {
-      return "stopped";
+      return { terminalReason: "stopped" };
     }
     console.error(
       `[linear-agent-bridge] session run failed: session=${request.linearSessionId} error=RuntimeExecutionError`,
@@ -1825,9 +2864,9 @@ async function runSessionTask(
     const body =
       outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     try {
-      await emitActivity(
+      await emitScopedActivity(
         deps,
-        executionId,
+        activityScope,
         "runtime-error",
         request.linearSessionId,
         { type: "error", body },
@@ -1837,9 +2876,13 @@ async function runSessionTask(
         `[linear-agent-bridge] failed to emit error activity: session=${request.linearSessionId} error=${boundedErrorClass(activityErr)}`,
       );
     }
-    return "failed";
+    return { terminalReason: "failed" };
   }
-  return controller?.signal.aborted === true ? "stopped" : "completed";
+  return {
+    terminalReason:
+      controller?.signal.aborted === true ? "stopped" : "completed",
+    ...(capturedResponse !== undefined ? { response: capturedResponse } : {}),
+  };
 }
 
 async function handleRuntimeEvent(
@@ -1847,7 +2890,7 @@ async function handleRuntimeEvent(
   request: SessionRequest,
   issueIdentifier: string | undefined,
   event: RuntimeEvent,
-  executionId: string,
+  activityScope: ActivityScope,
   activitySequence: number,
 ): Promise<void> {
   if (event.kind === "session-started") {
@@ -1865,9 +2908,9 @@ async function handleRuntimeEvent(
     const ephemeral =
       event.activity.type === "thought" ||
       (event.activity.type === "action" && event.activity.result === undefined);
-    await emitActivity(
+    await emitScopedActivity(
       deps,
-      executionId,
+      activityScope,
       `runtime-${activitySequence}`,
       request.linearSessionId,
       event.activity,
@@ -1879,6 +2922,34 @@ async function handleRuntimeEvent(
       },
     );
   }
+}
+
+async function emitScopedActivity(
+  deps: InternalServerDeps,
+  scope: ActivityScope,
+  activityKey: string,
+  agentSessionId: string,
+  content: AgentActivityContent,
+  options: { ephemeral?: boolean; signal?: AbortSignal } = {},
+): Promise<void> {
+  if (scope.kind === "ingress") {
+    await emitActivity(
+      deps,
+      scope.executionId,
+      activityKey,
+      agentSessionId,
+      content,
+      options,
+    );
+    return;
+  }
+  await emitAutonomousGoalActivity(
+    deps,
+    scope.linearSessionId,
+    `${scope.prefix}-${activityKey}`,
+    content,
+    options,
+  );
 }
 
 async function emitActivity(
@@ -1898,6 +2969,40 @@ async function emitActivity(
       ? deps.shutdownController.signal
       : AbortSignal.any([options.signal, deps.shutdownController.signal]);
   await deps.linear.createActivity(agentSessionId, content, {
+    activityId,
+    ...options,
+    signal,
+  });
+}
+
+async function emitAutonomousGoalActivity(
+  deps: InternalServerDeps,
+  linearSessionId: string,
+  activityKey: string,
+  content: AgentActivityContent,
+  options: { ephemeral?: boolean; signal?: AbortSignal } = {},
+): Promise<void> {
+  options.signal?.throwIfAborted();
+  const goal = await deps.bridgeState.getAutonomousGoal(linearSessionId);
+  if (goal?.status === "stopped") {
+    return;
+  }
+  options.signal?.throwIfAborted();
+  const activityId =
+    await deps.bridgeState.getOrCreateAutonomousGoalActivityId(
+      linearSessionId,
+      activityKey,
+    );
+  const latest = await deps.bridgeState.getAutonomousGoal(linearSessionId);
+  if (latest?.status === "stopped") {
+    return;
+  }
+  const signal =
+    options.signal === undefined
+      ? deps.shutdownController.signal
+      : AbortSignal.any([options.signal, deps.shutdownController.signal]);
+  signal.throwIfAborted();
+  await deps.linear.createActivity(linearSessionId, content, {
     activityId,
     ...options,
     signal,

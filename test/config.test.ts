@@ -39,6 +39,7 @@ describe("loadConfig", () => {
       reconcileLookbackMs: 86400000,
       reconcileMaxSessions: 250,
       agentSessionAckGraceMs: 120000,
+      autonomousGoalMaxSteps: 8,
     });
   });
 
@@ -57,6 +58,8 @@ describe("loadConfig", () => {
       RECONCILE_LOOKBACK_MS: "7200000",
       RECONCILE_MAX_SESSIONS: "125",
       AGENT_SESSION_ACK_GRACE_MS: "90000",
+      AUTONOMOUS_GOAL_LABEL_ID: "123e4567-e89b-42d3-a456-426614174000",
+      AUTONOMOUS_GOAL_MAX_STEPS: "12",
     });
 
     expect(config.port).toBe(8080);
@@ -71,6 +74,10 @@ describe("loadConfig", () => {
     expect(config.reconcileLookbackMs).toBe(7200000);
     expect(config.reconcileMaxSessions).toBe(125);
     expect(config.agentSessionAckGraceMs).toBe(90000);
+    expect(config.autonomousGoalLabelId).toBe(
+      "123e4567-e89b-42d3-a456-426614174000",
+    );
+    expect(config.autonomousGoalMaxSteps).toBe(12);
   });
 
   it.each([
@@ -113,8 +120,19 @@ describe("loadConfig", () => {
     "RECONCILE_LOOKBACK_MS",
     "RECONCILE_MAX_SESSIONS",
     "AGENT_SESSION_ACK_GRACE_MS",
+    "AUTONOMOUS_GOAL_MAX_STEPS",
   ])("throws for an invalid %s value", (key) => {
     expect(() => loadConfig({ ...validEnv, [key]: "0" })).toThrow(key);
+  });
+
+  it("keeps autonomous goals opt-in and validates the configured Linear label id", () => {
+    expect(loadConfig({ ...validEnv }).autonomousGoalLabelId).toBeUndefined();
+    expect(() =>
+      loadConfig({ ...validEnv, AUTONOMOUS_GOAL_LABEL_ID: "Autonomous" }),
+    ).toThrow(/AUTONOMOUS_GOAL_LABEL_ID/);
+    expect(() =>
+      loadConfig({ ...validEnv, AUTONOMOUS_GOAL_MAX_STEPS: "101" }),
+    ).toThrow(/AUTONOMOUS_GOAL_MAX_STEPS/);
   });
 
   it("rejects a reconciliation session cap above Linear's hard scan limit", () => {

@@ -21,8 +21,12 @@ import {
 import {
   createIngressRecoveryKeyring,
   IngressRecoveryEnvelopeError,
+  openAutonomousGoalObjective,
+  openAutonomousGoalNotice,
   openIngressRecoveryPayload,
   parseCanonicalRecoveryKey,
+  sealAutonomousGoalObjective,
+  sealAutonomousGoalNotice,
   sealIngressRecoveryPayload,
 } from "../src/state/recovery-envelope.js";
 
@@ -162,6 +166,53 @@ describe("ingress recovery envelopes", () => {
     expect(newEnvelope.keyId).toBe(rotatedKeyring.primary.id);
     expect(() =>
       openIngressRecoveryPayload(oldKeyring, identity, 8, newEnvelope),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+
+  it("encrypts autonomous notice content under a separate identity-bound domain", () => {
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const identity = {
+      linearSessionId: "goal-session",
+      activityKey: "goal-step-1-blocked",
+      kind: "elicitation" as const,
+    };
+    const body = "Which exact environment should I use?";
+    const envelope = sealAutonomousGoalNotice(keyring, identity, body);
+
+    expect(JSON.stringify(envelope)).not.toContain(body);
+    expect(openAutonomousGoalNotice(keyring, identity, envelope)).toBe(body);
+    expect(() =>
+      openAutonomousGoalNotice(
+        keyring,
+        { ...identity, activityKey: "goal-step-2-blocked" },
+        envelope,
+      ),
+    ).toThrow(IngressRecoveryEnvelopeError);
+  });
+
+  it("encrypts the autonomous opening objective under its own identity-bound domain", () => {
+    const keyring = createIngressRecoveryKeyring(RECOVERY_KEY_A);
+    const identity = {
+      linearSessionId: "goal-session",
+      issueId: "issue-autonomous",
+    };
+    const objective = "Implement the exact opening requirement.";
+    const envelope = sealAutonomousGoalObjective(
+      keyring,
+      identity,
+      objective,
+    );
+
+    expect(JSON.stringify(envelope)).not.toContain(objective);
+    expect(openAutonomousGoalObjective(keyring, identity, envelope)).toBe(
+      objective,
+    );
+    expect(() =>
+      openAutonomousGoalObjective(
+        keyring,
+        { ...identity, issueId: "issue-swapped" },
+        envelope,
+      ),
     ).toThrow(IngressRecoveryEnvelopeError);
   });
 

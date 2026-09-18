@@ -20,10 +20,10 @@ API key is required.
 Linear (mention / delegate / follow-up prompt)
   -> webhook + reconciliation: AgentSessionEvent / AgentSession activities
   -> src/server.ts        verify HMAC, persist ingress, ack < 5s
-  -> src/state/store.ts   durable receipt + semantic execution claim
+  -> src/state/store.ts   durable receipt, execution claim, goal lifecycle
   -> src/queue.ts         per-session FIFO lanes, concurrent across sessions
   -> src/runtime/{claude,codex}.ts  selected SDK, cwd = KB_PATH, resume
-  -> src/linear/client.ts   agentActivityCreate (thought/action/response)
+  -> src/linear/client.ts   issue/label guard + Agent Activities
 ```
 
 Session mapping (Linear session id -> SDK session id), bounded webhook state,
@@ -126,6 +126,50 @@ Changing `RUNTIME` requires a restart. A session already holding another
 provider's native session ID fails visibly instead of sending that ID to the
 wrong provider; start a new Linear agent session after switching.
 
+#### Optional: enable autonomous goals
+
+Linear's Agent Session `created` event does not say whether a delegation or a
+mention created it. The bridge therefore does not infer autonomous authority
+from either event. It uses a visible issue label as the explicit native grant.
+
+1. Create a Linear issue label such as **Autonomous** and obtain its canonical
+   `IssueLabel.id` UUID through the Linear API.
+2. Set `AUTONOMOUS_GOAL_LABEL_ID` to that UUID. Optionally change
+   `AUTONOMOUS_GOAL_MAX_STEPS`, which defaults to 8 provider turns between
+   human messages.
+3. On an issue, apply the label first, then delegate the issue to the app or
+   mention the app to open a new Agent Session.
+
+No command is typed into the conversation. While the label remains present,
+the opening message authorizes bounded autonomous work and later session
+messages are guidance or answers. A message that arrives during a provider
+turn is recorded as pending in the same durable ingress claim, takes the next
+FIFO slot, and supersedes even a provider completion decision that has not yet
+crossed its issue-mutation boundary. A blocked goal emits one Linear
+`elicitation`, schedules nothing else, and resumes only after a user replies.
+Linear's stop control durably stops the goal and aborts its active turn.
+Removing the label also blocks further work and asks for user action.
+
+The bridge accepts completion only from a structured runtime result with a
+nonempty verification summary. It then rechecks the label and current issue
+state, moves the issue to the team's first completed workflow state, and posts
+one durable final response. Stable activity IDs reconcile a crash between the
+issue update and that response without duplicating it. A process that restarts
+mid-provider-turn does not replay unknown side effects; it marks the goal
+blocked and asks the user how to proceed. Active, blocked, completing, stopped,
+and terminal states survive restart in `BRIDGE_STATE_STORE_PATH`. Before
+accepted ingress or goal recovery can restart autonomous work, the bridge
+reconciles that specific session so a stop or guidance message sent during
+downtime wins the FIFO order. If that preflight read fails, startup remains
+unready rather than dispatching accepted autonomous work through an unverified
+window.
+
+This feature is opt-in. If `AUTONOMOUS_GOAL_LABEL_ID` is unset, or an issue did
+not carry the label when its session opened, the v0.2.x one-turn-per-message
+behavior is unchanged. Apply the label before opening a new session; adding it
+to a session already recorded as non-autonomous does not silently convert that
+conversation.
+
 ### 3. Install the app as an agent (actor=app)
 
 Start the service, then open the `OAuth authorization URL` printed in its
@@ -148,13 +192,24 @@ excluded from Git.
 persistent local storage as well. It contains bounded identifiers, status
 timestamps, intended HTTP/result/disposition metadata, static error classes,
 caller-generated activity UUIDs, reconciliation watermarks, stop fences, and
-recovery ciphertext for accepted turns whose dispatch marker is absent.
+recovery ciphertext for accepted turns whose dispatch marker is absent. When
+autonomous goals are enabled it also contains issue/session identifiers,
+runtime name, lifecycle status, bounded step counters, the selected completed
+state ID, completion-dispatch timestamp, pending guidance/activity IDs, and
+caller-generated activity keys. The opening autonomous objective is stored in
+an AES-256-GCM envelope so guidance claimed before goal preparation cannot
+displace it. Autonomous prompts and provider transcripts are not stored in
+plaintext. A blocked elicitation or verified completion response that has not
+reached Linear is likewise stored as an encrypted envelope, so restart recovery
+can emit the exact question or verification text without leaving it readable in
+the state file.
 Plaintext recovery routing metadata includes the action,
 session/webhook/execution IDs, recovery sequence, event timestamp, envelope
-`keyId`, and stop-fence provenance. Prompt, issue, and comment text, the raw
-signal, and the stop/body semantics remain inside the encrypted envelope until
-the dispatch marker is committed. Ciphertext length still reveals an
-approximate prompt length, so protect the state file and its backups as
+`keyId`, autonomous notice kind/activity key, and stop-fence provenance.
+Prompt, issue, comment, pending elicitation, and pending completion text, the
+raw signal, and stop/body semantics remain inside encrypted envelopes until
+their delivery boundary is committed. Ciphertext length still reveals an
+approximate content length, so protect the state file and its backups as
 sensitive data.
 
 AES-256-GCM authenticates each encrypted payload against its routing identity,
@@ -345,7 +400,8 @@ tracing, failure diagnosis, the live checklist, and rollback.
 
 Delegate any issue to the agent, or message it in the session thread.
 First thought lands within seconds; answers take as long as a real agent
-session takes.
+session takes. For an autonomous goal, apply the configured label before
+opening the session; otherwise each message remains a single runtime turn.
 
 ## Field notes (things the docs won't tell you)
 
@@ -403,6 +459,16 @@ session takes.
   cannot retain that lane.
   Turn-scoped Linear activity requests receive the same abort signal, late
   events are ignored, and inactivity is reported once on a best-effort basis.
+- Linear does not expose a documented cause field on `AgentSessionEvent.created`:
+  mention and delegation share the same action. Autonomous mode therefore uses
+  the configured issue label as a current, visible authorization grant. The
+  label is rechecked before every provider step and before issue completion;
+  webhook arrival order is never used to correlate assignment with a session.
+- Autonomous continuations are separate bounded provider turns in the same
+  per-session FIFO lane. `AUTONOMOUS_GOAL_MAX_STEPS` bounds turns since the
+  latest human message. Pending user guidance is recorded with its ingress
+  claim and runs before another continuation or issue completion. Reaching the
+  bound emits an elicitation and consumes no more turns until a reply arrives.
 - `RUN_TIMEOUT_MS` remains a deprecated fallback for one release. The bridge
   logs one bounded warning whenever the legacy variable is present;
   `RUN_INACTIVITY_TIMEOUT_MS` takes precedence when both are present.
@@ -430,13 +496,17 @@ session takes.
 The loopback-only webhook endpoint verifies signatures, rejects stale timestamps, and does
 not return 200 for a valid agent event unless its receipt and claim are durable.
 Marker-free accepted turns retain encrypted prompt material until the dispatch
-marker is durable. Bounded action, identity, sequence, timestamp, `keyId`, and
-stop-fence provenance remain plaintext for routing. Prompt, issue, and comment
-text, raw signal, and stop/body semantics remain encrypted, while ciphertext
-size leaks an approximate length. The envelope authenticates its payload and
-routing association, not the whole state file. Keep `.env`, the state file, and
-their backups owner-only; losing every reader key for an active envelope blocks
-startup rather than dropping accepted work.
+marker is durable. An autonomous goal's opening objective and undelivered
+elicitation or completion notices retain their exact text in separate encrypted
+envelopes until their lifecycle boundary is committed. Bounded action,
+identity, sequence, timestamp, `keyId`, notice kind/activity key, and stop-fence
+provenance remain plaintext for routing. Prompt, issue, comment, objective, and
+notice text, raw signal, and stop/body semantics remain encrypted, while
+ciphertext size leaks an approximate length.
+Each envelope authenticates its payload and routing association, not the whole
+state file. Keep `.env`, the state file, and their backups owner-only; losing
+every reader key for an active envelope blocks recovery rather than replacing
+the exact content with generic text.
 The OAuth callback consumes a random, expiring state value before exchanging an
 authorization code; only the local service log receives the matching setup
 URL. `/healthz` and `/oauth/callback` are the only other routes. Understand

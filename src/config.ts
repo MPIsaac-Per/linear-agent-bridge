@@ -23,6 +23,12 @@ export interface Config {
   reconcileMaxSessions: number;
   agentSessionAckGraceMs: number;
   /**
+   * Optional Linear issue-label id that grants autonomous execution. Unset
+   * preserves the one-provider-turn behavior from v0.2.x.
+   */
+  autonomousGoalLabelId?: string;
+  autonomousGoalMaxSteps: number;
+  /**
    * Directory the agent may write to. Optional: unset means the runtime keeps
    * today's behaviour and no output path is surfaced. Enforcement is the
    * filesystem, never this value; surfacing it only saves the agent from
@@ -43,6 +49,7 @@ const DEFAULT_RECONCILE_INTERVAL_MS = "60000";
 const DEFAULT_RECONCILE_LOOKBACK_MS = "86400000";
 const DEFAULT_RECONCILE_MAX_SESSIONS = "250";
 const DEFAULT_AGENT_SESSION_ACK_GRACE_MS = "120000";
+const DEFAULT_AUTONOMOUS_GOAL_MAX_STEPS = "8";
 // Chosen to sit inside launchd's 20-second SIGKILL window. systemd's default
 // TimeoutStopSec is far longer, so the same default is safe there.
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = "10000";
@@ -104,6 +111,24 @@ function integerInRange(
   return parsed;
 }
 
+function optionalLinearId(
+  value: string | undefined,
+  key: string,
+): string | undefined {
+  if (value === undefined || value === "") {
+    return undefined;
+  }
+  if (
+    value.length > 256 ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  ) {
+    throw new Error(`Invalid ${key}: expected a Linear UUID`);
+  }
+  return value;
+}
+
 /**
  * Load and validate config from process.env (see .env.example).
  * Missing required values fail fast, naming the first missing variable
@@ -151,6 +176,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const ingressRecoveryPreviousKeys = parseRecoveryKeys(
     ingressRecoveryKey,
     env.INGRESS_RECOVERY_PREVIOUS_KEYS,
+  );
+  const autonomousGoalLabelId = optionalLinearId(
+    env.AUTONOMOUS_GOAL_LABEL_ID,
+    "AUTONOMOUS_GOAL_LABEL_ID",
   );
 
   const runtimeRaw = env.RUNTIME ?? DEFAULT_RUNTIME;
@@ -202,6 +231,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
 
   return {
+    ...(autonomousGoalLabelId !== undefined ? { autonomousGoalLabelId } : {}),
+    autonomousGoalMaxSteps: integerInRange(
+      env.AUTONOMOUS_GOAL_MAX_STEPS ?? DEFAULT_AUTONOMOUS_GOAL_MAX_STEPS,
+      "AUTONOMOUS_GOAL_MAX_STEPS",
+      1,
+      100,
+    ),
     ...(agentOutputPathRaw !== undefined && agentOutputPathRaw !== ""
       ? { agentOutputPath: resolveAgentOutputPath(agentOutputPathRaw) }
       : {}),

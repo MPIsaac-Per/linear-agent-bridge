@@ -7,6 +7,34 @@ Changes awaiting a tagged release remain under Unreleased.
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in autonomous goal execution for Claude and Codex. A configured,
+  visible Linear issue label authorizes bounded continuation without commands
+  in conversation text. Durable goal state survives restart, pauses on one
+  elicitation when blocked, resumes from user guidance, obeys Linear stop
+  fences, records guidance with its ingress claim, reconciles downtime activity
+  before recovery, and caps provider turns between human messages.
+- Complete an issue only after the runtime returns a verified-completion result
+  and the bridge rechecks its label and workflow state. Completion uses stable
+  Agent Activity IDs so restart recovery does not duplicate the final response.
+- Encrypt the opening objective, exact pending blocked question, and completion
+  verification with the recovery key. This preserves the objective across an
+  early-guidance race and lets crash recovery emit the original notice content
+  without storing any of it as plaintext.
+
+### Changed
+
+- Keep autonomous mode disabled by default. With
+  `AUTONOMOUS_GOAL_LABEL_ID` unset, existing v0.2.x one-turn behavior is
+  unchanged. The bridge does not treat mention or delegation alone as an
+  autonomous grant because Linear exposes both as the same session-created
+  event.
+- Give durably claimed guidance priority at autonomous step admission and after
+  a failed issue update. Interrupted running goals become blocked before
+  downtime ingress dispatch, and inactivity finalization persists that block
+  with a service-scoped cancellation signal.
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
