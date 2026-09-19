@@ -64,9 +64,12 @@ top-level `end_turn`; Codex posts at `turn.completed`.
 
 Every runtime turn begins with a delivery contract explaining that the agent is
 already operating inside a Linear Agent Session and that its final response is
-posted automatically. Linear tools remain available for deliberate issue
-mutations, but the agent is instructed not to edit fields or add comments merely
-to duplicate its conversation, progress, or final response.
+posted automatically under the app identity. That response satisfies requests
+to comment, record, report, explain, or ask something on the current issue. The
+agent must never use a Linear tool to add, edit, or reply to a current-issue
+comment, because that uses a separate user connector and the wrong identity.
+Linear tools remain available for reading and for other deliberate workspace
+mutations that the assigned task actually requires.
 
 ## Prerequisites
 
